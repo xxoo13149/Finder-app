@@ -1,0 +1,1478 @@
+from __future__ import annotations
+
+import json
+import mimetypes
+import os
+import re
+import signal
+import shutil
+import subprocess
+import threading
+import time
+import traceback
+import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Mapping
+from urllib.parse import parse_qs, unquote, urlparse
+
+from .config import DEFAULT_CONFIG_PATH, apply_overrides, load_config
+from .env import load_project_env
+from .history_registry import list_wallet_history_records
+from .labels import CORE_LABEL_KEYS
+
+
+UTC = timezone.utc
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ARTIFACTS_ROOT = PROJECT_ROOT / "artifacts"
+RUNTIME_STATE_RELATIVE_PATH = Path(".cache") / "runtime" / "launcher.json"
+ALLOWED_BROWSER_ORIGINS = {
+    "http://localhost:41873",
+    "http://127.0.0.1:41873",
+    "http://localhost:41874",
+    "http://127.0.0.1:41874",
+}
+FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
+DIAGNOSTIC_RUN_TOKENS = ("smoke", "codex", "browser-", "ui-api", "test-fast")
+RUN_DETAIL_PRUNE_FILES = (
+    "leaderboard.json",
+    "screening_records.json",
+    "weather_events.json",
+    "errors.json",
+    "progress.log",
+)
+RUN_DETAIL_PRUNE_DIRS = ("wallets",)
+
+
+@dataclass
+class RunState:
+    run_id: str
+    status: str
+    output_dir: str
+    created_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    progress_log_path: str | None = None
+    traceback: str | None = None
+
+
+@dataclass
+class ServerState:
+    root: Path
+    artifacts_root: Path
+    runs: dict[str, RunState] = field(default_factory=dict)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+def now_iso() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def new_run_id() -> str:
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%SZ")
+    return f"polymarket-weather-{timestamp}-{uuid.uuid4().hex[:6]}"
+
+
+def resolve_under_root(root: Path, value: str | Path) -> Path:
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    return candidate.resolve()
+
+
+def ensure_under(parent: Path, child: Path) -> Path:
+    parent = parent.resolve()
+    child = child.resolve()
+    if parent != child and parent not in child.parents:
+        raise ValueError(f"path is outside allowed root: {child}")
+    return child
+
+
+def read_json_file(path: Path, fallback: Any = None) -> Any:
+    if not path.exists():
+        return fallback
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (json.JSONDecodeError, OSError):
+        return fallback
+
+
+def write_json_file(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def wallet_payload_has_core_label(payload: Any) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+
+    core_label_keys = set(CORE_LABEL_KEYS)
+    evaluations = payload.get("label_evaluations")
+    if isinstance(evaluations, list):
+        for item in evaluations:
+            if (
+                isinstance(item, Mapping)
+                and str(item.get("key") or "") in core_label_keys
+                and bool(item.get("matched"))
+            ):
+                return True
+
+    labels = payload.get("labels")
+    if isinstance(labels, list):
+        for item in labels:
+            if isinstance(item, Mapping) and str(item.get("key") or "") in core_label_keys:
+                return True
+    return False
+
+
+def count_core_labeled_wallets(output_dir: Path) -> int:
+    selected_wallets = read_json_file(output_dir / "selected_wallets.json", []) or []
+    if isinstance(selected_wallets, list) and selected_wallets:
+        matched_by_wallet: dict[str, bool] = {}
+        for item in selected_wallets:
+            if not isinstance(item, Mapping):
+                continue
+            wallet = str(item.get("wallet") or "").strip().lower()
+            if not wallet or wallet in matched_by_wallet:
+                continue
+            wallet_path = ensure_under(output_dir / "wallets", output_dir / "wallets" / f"{wallet}.json")
+            matched_by_wallet[wallet] = wallet_payload_has_core_label(read_json_file(wallet_path, {}))
+        return sum(
+            1
+            for item in selected_wallets
+            if isinstance(item, Mapping)
+            and matched_by_wallet.get(str(item.get("wallet") or "").strip().lower(), False)
+        )
+
+    wallets_dir = output_dir / "wallets"
+    if not wallets_dir.exists():
+        return 0
+
+    count = 0
+    for wallet_path in wallets_dir.glob("*.json"):
+        if wallet_payload_has_core_label(read_json_file(wallet_path, {})):
+            count += 1
+    return count
+
+
+def read_run_summary(output_dir: Path) -> dict[str, Any]:
+    payload = read_json_file(output_dir / "analysis_summary.json", {})
+    summary = dict(payload) if isinstance(payload, Mapping) else {}
+    if "wallets_selected" not in summary:
+        selected_wallets = read_json_file(output_dir / "selected_wallets.json", []) or []
+        summary["wallets_selected"] = len(selected_wallets) if isinstance(selected_wallets, list) else 0
+    if "wallets_core_labeled" not in summary:
+        summary["wallets_core_labeled"] = count_core_labeled_wallets(output_dir)
+    return summary
+
+
+def runtime_state_path(root: Path) -> Path:
+    return root / RUNTIME_STATE_RELATIVE_PATH
+
+
+def read_runtime_state(root: Path) -> dict[str, Any]:
+    payload = read_json_file(runtime_state_path(root), {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def process_id_from(value: Any) -> int | None:
+    try:
+        pid = int(value)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def process_is_running(pid: int) -> bool:
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+
+            process_query_limited_information = 0x1000
+            still_active = 259
+            handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+            if not handle:
+                return False
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return exit_code.value == still_active
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def terminate_process_tree(pid: int) -> bool:
+    current_pid = os.getpid()
+    if pid <= 0 or pid == current_pid:
+        return False
+
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+                check=False,
+            )
+            return result.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False
+
+
+def runtime_status(root: Path) -> dict[str, Any]:
+    runtime = read_runtime_state(root)
+    pid_keys = (
+        "launcher_pid",
+        "api_process_pid",
+        "api_port_pid",
+        "frontend_process_pid",
+        "frontend_port_pid",
+        "browser_pid",
+    )
+    processes = {
+        key: {"pid": pid, "running": process_is_running(pid)}
+        for key in pid_keys
+        if (pid := process_id_from(runtime.get(key))) is not None
+    }
+    return {
+        "ok": True,
+        "root": str(root),
+        "runtime_state_path": str(runtime_state_path(root)),
+        "launched_at": runtime.get("launched_at"),
+        "frontend_url": runtime.get("frontend_url", "http://127.0.0.1:41874"),
+        "processes": processes,
+    }
+
+
+def runtime_identity(root: Path) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "root": str(root),
+        "frontend_url": "http://127.0.0.1:41874",
+    }
+
+
+def schedule_application_shutdown(server: ThreadingHTTPServer, root: Path) -> None:
+    runtime = read_runtime_state(root)
+    candidate_pids = [
+        process_id_from(runtime.get(key))
+        for key in (
+            "browser_pid",
+        )
+    ]
+    current_pid = os.getpid()
+    unique_pids = []
+    for pid in candidate_pids:
+        if pid and pid != current_pid and pid not in unique_pids:
+            unique_pids.append(pid)
+
+    def worker() -> None:
+        time.sleep(0.2)
+        for pid in unique_pids:
+            terminate_process_tree(pid)
+            time.sleep(0.2)
+        try:
+            runtime_state_path(root).unlink(missing_ok=True)
+        except OSError:
+            pass
+        server.shutdown()
+
+    thread = threading.Thread(target=worker, name="polymarket-weather-shutdown", daemon=True)
+    thread.start()
+
+
+def read_progress(path: Path | None) -> list[dict[str, str]]:
+    if not path or not path.exists():
+        return []
+    rows: list[dict[str, str]] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            if "\t" in line:
+                timestamp, message = line.split("\t", 1)
+            else:
+                timestamp, message = "", line
+            rows.append({"time": timestamp, "message": message})
+    except OSError:
+        return []
+    return rows
+
+
+def progress_view(rows: list[dict[str, str]], status: str) -> dict[str, Any]:
+    if status == "succeeded":
+        return {"phase": "Completed", "percent": 100}
+    if status == "failed":
+        return {"phase": "Failed", "percent": 100}
+    if not rows:
+        return {"phase": "Queued", "percent": 0 if status == "queued" else 5}
+
+    message = rows[-1]["message"]
+    percent = 8
+    phase = message
+    if "Fetching leaderboard" in message:
+        percent = 10
+    elif "Fetched" in message and "leaderboard" in message:
+        percent = 22
+    elif "Fetching weather events" in message:
+        percent = 30
+    elif "Indexed" in message and "weather" in message:
+        percent = 42
+    elif "Analyzing wallets" in message:
+        percent = 55
+        match = re.search(r"(\d+)-(\d+) of (\d+)", message)
+        if match:
+            end = int(match.group(2))
+            total = max(1, int(match.group(3)))
+            percent = min(96, 42 + round((end / total) * 52))
+    return {"phase": phase, "percent": percent}
+
+
+def file_metadata(path: Path, root: Path) -> dict[str, Any]:
+    stat = path.stat()
+    return {
+        "name": path.name,
+        "path": path.relative_to(root).as_posix(),
+        "type": "folder" if path.is_dir() else path.suffix.lstrip(".").lower() or "file",
+        "size": stat.st_size if path.is_file() else None,
+        "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(timespec="seconds"),
+    }
+
+
+def artifact_run_ids(artifacts_root: Path) -> list[str]:
+    if not artifacts_root.exists():
+        return []
+    runs = []
+    for path in artifacts_root.iterdir():
+        if not path.is_dir():
+            continue
+        if any(
+            (path / name).exists()
+            for name in (
+                "resolved_config.json",
+                "analysis_summary.json",
+                "selected_wallets.json",
+                "report.txt",
+            )
+        ):
+            runs.append(path.name)
+    return sorted(runs, key=lambda name: (artifacts_root / name).stat().st_mtime, reverse=True)
+
+
+def infer_artifact_status(output_dir: Path) -> str:
+    if (output_dir / "analysis_summary.json").exists() and (output_dir / "report.txt").exists():
+        return "succeeded"
+    if (output_dir / "errors.json").exists():
+        return "partial"
+    return "artifact"
+
+
+def public_run_record(state: ServerState, run_id: str, *, include_files: bool = True) -> dict[str, Any]:
+    output_dir = ensure_under(state.artifacts_root, state.artifacts_root / run_id)
+    with state.lock:
+        memory_state = state.runs.get(run_id)
+
+    if memory_state:
+        payload = asdict(memory_state)
+    else:
+        payload = {
+            "run_id": run_id,
+            "status": infer_artifact_status(output_dir),
+            "output_dir": str(output_dir),
+            "created_at": datetime.fromtimestamp(output_dir.stat().st_mtime, tz=UTC).isoformat(
+                timespec="seconds"
+            ),
+            "started_at": None,
+            "finished_at": None,
+            "result": None,
+            "error": None,
+            "progress_log_path": str(output_dir / "progress.log"),
+            "traceback": None,
+        }
+
+    progress = read_progress(Path(payload["progress_log_path"]) if payload.get("progress_log_path") else None)
+    payload["progress"] = progress
+    payload.update(progress_view(progress, str(payload["status"])))
+    if include_files:
+        payload["files"] = list_artifact_files(output_dir)
+    return payload
+
+
+def list_artifact_files(output_dir: Path) -> list[dict[str, Any]]:
+    if not output_dir.exists():
+        return []
+    files = []
+    for path in sorted(output_dir.iterdir(), key=lambda item: (not item.is_dir(), item.name)):
+        if path.name.startswith("."):
+            continue
+        files.append(file_metadata(path, output_dir))
+    return files
+
+
+def is_diagnostic_run_name(name: str) -> bool:
+    lowered = name.strip().lower()
+    return any(token in lowered for token in DIAGNOSTIC_RUN_TOKENS)
+
+
+def path_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file():
+        try:
+            return int(path.stat().st_size)
+        except OSError:
+            return 0
+    total = 0
+    for child in path.rglob("*"):
+        if not child.is_file():
+            continue
+        try:
+            total += int(child.stat().st_size)
+        except OSError:
+            continue
+    return total
+
+
+def path_file_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file():
+        return 1
+    return sum(1 for child in path.rglob("*") if child.is_file())
+
+
+def path_modified_at(path: Path) -> str:
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat(timespec="seconds")
+
+
+def build_cleanup_item(
+    *,
+    item_id: str,
+    label: str,
+    root: Path,
+    path: Path,
+    item_type: str,
+    note: str,
+    locked: bool = False,
+    locked_reason: str | None = None,
+    run_id: str | None = None,
+    status: str | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    relative_path = ensure_under(root, path).relative_to(root).as_posix()
+    item = {
+        "id": item_id,
+        "label": label,
+        "path": relative_path,
+        "item_type": item_type,
+        "size_bytes": path_size_bytes(path),
+        "file_count": path_file_count(path),
+        "modified_at": path_modified_at(path),
+        "note": note,
+        "locked": locked,
+    }
+    if locked_reason:
+        item["locked_reason"] = locked_reason
+    if run_id:
+        item["run_id"] = run_id
+    if status:
+        item["status"] = status
+    if extra:
+        item.update(extra)
+    return item
+
+
+def build_wallet_registry_items(state: ServerState) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for record_path, record in list_wallet_history_records(state.artifacts_root):
+        wallet_address = str(record.get("wallet_address") or "").strip().lower()
+        if not wallet_address:
+            continue
+        user_name = str(record.get("user_name") or "").strip()
+        label = user_name or wallet_address
+        items.append(
+            build_cleanup_item(
+                item_id=f"wallet_registry:{ensure_under(state.root, record_path).relative_to(state.root).as_posix()}",
+                label=label,
+                root=state.root,
+                path=record_path,
+                item_type="wallet_registry_entry",
+                note="历史已抓取钱包名册条目，删除后该钱包可再次进入后续抓取流程。",
+                extra={
+                    "wallet_address": wallet_address,
+                    "user_name": user_name,
+                    "x_username": str(record.get("x_username") or "").strip(),
+                    "first_seen_at": str(record.get("first_seen_at") or ""),
+                    "last_seen_at": str(record.get("last_seen_at") or ""),
+                    "run_count": int(record.get("run_count") or 0),
+                    "last_run_id": str(record.get("last_run_id") or ""),
+                    "last_status": str(record.get("last_status") or ""),
+                },
+            )
+        )
+    return sorted(
+        items,
+        key=lambda item: (
+            str(item.get("last_seen_at") or item.get("modified_at") or ""),
+            str(item.get("wallet_address") or ""),
+        ),
+        reverse=True,
+    )
+
+
+def run_prunable_paths(output_dir: Path) -> list[Path]:
+    paths: list[Path] = []
+    for name in RUN_DETAIL_PRUNE_FILES:
+        candidate = output_dir / name
+        if candidate.exists():
+            paths.append(candidate)
+    for name in RUN_DETAIL_PRUNE_DIRS:
+        candidate = output_dir / name
+        if candidate.exists():
+            paths.append(candidate)
+    return paths
+
+
+def run_prunable_size_bytes(output_dir: Path) -> int:
+    return sum(path_size_bytes(path) for path in run_prunable_paths(output_dir))
+
+
+def build_cleanup_sections(state: ServerState) -> list[dict[str, Any]]:
+    analysis_items: list[dict[str, Any]] = []
+    diagnostic_items: list[dict[str, Any]] = []
+    wallet_registry_items = build_wallet_registry_items(state)
+    output_items: list[dict[str, Any]] = []
+    runtime_items: list[dict[str, Any]] = []
+    seen_run_ids: set[str] = set()
+
+    with state.lock:
+        memory_run_ids = list(state.runs.keys())
+
+    for run_id in memory_run_ids + artifact_run_ids(state.artifacts_root):
+        if run_id in seen_run_ids:
+            continue
+        seen_run_ids.add(run_id)
+        output_dir = ensure_under(state.artifacts_root, state.artifacts_root / run_id)
+        if not output_dir.exists():
+            continue
+        record = public_run_record(state, run_id, include_files=False)
+        locked = str(record.get("status") or "") in {"queued", "running"}
+        prunable_bytes = 0 if is_diagnostic_run_name(run_id) else run_prunable_size_bytes(output_dir)
+        note = (
+            "删除后会移除该次完整分析结果、报告、钱包证据与原始附件。"
+            if not is_diagnostic_run_name(run_id)
+            else "开发期测试或诊断产物，通常可安全清理。"
+        )
+        item = build_cleanup_item(
+            item_id=f"run:{run_id}",
+            label=run_id,
+            root=state.root,
+            path=output_dir,
+            item_type="diagnostic_run" if is_diagnostic_run_name(run_id) else "analysis_run",
+            note=note,
+            locked=locked,
+            locked_reason="运行中的任务暂时不能删除。" if locked else None,
+            run_id=run_id,
+            status=str(record.get("status") or "artifact"),
+        )
+        if prunable_bytes:
+            item["detail_prunable_bytes"] = prunable_bytes
+        if is_diagnostic_run_name(run_id):
+            diagnostic_items.append(item)
+        else:
+            analysis_items.append(item)
+
+    output_root = state.root / "output"
+    if output_root.exists():
+        for child in sorted(output_root.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True):
+            if child.name.startswith("."):
+                continue
+            note = "临时输出、截图或开发验证目录。"
+            if child.suffix == ".log":
+                note = "本地开发或调试日志。"
+            output_items.append(
+                build_cleanup_item(
+                    item_id=f"output:{ensure_under(state.root, child).relative_to(state.root).as_posix()}",
+                    label=child.name,
+                    root=state.root,
+                    path=child,
+                    item_type="temp_output",
+                    note=note,
+                )
+            )
+
+    frontend_test_results_root = state.root / "frontend" / "test-results"
+    if frontend_test_results_root.exists():
+        for child in sorted(frontend_test_results_root.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True):
+            if child.name.startswith("."):
+                continue
+            output_items.append(
+                build_cleanup_item(
+                    item_id=f"output:{ensure_under(state.root, child).relative_to(state.root).as_posix()}",
+                    label=child.name,
+                    root=state.root,
+                    path=child,
+                    item_type="temp_output",
+                    note="前端测试产物或截图目录。",
+                )
+            )
+
+    api_cache_path = state.root / ".cache" / "polymarket-weather-tool"
+    if api_cache_path.exists():
+        runtime_items.append(
+            build_cleanup_item(
+                item_id="runtime:.cache/polymarket-weather-tool",
+                label="Polymarket 接口缓存",
+                root=state.root,
+                path=api_cache_path,
+                item_type="runtime_cache",
+                note="缓存的接口响应与派生运行数据。",
+            )
+        )
+    for path in collect_runtime_log_paths(state.root):
+        runtime_items.append(
+            build_cleanup_item(
+                item_id=f"runtime:{ensure_under(state.root, path).relative_to(state.root).as_posix()}",
+                label=path.name,
+                root=state.root,
+                path=path,
+                item_type="runtime_log",
+                note="启动器、API 或本地开发日志输出。",
+            )
+        )
+    for path in collect_python_cache_paths(state.root):
+        runtime_items.append(
+            build_cleanup_item(
+                item_id=f"runtime:{ensure_under(state.root, path).relative_to(state.root).as_posix()}",
+                label=path.relative_to(state.root).as_posix(),
+                root=state.root,
+                path=path,
+                item_type="python_cache",
+                note="Python 字节码缓存，删除后会自动重建。",
+            )
+        )
+
+    sections = [
+        {
+            "key": "analysis_runs",
+            "label": "历史分析结果",
+            "description": "正式分析产物，可按条删除。",
+            "items": sorted(analysis_items, key=lambda item: str(item.get("modified_at") or ""), reverse=True),
+        },
+        {
+            "key": "diagnostic_runs",
+            "label": "测试与诊断记录",
+            "description": "开发期冒烟测试、验收和诊断记录，适合集中清理。",
+            "items": sorted(diagnostic_items, key=lambda item: str(item.get("modified_at") or ""), reverse=True),
+        },
+        {
+            "key": "wallet_registry",
+            "label": "历史已抓取钱包名册",
+            "description": "去重后的历史钱包地址与用户名记录，可按钱包条目删除。",
+            "items": wallet_registry_items,
+        },
+        {
+            "key": "temp_outputs",
+            "label": "临时输出与截图",
+            "description": "Playwright 截图、开发日志与临时输出目录。",
+            "items": sorted(output_items, key=lambda item: str(item.get("modified_at") or ""), reverse=True),
+        },
+        {
+            "key": "runtime_storage",
+            "label": "运行缓存与日志",
+            "description": "接口缓存、运行日志和 Python 编译缓存。",
+            "items": sorted(runtime_items, key=lambda item: str(item.get("modified_at") or ""), reverse=True),
+        },
+    ]
+    for section in sections:
+        items = section["items"]
+        section["count"] = len(items)
+        section["size_bytes"] = sum(int(item.get("size_bytes") or 0) for item in items)
+    return sections
+
+
+def build_cleanup_item_index(sections: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+    for section in sections:
+        for item in section.get("items", []):
+            if isinstance(item, dict):
+                index[str(item.get("id") or "")] = item
+    return index
+
+
+def cleanup_targets_for_item(
+    state: ServerState,
+    item: dict[str, Any],
+    *,
+    operation: str,
+) -> tuple[list[Path], list[str]]:
+    item_type = str(item.get("item_type") or "")
+    if operation == "delete":
+        relative_path = str(item.get("path") or "")
+        run_id = str(item.get("run_id") or "")
+        return [ensure_under(state.root, state.root / relative_path)], [run_id] if run_id else []
+
+    if operation == "prune":
+        if item_type != "analysis_run":
+            raise ValueError("明细清理仅支持正式分析历史条目")
+        run_id = str(item.get("run_id") or "")
+        if not run_id:
+            raise ValueError("所选条目没有关联正式分析记录")
+        output_dir = ensure_under(state.artifacts_root, state.artifacts_root / run_id)
+        targets = run_prunable_paths(output_dir)
+        if not targets:
+            raise ValueError("所选分析记录没有可清理的明细附件")
+        return targets, []
+
+    raise ValueError(f"未知的清理操作：{operation}")
+
+
+def collect_runtime_log_paths(root: Path) -> list[Path]:
+    paths: list[Path] = []
+    runtime_logs = root / ".cache" / "runtime" / "logs"
+    if runtime_logs.exists():
+        paths.append(runtime_logs)
+    output_root = root / "output"
+    if output_root.exists():
+        for child in output_root.iterdir():
+            if child.is_file() and child.suffix == ".log":
+                paths.append(child)
+    return paths
+
+
+def collect_python_cache_paths(root: Path) -> list[Path]:
+    paths: list[Path] = []
+    for base in (root / "src", root / "tests"):
+        if not base.exists():
+            continue
+        for child in base.rglob("__pycache__"):
+            if child.is_dir():
+                paths.append(child)
+    return paths
+
+
+def build_cleanup_action_specs(
+    state: ServerState,
+    sections: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    item_index = build_cleanup_item_index(sections)
+    diagnostic_paths = [
+        ensure_under(state.root, state.root / str(item.get("path")))
+        for item in item_index.values()
+        if str(item.get("item_type") or "") == "diagnostic_run" and not bool(item.get("locked"))
+    ]
+    diagnostic_run_ids = [
+        str(item.get("run_id") or "")
+        for item in item_index.values()
+        if str(item.get("item_type") or "") == "diagnostic_run" and not bool(item.get("locked"))
+    ]
+    temp_output_paths = [
+        ensure_under(state.root, state.root / str(item.get("path")))
+        for item in item_index.values()
+        if str(item.get("item_type") or "") == "temp_output"
+    ]
+    wallet_registry_paths = [
+        ensure_under(state.root, state.root / str(item.get("path")))
+        for item in item_index.values()
+        if str(item.get("item_type") or "") == "wallet_registry_entry"
+    ]
+    api_cache_path = state.root / ".cache" / "polymarket-weather-tool"
+    runtime_cache_paths = [api_cache_path] if api_cache_path.exists() else []
+    runtime_log_paths = collect_runtime_log_paths(state.root)
+    python_cache_paths = collect_python_cache_paths(state.root)
+    prunable_targets: list[Path] = []
+    prunable_runs = 0
+    for item in item_index.values():
+        if str(item.get("item_type") or "") != "analysis_run" or bool(item.get("locked")):
+            continue
+        run_id = str(item.get("run_id") or "")
+        if not run_id:
+            continue
+        output_dir = ensure_under(state.artifacts_root, state.artifacts_root / run_id)
+        targets = run_prunable_paths(output_dir)
+        if targets:
+            prunable_runs += 1
+            prunable_targets.extend(targets)
+
+    specs: dict[str, dict[str, Any]] = {
+        "delete_diagnostic_records": {
+            "key": "delete_diagnostic_records",
+            "label": "一键删除测试与诊断记录",
+            "description": "删除冒烟测试记录、验收产物、截图和临时输出。",
+            "warning": "这会移除开发期诊断记录，但不会影响正式分析历史。",
+            "paths": diagnostic_paths,
+            "deleted_run_ids": diagnostic_run_ids,
+            "target_count": len(diagnostic_paths),
+        },
+        "delete_temp_outputs": {
+            "key": "delete_temp_outputs",
+            "label": "删除临时输出与截图",
+            "description": "删除 output 和前端测试结果目录中的临时产物，但保留根目录结构。",
+            "warning": "只会移除临时输出，不会影响历史分析结果，也不会删除清理根目录。",
+            "paths": temp_output_paths,
+            "deleted_run_ids": [],
+            "target_count": len(temp_output_paths),
+        },
+        "clear_runtime_storage": {
+            "key": "clear_runtime_storage",
+            "label": "一键清理运行缓存与日志",
+            "description": "删除接口缓存、运行日志和 Python 的 __pycache__ 编译缓存。",
+            "warning": "不会删除正式分析结果；缓存会在后续运行中自动重建。",
+            "paths": runtime_cache_paths + runtime_log_paths + python_cache_paths,
+            "deleted_run_ids": [],
+            "target_count": len(runtime_cache_paths) + len(runtime_log_paths) + len(python_cache_paths),
+        },
+        "clear_api_cache": {
+            "key": "clear_api_cache",
+            "label": "清空接口缓存",
+            "description": "删除 Polymarket 接口响应缓存，下次会重新联网抓取。",
+            "warning": "不会删除正式分析结果，但下一次分析速度可能变慢。",
+            "paths": runtime_cache_paths,
+            "deleted_run_ids": [],
+            "target_count": len(runtime_cache_paths),
+        },
+        "clear_runtime_logs": {
+            "key": "clear_runtime_logs",
+            "label": "清空运行日志",
+            "description": "删除启动器、API 和前端开发日志。",
+            "warning": "适合释放低价值日志占用，不影响正式报告。",
+            "paths": runtime_log_paths,
+            "deleted_run_ids": [],
+            "target_count": len(runtime_log_paths),
+        },
+        "clear_python_caches": {
+            "key": "clear_python_caches",
+            "label": "清空代码缓存",
+            "description": "删除 Python 的 __pycache__ 编译缓存。",
+            "warning": "删除后运行时会自动重建，通常风险很低。",
+            "paths": python_cache_paths,
+            "deleted_run_ids": [],
+            "target_count": len(python_cache_paths),
+        },
+        "prune_run_details": {
+            "key": "prune_run_details",
+            "label": "清理历史明细附件",
+            "description": "保留 report、summary 和 selected_wallets，删除钱包明细与原始快照。",
+            "warning": "清理后仍能看摘要和报告，但钱包详情页与深度证据会不可用。",
+            "paths": prunable_targets,
+            "deleted_run_ids": [],
+            "target_count": prunable_runs,
+        },
+        "clear_wallet_registry": {
+            "key": "clear_wallet_registry",
+            "label": "清空历史钱包名册",
+            "description": "删除历史已抓取钱包名册中的全部钱包条目。",
+            "warning": "清空后，后续分析不会再跳过这些历史钱包，旧钱包可能重新被抓取。",
+            "paths": wallet_registry_paths,
+            "deleted_run_ids": [],
+            "target_count": len(wallet_registry_paths),
+        },
+    }
+    for spec in specs.values():
+        spec["size_bytes"] = sum(path_size_bytes(path) for path in spec["paths"])
+    return specs
+
+
+def build_cleanup_inventory(state: ServerState) -> dict[str, Any]:
+    sections = build_cleanup_sections(state)
+    action_specs = build_cleanup_action_specs(state, sections)
+    actions = [
+        {
+            "key": spec["key"],
+            "label": spec["label"],
+            "description": spec["description"],
+            "warning": spec["warning"],
+            "target_count": spec["target_count"],
+            "size_bytes": spec["size_bytes"],
+        }
+        for spec in action_specs.values()
+    ]
+    return {
+        "generated_at": now_iso(),
+        "sections": sections,
+        "actions": actions,
+    }
+
+
+def dedupe_cleanup_paths(paths: list[Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in sorted((path.resolve() for path in paths if path.exists()), key=lambda item: (len(item.parts), str(item))):
+        if path in seen:
+            continue
+        if any(parent == path or parent in path.parents for parent in unique):
+            continue
+        unique.append(path)
+        seen.add(path)
+    return unique
+
+
+def ensure_cleanup_path_allowed(state: ServerState, path: Path) -> Path:
+    target = ensure_under(state.root, path)
+    cleanup_roots = (
+        state.artifacts_root,
+        state.root / "output",
+        state.root / ".cache",
+        state.root / "frontend" / "test-results",
+    )
+    for cleanup_root in cleanup_roots:
+        cleanup_root = cleanup_root.resolve()
+        if target == cleanup_root:
+            raise ValueError(f"refusing to delete cleanup root: {target}")
+        if cleanup_root in target.parents:
+            return target
+
+    python_cache_roots = (state.root / "src", state.root / "tests")
+    if target.name == "__pycache__" and any(base.resolve() in target.parents for base in python_cache_roots):
+        return target
+
+    raise ValueError(f"path is outside cleanup-safe roots: {target}")
+
+
+def remove_cleanup_path(state: ServerState, path: Path) -> int:
+    target = ensure_cleanup_path_allowed(state, path)
+    size_bytes = path_size_bytes(target)
+    if not target.exists():
+        return 0
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink(missing_ok=True)
+    return size_bytes
+
+
+def perform_cleanup_delete(
+    state: ServerState,
+    *,
+    item_ids: list[str] | None = None,
+    action_key: str | None = None,
+    operation: str = "delete",
+) -> dict[str, Any]:
+    operation = str(operation or "delete").strip().lower()
+    if operation not in {"delete", "prune"}:
+        raise ValueError(f"未知的清理操作：{operation}")
+
+    sections = build_cleanup_sections(state)
+    item_index = build_cleanup_item_index(sections)
+    deleted_run_ids: list[str] = []
+    target_paths: list[Path] = []
+    deleted_item_ids: list[str] = []
+    affected_count = 0
+
+    if item_ids:
+        for item_id in item_ids:
+            item = item_index.get(item_id)
+            if item is None:
+                raise ValueError(f"未知的清理条目：{item_id}")
+            if bool(item.get("locked")):
+                raise ValueError(str(item.get("locked_reason") or "所选条目已锁定，暂时不能清理"))
+            item_paths, item_run_ids = cleanup_targets_for_item(
+                state,
+                item,
+                operation=operation,
+            )
+            target_paths.extend(item_paths)
+            deleted_run_ids.extend(item_run_ids)
+            if operation == "delete":
+                deleted_item_ids.append(item_id)
+            affected_count += 1
+    elif action_key:
+        if operation != "delete":
+            raise ValueError("快捷清理动作不支持额外的操作模式")
+        action_specs = build_cleanup_action_specs(state, sections)
+        spec = action_specs.get(action_key)
+        if spec is None:
+            raise ValueError(f"未知的清理动作：{action_key}")
+        target_paths.extend(spec["paths"])
+        deleted_run_ids.extend(str(run_id) for run_id in spec.get("deleted_run_ids", []))
+        affected_count = int(spec.get("target_count") or 0)
+    else:
+        raise ValueError("清理请求必须提供 item_ids 或 action_key")
+
+    deleted_paths = dedupe_cleanup_paths(target_paths)
+    removed_bytes = 0
+    for path in deleted_paths:
+        removed_bytes += remove_cleanup_path(state, path)
+
+    if deleted_run_ids:
+        with state.lock:
+            for run_id in deleted_run_ids:
+                run_state = state.runs.get(run_id)
+                if run_state and run_state.status not in {"queued", "running"}:
+                    state.runs.pop(run_id, None)
+
+    return {
+        "ok": True,
+        "deleted_count": affected_count if affected_count else len(deleted_paths),
+        "deleted_bytes": removed_bytes,
+        "deleted_item_ids": deleted_item_ids,
+        "deleted_run_ids": sorted({run_id for run_id in deleted_run_ids if run_id}),
+        "inventory": build_cleanup_inventory(state),
+    }
+
+
+def build_run_payload(state: ServerState, body: dict[str, Any]) -> RunState:
+    run_id = str(body.get("run_id") or new_run_id()).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", run_id):
+        raise ValueError("run_id may only contain letters, numbers, dots, underscores, and dashes")
+
+    raw_output_dir = body.get("output_dir")
+    output_dir = (
+        resolve_under_root(state.root, str(raw_output_dir))
+        if raw_output_dir
+        else state.artifacts_root / run_id
+    )
+    ensure_under(state.artifacts_root, output_dir)
+
+    progress_log_path = output_dir / "progress.log"
+    return RunState(
+        run_id=run_id,
+        status="queued",
+        output_dir=str(output_dir),
+        created_at=now_iso(),
+        progress_log_path=str(progress_log_path),
+    )
+
+
+def build_config_for_run(state: ServerState, body: dict[str, Any], run_state: RunState) -> dict[str, Any]:
+    config_path = resolve_under_root(
+        state.root,
+        str(body.get("config_path") or DEFAULT_CONFIG_PATH),
+    )
+    ensure_under(state.root, config_path)
+    load_project_env(state.root)
+    config = load_config(config_path)
+    overrides = dict(body.get("overrides") or {})
+    config = apply_overrides(
+        config,
+        target_count=optional_int(overrides.get("target_count")),
+        min_pnl=optional_number(overrides.get("min_pnl")),
+        max_pnl=optional_number(overrides.get("max_pnl")),
+        min_volume=optional_number(overrides.get("min_volume")),
+        max_volume=optional_number(overrides.get("max_volume")),
+        min_traded_count=optional_int(overrides.get("min_traded_count")),
+        max_traded_count=optional_int(overrides.get("max_traded_count")),
+        min_weather_trade_ratio=optional_number(overrides.get("min_weather_trade_ratio")),
+        fetch_limit=optional_int(overrides.get("fetch_limit")),
+        max_fetch_limit=optional_int(overrides.get("max_fetch_limit")),
+        max_weather_events=optional_int(overrides.get("max_weather_events")),
+        max_wallet_offset=optional_int(overrides.get("max_wallet_offset")),
+        concurrent_wallets=optional_int(overrides.get("concurrent_wallets")),
+        verbose=optional_bool(overrides.get("verbose")),
+        use_cache=optional_bool(overrides.get("use_cache")),
+        enable_chain_validation=optional_bool(overrides.get("enable_chain_validation")),
+        chain_api_key_env=optional_str(overrides.get("chain_api_key_env")),
+    )
+
+    runtime = config.setdefault("runtime", {})
+    runtime["run_id"] = run_state.run_id
+    runtime["progress_log_path"] = run_state.progress_log_path
+    return config
+
+
+def optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    return int(value)
+
+
+def optional_number(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    return float(value)
+
+
+def optional_bool(value: Any) -> bool | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def optional_str(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def run_in_background(state: ServerState, run_state: RunState, config: dict[str, Any]) -> None:
+    def target() -> None:
+        from .analysis import run_pipeline
+
+        with state.lock:
+            run_state.status = "running"
+            run_state.started_at = now_iso()
+        try:
+            result = run_pipeline(config=config, output_dir=Path(run_state.output_dir))
+            with state.lock:
+                run_state.status = "succeeded"
+                run_state.result = result
+                run_state.finished_at = now_iso()
+        except Exception as exc:  # pragma: no cover - defensive HTTP boundary
+            with state.lock:
+                run_state.status = "failed"
+                run_state.error = str(exc)
+                run_state.traceback = traceback.format_exc()
+                run_state.finished_at = now_iso()
+
+    thread = threading.Thread(target=target, name=f"polymarket-weather-{run_state.run_id}", daemon=True)
+    thread.start()
+
+
+class ApiHandler(BaseHTTPRequestHandler):
+    server_version = "PolymarketWeatherAPI/0.1"
+
+    @property
+    def app_state(self) -> ServerState:
+        return self.server.app_state  # type: ignore[attr-defined]
+
+    def do_OPTIONS(self) -> None:
+        if not self.request_origin_allowed():
+            self.send_error_json(HTTPStatus.FORBIDDEN, "origin is not allowed")
+            return
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_cors_headers()
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        try:
+            parsed = urlparse(self.path)
+            parts = [unquote(part) for part in parsed.path.strip("/").split("/") if part]
+            query = parse_qs(parsed.query)
+            if parts == ["api", "health"]:
+                self.send_json({"ok": True, "time": now_iso()})
+                return
+            if parts == ["api", "system", "status"]:
+                self.send_json(runtime_status(self.app_state.root))
+                return
+            if parts == ["api", "system", "identity"]:
+                self.send_json(runtime_identity(self.app_state.root))
+                return
+            if parts == ["api", "config", "default"]:
+                config_path = ensure_under(self.app_state.root, self.app_state.root / DEFAULT_CONFIG_PATH)
+                self.send_json(read_json_file(config_path, {}))
+                return
+            if parts == ["api", "history", "cleanup"]:
+                self.send_json(build_cleanup_inventory(self.app_state))
+                return
+            if parts == ["api", "runs"]:
+                self.send_json({"items": self.handle_list_runs()})
+                return
+            if len(parts) >= 3 and parts[:2] == ["api", "runs"]:
+                self.handle_run_get(parts[2:], query)
+                return
+            if parts and parts[0] == "api":
+                self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
+                return
+            self.serve_frontend(parsed.path)
+            return
+        except Exception as exc:
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    def do_POST(self) -> None:
+        try:
+            if not self.request_origin_allowed():
+                self.send_error_json(HTTPStatus.FORBIDDEN, "origin is not allowed")
+                return
+            parsed = urlparse(self.path)
+            parts = [unquote(part) for part in parsed.path.strip("/").split("/") if part]
+            body = self.read_json_body()
+            if parts == ["api", "runs"]:
+                run_state = build_run_payload(self.app_state, body)
+                config = build_config_for_run(self.app_state, body, run_state)
+                Path(run_state.output_dir).mkdir(parents=True, exist_ok=True)
+                with self.app_state.lock:
+                    if run_state.run_id in self.app_state.runs:
+                        self.send_error_json(HTTPStatus.CONFLICT, "run_id already exists")
+                        return
+                    self.app_state.runs[run_state.run_id] = run_state
+                run_in_background(self.app_state, run_state, config)
+                self.send_json(public_run_record(self.app_state, run_state.run_id), status=HTTPStatus.ACCEPTED)
+                return
+            if parts == ["api", "system", "shutdown"]:
+                self.send_json({"ok": True, "message": "application shutdown requested"})
+                schedule_application_shutdown(self.server, self.app_state.root)  # type: ignore[arg-type]
+                return
+            if parts == ["api", "config", "default"]:
+                self.update_default_config(body)
+                return
+            if parts == ["api", "history", "cleanup", "delete"]:
+                item_ids_raw = body.get("item_ids") or []
+                action_key = str(body.get("action_key") or "").strip() or None
+                operation = str(body.get("operation") or "delete").strip().lower() or "delete"
+                if item_ids_raw and not isinstance(item_ids_raw, list):
+                    raise ValueError("item_ids must be a list")
+                item_ids = [str(item).strip() for item in item_ids_raw if str(item).strip()] if isinstance(item_ids_raw, list) else []
+                self.send_json(
+                    perform_cleanup_delete(
+                        self.app_state,
+                        item_ids=item_ids or None,
+                        action_key=action_key,
+                        operation=operation,
+                    )
+                )
+                return
+            self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except Exception as exc:
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    def do_PUT(self) -> None:
+        self.do_POST()
+
+    def handle_list_runs(self) -> list[dict[str, Any]]:
+        items = []
+        seen: set[str] = set()
+        with self.app_state.lock:
+            memory_run_ids = list(self.app_state.runs.keys())
+        for run_id in memory_run_ids + artifact_run_ids(self.app_state.artifacts_root):
+            if run_id in seen:
+                continue
+            seen.add(run_id)
+            try:
+                items.append(public_run_record(self.app_state, run_id, include_files=False))
+            except OSError:
+                continue
+        return sorted(items, key=lambda item: str(item.get("created_at") or ""), reverse=True)
+
+    def handle_run_get(self, parts: list[str], query: dict[str, list[str]]) -> None:
+        run_id = parts[0]
+        output_dir = ensure_under(self.app_state.artifacts_root, self.app_state.artifacts_root / run_id)
+        if not output_dir.exists():
+            self.send_error_json(HTTPStatus.NOT_FOUND, "run not found")
+            return
+
+        if len(parts) == 1:
+            self.send_json(public_run_record(self.app_state, run_id))
+            return
+        if parts[1:] == ["summary"]:
+            self.send_json(read_run_summary(output_dir))
+            return
+        if parts[1:] == ["wallets"]:
+            self.send_json(self.wallets_response(output_dir, query))
+            return
+        if len(parts) == 3 and parts[1] == "wallets":
+            wallet = parts[2].lower()
+            wallet_path = ensure_under(output_dir / "wallets", output_dir / "wallets" / f"{wallet}.json")
+            payload = read_json_file(wallet_path)
+            if payload is None:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "wallet not found")
+                return
+            self.send_json(payload)
+            return
+        if parts[1:] == ["report"]:
+            report_path = output_dir / "report.txt"
+            if not report_path.exists():
+                self.send_error_json(HTTPStatus.NOT_FOUND, "report not found")
+                return
+            self.send_text(report_path.read_text(encoding="utf-8"))
+            return
+        if parts[1:] == ["files"]:
+            self.send_json({"items": list_artifact_files(output_dir)})
+            return
+        if parts[1:] == ["artifact"]:
+            path_values = query.get("path") or [""]
+            self.send_artifact(output_dir, path_values[0])
+            return
+        self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
+
+    def wallets_response(self, output_dir: Path, query: dict[str, list[str]]) -> dict[str, Any]:
+        wallets = read_json_file(output_dir / "selected_wallets.json", []) or []
+        offset = int((query.get("offset") or ["0"])[0])
+        limit = int((query.get("limit") or [str(len(wallets) or 50)])[0])
+        limit = max(1, min(500, limit))
+        offset = max(0, offset)
+        return {"items": wallets[offset : offset + limit], "total": len(wallets), "offset": offset, "limit": limit}
+
+    def send_artifact(self, output_dir: Path, raw_path: str) -> None:
+        if not raw_path:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "path is required")
+            return
+        artifact_path = ensure_under(output_dir, output_dir / raw_path)
+        if artifact_path.is_dir():
+            self.send_json({"items": list_artifact_files(artifact_path)})
+            return
+        if not artifact_path.exists():
+            self.send_error_json(HTTPStatus.NOT_FOUND, "artifact not found")
+            return
+        text = artifact_path.read_text(encoding="utf-8")
+        content_type = "application/json" if artifact_path.suffix == ".json" else "text/plain; charset=utf-8"
+        self.send_text(text, content_type=content_type)
+
+    def update_default_config(self, body: dict[str, Any]) -> None:
+        payload = body.get("config", body)
+        if not isinstance(payload, dict):
+            raise ValueError("config payload must be an object")
+        config_path = ensure_under(self.app_state.root, self.app_state.root / DEFAULT_CONFIG_PATH)
+        backup_path = config_path.with_suffix(".json.bak")
+        if config_path.exists() and not backup_path.exists():
+            backup_path.write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
+        write_json_file(config_path, payload)
+        self.send_json({"ok": True, "path": str(config_path)})
+
+    def serve_frontend(self, raw_path: str) -> None:
+        dist_root = FRONTEND_DIST.resolve()
+        index_path = dist_root / "index.html"
+        if not index_path.exists():
+            self.send_error_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "frontend build is missing; run npm run build in frontend",
+            )
+            return
+
+        relative = unquote(raw_path.split("?", 1)[0]).lstrip("/")
+        if not relative or relative.endswith("/"):
+            target_path = index_path
+        else:
+            try:
+                target_path = ensure_under(dist_root, dist_root / relative)
+            except ValueError:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
+                return
+            if not target_path.exists() or target_path.is_dir():
+                target_path = index_path
+
+        content_type = mimetypes.guess_type(str(target_path))[0] or "application/octet-stream"
+        if target_path.suffix == ".html":
+            content_type = "text/html; charset=utf-8"
+        elif target_path.suffix in {".js", ".mjs"}:
+            content_type = "text/javascript; charset=utf-8"
+        elif target_path.suffix == ".css":
+            content_type = "text/css; charset=utf-8"
+
+        try:
+            data = target_path.read_bytes()
+        except OSError as exc:
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+            return
+
+        self.send_response(HTTPStatus.OK)
+        self.send_cors_headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        if target_path == index_path:
+            self.send_header("Cache-Control", "no-cache")
+        elif "/assets/" in target_path.as_posix():
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        else:
+            self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def read_json_body(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length).decode("utf-8")
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        return payload
+
+    def request_origin_allowed(self) -> bool:
+        origin = self.headers.get("Origin")
+        return not origin or origin in ALLOWED_BROWSER_ORIGINS
+
+    def send_cors_headers(self) -> None:
+        origin = self.headers.get("Origin")
+        if origin in ALLOWED_BROWSER_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "false")
+        self.send_header("Vary", "Origin")
+
+    def send_json(self, payload: Any, *, status: HTTPStatus = HTTPStatus.OK) -> None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_cors_headers()
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_text(
+        self,
+        text: str,
+        *,
+        status: HTTPStatus = HTTPStatus.OK,
+        content_type: str = "text/plain; charset=utf-8",
+    ) -> None:
+        data = text.encode("utf-8")
+        self.send_response(status)
+        self.send_cors_headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_error_json(self, status: HTTPStatus, message: str) -> None:
+        self.send_json({"ok": False, "error": message}, status=status)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        print(f"[api] {self.address_string()} - {format % args}")
+
+
+def create_server(host: str, port: int, root: Path = PROJECT_ROOT) -> ThreadingHTTPServer:
+    root = root.resolve()
+    artifacts_root = root / "artifacts"
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+    server = ThreadingHTTPServer((host, port), ApiHandler)
+    server.app_state = ServerState(root=root, artifacts_root=artifacts_root)  # type: ignore[attr-defined]
+    return server
+
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run the local Polymarket Weather Tool API.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=41874)
+    parser.add_argument("--root", default=str(PROJECT_ROOT))
+    args = parser.parse_args()
+
+    load_project_env(args.root)
+    server = create_server(args.host, args.port, root=Path(args.root))
+    print(f"Polymarket Weather API listening on http://{args.host}:{args.port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

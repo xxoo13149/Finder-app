@@ -1,0 +1,169 @@
+{
+  "api": {
+    "timeout_seconds": 20,
+    "retry_count": 3,
+    "retry_backoff_seconds": 1.5,
+    "request_delay_seconds": 0.15,
+    "user_agent": "polymarket-weather-tool/0.1.0",
+    "use_cache": true,
+    "cache_dir": ".cache/polymarket-weather-tool",
+    "cache_ttl_seconds": 1800
+  },
+  "leaderboard": {
+    "category": "WEATHER",
+    "time_period": "DAY",
+    "order_by": "PNL",
+    "fetch_limit": 100,
+    "auto_extend_to_target": true,
+    "max_fetch_limit": 300,
+    "page_size": 50
+  },
+  "wallet_filter": {
+    "target_count": 10,
+    "min_pnl": 0.01,
+    "max_pnl": 200,
+    "min_volume": 0,
+    "max_volume": 40000,
+    "min_traded_count": 11,
+    "max_traded_count": 200,
+    "min_weather_trade_ratio": 0.5,
+    "include_wallets": [],
+    "exclude_wallets": []
+  },
+  "pagination": {
+    "page_size": 500,
+    "max_offset": 10000
+  },
+  "weather": {
+    "tag_id": 84,
+    "tag_slug": "weather",
+    "use_keyset": true,
+    "order": "createdAt",
+    "ascending": false,
+    "max_events": 1000,
+    "active_only": false,
+    "closed_only": false,
+    "include_archived": true,
+    "page_size": 200
+  },
+  "analysis": {
+    "concurrent_wallets": 4,
+    "long_dated_threshold_days": 90,
+    "recent_active_days": 3,
+    "normal_active_days": 1,
+    "new_wallet_days": 60,
+    "hidden_new_wallet_days": 10,
+    "regional_frequency_min_day_ratio": 0.4,
+    "regional_win_rate_min_trade_count": 3,
+    "position_size_threshold": 0.1,
+    "region_fields": [
+      "region",
+      "regionName",
+      "region_name",
+      "location",
+      "locationName",
+      "location_name",
+      "city",
+      "marketRegion",
+      "market_region",
+      "eventRegion",
+      "event_region",
+      "event.region",
+      "event.location",
+      "market.region",
+      "market.location"
+    ],
+    "top_positions_in_report": 5,
+    "top_trades_in_report": 5,
+    "top_closed_positions_in_report": 5
+  },
+  "chain_validation": {
+    "enabled": true,
+    "api_key_envs": [
+      "ETHERSCAN_API_KEY",
+      "POLYGONSCAN_API_KEY"
+    ],
+    "provider_base_url": "https://api.etherscan.io",
+    "chain_id": 137,
+    "neg_risk_adapter": "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296",
+    "positions_converted_topic0": "0xb03d19dddbc72a87e735ff0ea3b57bef133ebe44e1894284916a84044deb367e",
+    "from_block": 0,
+    "to_block": 99999999,
+    "page": 1,
+    "offset": 1000,
+    "fetch_first_transaction": true,
+    "split_target_avg_chip_cost": 5,
+    "split_avg_chip_cost_tolerance": 0.5,
+    "min_split_evidence_count": 2
+  },
+  "runtime": {
+    "verbose": false
+  },
+  "labels": [
+    {
+      "key": "normal_active",
+      "display_name": "正常活跃",
+      "description": "最新交易日期距当前日期不超过正常活跃窗口。",
+      "enabled": true,
+      "all": [
+        {
+          "field": "activity_level",
+          "op": "==",
+          "value": "normal_active"
+        }
+      ]
+    },
+    {
+      "key": "low_active",
+      "display_name": "低活跃",
+      "description": "最新交易日期距当前日期在三天活跃窗口内，但超过正常活跃窗口。",
+      "enabled": true,
+      "all": [
+        {
+          "field": "activity_level",
+          "op": "==",
+          "value": "low_active"
+        }
+      ]
+    },
+    {
+      "key": "new_wallet",
+      "display_name": "新钱包",
+      "description": "注册地址或首笔可验证链上交易日期距当前日期小于两个月。",
+      "enabled": true,
+      "all": [
+        {
+          "field": "new_wallet_matched",
+          "op": "==",
+          "value": true
+        }
+      ]
+    },
+    {
+      "key": "hidden_expert_new_wallet",
+      "display_name": "隐藏高手新钱包",
+      "description": "注册地址或首笔可验证链上交易日期距当前日期小于十天。",
+      "enabled": true,
+      "all": [
+        {
+          "field": "hidden_new_wallet_matched",
+          "op": "==",
+          "value": true
+        }
+      ]
+    },
+    {
+      "key": "early_positioning",
+      "display_name": "提前埋伏",
+      "description": "最高温气温市场中，买入日期与对应最高温日期不同日的记录占比大于 50%。",
+      "enabled": true,
+      "all": [
+        {
+          "field": "high_temp_early_positioning_matched",
+          "op": "==",
+          "value": true
+        }
+      ]
+    }
+  ]
+}
