@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from polymarket_weather_tool import analysis
+from polymarket_weather_tool.config import WEEKLY_HIGH_PROFIT_MODE, apply_analysis_mode
 
 
 UTC = timezone.utc
@@ -339,6 +340,76 @@ class PipelineSmokeTests(unittest.TestCase):
         self.assertFalse(screening["selected"])
         self.assertIn("failed:weather_trade_ratio>=0.5", screening["reasons"])
 
+    def test_build_screening_record_prefers_period_scoped_trade_metrics(self) -> None:
+        config = small_config(Path("cache"))
+        config["wallet_filter"].update(
+            {
+                "min_traded_count": 2,
+                "max_traded_count": 10,
+                "min_weather_trade_ratio": 0.5,
+            }
+        )
+        metrics = {
+            "leaderboard_pnl": 120.0,
+            "leaderboard_volume": 2000.0,
+            "trade_count": 300,
+            "screening_trade_count": 5,
+            "weather_trade_count": 12,
+            "screening_weather_trade_count": 3,
+            "weather_trade_ratio": 0.04,
+            "screening_weather_trade_ratio": 0.6,
+            "weather_notional_ratio": 0.1,
+            "screening_weather_notional_ratio": 0.8,
+        }
+
+        screening = analysis.build_screening_record(
+            WALLET,
+            {"rank": 1, "userName": "screening-period", "xUsername": "screening_period"},
+            metrics,
+            config,
+        )
+
+        self.assertTrue(screening["selected"])
+        self.assertEqual(screening["trade_count"], 5)
+        self.assertEqual(screening["weather_trade_count"], 3)
+        self.assertAlmostEqual(screening["weather_trade_ratio"], 0.6)
+        self.assertAlmostEqual(screening["weather_notional_ratio"], 0.8)
+
+    def test_build_screening_record_weekly_mode_accepts_weather_notional_ratio_even_when_trade_ratio_is_low(self) -> None:
+        standard_config = small_config(Path("cache"))
+        weekly_config = apply_analysis_mode(small_config(Path("cache")), WEEKLY_HIGH_PROFIT_MODE)
+        metrics = {
+            "leaderboard_pnl": 120.0,
+            "leaderboard_volume": 2000.0,
+            "trade_count": 12,
+            "weather_trade_count": 2,
+            "weather_trade_ratio": 2 / 12,
+            "weather_notional_ratio": 0.5,
+        }
+        leaderboard_entry = {
+            "rank": 1,
+            "userName": "screening-weekly",
+            "xUsername": "screening_weekly",
+        }
+
+        standard_screening = analysis.build_screening_record(
+            WALLET,
+            leaderboard_entry,
+            metrics,
+            standard_config,
+        )
+        weekly_screening = analysis.build_screening_record(
+            WALLET,
+            leaderboard_entry,
+            metrics,
+            weekly_config,
+        )
+
+        self.assertFalse(standard_screening["selected"])
+        self.assertIn("failed:weather_trade_ratio>=0.5", standard_screening["reasons"])
+        self.assertTrue(weekly_screening["selected"])
+        self.assertEqual(weekly_screening["reasons"], ["passed all numeric filters"])
+
     def test_weather_index_maps_market_dates_for_high_temperature_records(self) -> None:
         weather_index = analysis.build_weather_index(
             [
@@ -394,6 +465,10 @@ class PipelineSmokeTests(unittest.TestCase):
         self.assertEqual(metrics["trade_count"], 4)
         self.assertEqual(metrics["weather_trade_count"], 3)
         self.assertAlmostEqual(metrics["weather_notional_ratio"], 0.5)
+        self.assertEqual(metrics["screening_trade_count"], 4)
+        self.assertEqual(metrics["screening_weather_trade_count"], 3)
+        self.assertAlmostEqual(metrics["screening_weather_trade_ratio"], 0.75)
+        self.assertAlmostEqual(metrics["screening_weather_notional_ratio"], 0.5)
         self.assertAlmostEqual(metrics["closed_position_win_rate"], 2 / 3)
         self.assertAlmostEqual(metrics["median_trade_notional"], 37.5)
         self.assertGreater(metrics["trades_per_active_day"], 0)
@@ -425,6 +500,35 @@ class PipelineSmokeTests(unittest.TestCase):
         self.assertEqual(profile["closed_position_pnl"]["win_count"], 2)
         self.assertEqual(profile["closed_position_pnl"]["loss_count"], 1)
         self.assertAlmostEqual(profile["closed_position_pnl"]["total_realized_pnl"], 16.0)
+
+    def test_compute_metrics_scopes_screening_trade_counts_to_leaderboard_period(self) -> None:
+        client = FakePolymarketClient({"use_cache": False})
+        events = client.fetch_events_keyset_page(limit=1)["events"]
+        weather_index = analysis.build_weather_index(events)
+        snapshot = {
+            "wallet": WALLET,
+            "activity": client.fetch_activity_page(user=WALLET, limit=10, offset=0),
+            "trades": client.fetch_trades_page(user=WALLET, limit=10, offset=0),
+            "rewards": [{"type": "REWARD", "usdcSize": "12.34"}],
+            "positions": client.fetch_positions_page(user=WALLET, limit=10, offset=0),
+            "closed_positions": client.fetch_closed_positions_page(user=WALLET, limit=10, offset=0),
+        }
+        config = small_config(Path("cache"))
+        config["leaderboard"]["time_period"] = "DAY"
+        config["analysis"]["current_datetime"] = (BASE_DT + timedelta(days=5)).isoformat()
+
+        metrics = analysis.compute_metrics(
+            snapshot=snapshot,
+            leaderboard_entry={"pnl": "250.50", "vol": "2400"},
+            weather_index=weather_index,
+            config=config,
+        )
+
+        self.assertEqual(metrics["trade_count"], 4)
+        self.assertEqual(metrics["screening_trade_count"], 1)
+        self.assertEqual(metrics["screening_weather_trade_count"], 1)
+        self.assertAlmostEqual(metrics["screening_weather_trade_ratio"], 1.0)
+        self.assertAlmostEqual(metrics["screening_weather_notional_ratio"], 1.0)
 
     def test_fetch_optional_chain_validation_extracts_positions_converted_logs(self) -> None:
         class FakeChainClient:
@@ -684,6 +788,57 @@ class PipelineSmokeTests(unittest.TestCase):
                 16.0,
             )
             self.assertTrue(metrics["snapshot_complete"])
+            self.assertIn("finder_ai", wallet_result)
+            self.assertTrue(wallet_result["finder_ai"]["runId"])
+            self.assertEqual(wallet_result["finder_ai"]["normalizedAddress"], WALLET)
+            self.assertEqual(wallet_result["finder_ai"]["wallet"]["address"], WALLET)
+            self.assertEqual(wallet_result["finder_ai"]["providerMeta"]["provider"], "deepseek")
+            self.assertEqual(
+                wallet_result["finder_ai"]["providerMeta"]["promptVersion"],
+                "finder-weather-brief-v1",
+            )
+            self.assertTrue(
+                str(wallet_result["finder_ai"]["providerMeta"]["inputHash"]).startswith("sha256:")
+            )
+            self.assertIn("layeredInput", wallet_result["finder_ai"])
+            self.assertEqual(
+                wallet_result["finder_ai"]["layeredInput"]["L0"]["normalizedAddress"],
+                WALLET,
+            )
+            self.assertEqual(
+                wallet_result["finder_ai"]["layeredInput"]["L2"]["primarySignals"][0]["key"],
+                "high_frequency_region",
+            )
+            self.assertIn("briefGeneration", wallet_result["finder_ai"])
+            self.assertTrue(wallet_result["finder_ai"]["briefGeneration"]["enabled"])
+            self.assertEqual(
+                wallet_result["finder_ai"]["briefGeneration"]["status"],
+                "ready",
+            )
+            self.assertGreaterEqual(
+                wallet_result["finder_ai"]["briefGeneration"]["gate"]["structuredEvidenceCount"],
+                1,
+            )
+            self.assertIn("structured_materials", wallet_result)
+            structured_materials = wallet_result["structured_materials"]
+            self.assertEqual(structured_materials["identity"]["normalized_address"], WALLET)
+            self.assertEqual(structured_materials["summary"]["main_region"], "NYC")
+            self.assertTrue(structured_materials["summary"]["source_excerpt"])
+            self.assertTrue(structured_materials["summary"]["latest_evidence_date"])
+            self.assertEqual(
+                structured_materials["signals"]["label_hits"][0]["label_key"],
+                "high_frequency_region",
+            )
+            self.assertEqual(
+                structured_materials["signals"]["primary_signals"][0]["key"],
+                "high_frequency_region",
+            )
+            self.assertEqual(
+                structured_materials["signals"]["weather_signals"]["market_scope"],
+                "weather",
+            )
+            self.assertTrue(structured_materials["records"]["trade_samples"])
+            self.assertTrue(structured_materials["records"]["trade_samples"][0]["market_title"])
 
             profile = wallet_result["profile"]
             self.assertEqual(profile, metrics["profile"])
@@ -729,6 +884,178 @@ class PipelineSmokeTests(unittest.TestCase):
                     "positions",
                     "closed_positions",
                 ],
+            )
+
+    def test_build_analysis_summary_tracks_finder_ai_run_stats(self) -> None:
+        def wallet_result(
+            wallet: str,
+            *,
+            status: str,
+            generated_at: str = "",
+            needs_review: bool = False,
+            has_conflict: bool = False,
+            eligible: bool = True,
+        ) -> dict[str, Any]:
+            return {
+                "wallet": wallet,
+                "metrics": {
+                    "weather_notional_ratio": 0.5,
+                    "closed_position_win_rate": 0.6,
+                    "closed_profit_multiple": 1.8,
+                    "trades_per_active_day": 3.5,
+                    "leaderboard_pnl": 120.0,
+                    "trade_count": 14,
+                },
+                "labels": [{"display_name": "Weather specialist"}],
+                "label_evaluations": [
+                    {"key": "high_frequency_region", "matched": wallet.endswith("1")}
+                ],
+                "leaderboard_entry": {
+                    "rank": 1,
+                    "userName": f"user-{wallet[-1]}",
+                    "xUsername": f"x_user_{wallet[-1]}",
+                },
+                "selection_record": {"user_name": f"user-{wallet[-1]}"},
+                "finder_ai": {
+                    "needsReview": needs_review,
+                    "hasConflict": has_conflict,
+                    "providerMeta": {"generatedAt": generated_at},
+                    "briefGeneration": {
+                        "status": status,
+                        "gate": {"eligible": eligible},
+                    },
+                },
+            }
+
+        summary = analysis.build_analysis_summary(
+            leaderboard=[{"wallet": "a"}],
+            weather_events=[{"id": "weather-event"}],
+            screening_records=[{"wallet": "a"}, {"wallet": "b"}, {"wallet": "c"}, {"wallet": "d"}],
+            wallet_results=[
+                wallet_result(
+                    "0x0000000000000000000000000000000000000001",
+                    status="generated",
+                    generated_at="2026-05-05T09:00:00+00:00",
+                ),
+                wallet_result(
+                    "0x0000000000000000000000000000000000000002",
+                    status="cached",
+                    generated_at="2026-05-05T10:00:00+00:00",
+                    has_conflict=True,
+                ),
+                wallet_result(
+                    "0x0000000000000000000000000000000000000003",
+                    status="failed",
+                    needs_review=True,
+                ),
+                wallet_result(
+                    "0x0000000000000000000000000000000000000004",
+                    status="insufficient",
+                    eligible=False,
+                ),
+            ],
+            errors=[],
+        )
+
+        self.assertEqual(summary["wallets_selected"], 4)
+        self.assertEqual(summary["wallets_core_labeled"], 1)
+        self.assertEqual(summary["finder_ai_summary"]["selected_wallets"], 4)
+        self.assertEqual(summary["finder_ai_summary"]["finder_ai_present"], 4)
+        self.assertEqual(summary["finder_ai_summary"]["eligible"], 3)
+        self.assertEqual(summary["finder_ai_summary"]["generated"], 1)
+        self.assertEqual(summary["finder_ai_summary"]["cached"], 1)
+        self.assertEqual(summary["finder_ai_summary"]["failed"], 1)
+        self.assertEqual(summary["finder_ai_summary"]["skipped"], 1)
+        self.assertEqual(summary["finder_ai_summary"]["needs_review"], 1)
+        self.assertEqual(summary["finder_ai_summary"]["has_conflict"], 1)
+        self.assertEqual(
+            summary["finder_ai_summary"]["latest_generated_at"],
+            "2026-05-05T10:00:00+00:00",
+        )
+
+    def test_run_pipeline_generates_finder_ai_brief_for_selected_wallet(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            config = small_config(temp_path / "cache")
+            captured: dict[str, Any] = {}
+
+            def fake_generate(*, payload: dict[str, Any] | None, wallet_result: dict[str, Any]) -> dict[str, Any]:
+                finder_ai = json.loads(json.dumps(payload or {}, ensure_ascii=False))
+                captured["normalizedAddress"] = finder_ai.get("normalizedAddress")
+                captured["promptVersion"] = finder_ai.get("providerMeta", {}).get("promptVersion")
+                captured["cacheKey"] = finder_ai.get("briefGeneration", {}).get("cacheKey")
+                captured["statusBefore"] = finder_ai.get("briefGeneration", {}).get("status")
+                captured["primarySignalKey"] = (
+                    finder_ai.get("layeredInput", {})
+                    .get("L2", {})
+                    .get("primarySignals", [{}])[0]
+                    .get("key")
+                )
+                finder_ai["aiBriefShort"] = "测试短摘要"
+                finder_ai["aiBriefNote"] = "这是一个用于测试的 AI 简报。"
+                finder_ai.setdefault("providerMeta", {})["generatedAt"] = "2026-05-05T00:00:00+00:00"
+                finder_ai.setdefault("briefGeneration", {})["status"] = "generated"
+                finder_ai["briefGeneration"]["reason"] = "generated"
+                return finder_ai
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(analysis, "PolymarketClient", FakePolymarketClient))
+                stack.enter_context(patch.object(analysis, "generate_finder_ai_brief", fake_generate))
+                if not hasattr(analysis, "progress"):
+                    stack.enter_context(
+                        patch.object(analysis, "progress", lambda *_args, **_kwargs: None, create=True)
+                    )
+                if not hasattr(analysis, "build_analysis_summary"):
+                    stack.enter_context(
+                        patch.object(
+                            analysis,
+                            "build_analysis_summary",
+                            fallback_analysis_summary,
+                            create=True,
+                        )
+                    )
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+            self.assertEqual(result["selected_wallet_count"], 1)
+            self.assertEqual(captured["normalizedAddress"], WALLET)
+            self.assertEqual(captured["promptVersion"], "finder-weather-brief-v1")
+            self.assertEqual(captured["statusBefore"], "ready")
+            self.assertEqual(captured["primarySignalKey"], "high_frequency_region")
+            self.assertTrue(str(captured["cacheKey"]).startswith(f"{WALLET}|sha256:"))
+
+            wallet_result = json.loads(
+                (output_dir / "wallets" / f"{WALLET}.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(wallet_result["finder_ai"]["aiBriefShort"], "测试短摘要")
+            self.assertEqual(wallet_result["finder_ai"]["aiBriefNote"], "这是一个用于测试的 AI 简报。")
+            self.assertEqual(
+                wallet_result["finder_ai"]["providerMeta"]["generatedAt"],
+                "2026-05-05T00:00:00+00:00",
+            )
+            self.assertEqual(wallet_result["finder_ai"]["briefGeneration"]["status"], "generated")
+            selected_wallets = json.loads(
+                (output_dir / "selected_wallets.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(selected_wallets[0]["ai_brief_short"], "测试短摘要")
+            self.assertEqual(selected_wallets[0]["ai_strategy_focus"], wallet_result["finder_ai"]["strategyFocus"])
+            self.assertFalse(selected_wallets[0]["ai_needs_review"])
+            self.assertFalse(selected_wallets[0]["ai_has_conflict"])
+            self.assertEqual(
+                selected_wallets[0]["ai_evidence_level"],
+                wallet_result["finder_ai"]["evidenceLevel"],
+            )
+            analysis_summary = json.loads(
+                (output_dir / "analysis_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(analysis_summary["finder_ai_summary"]["selected_wallets"], 1)
+            self.assertEqual(analysis_summary["finder_ai_summary"]["generated"], 1)
+            self.assertEqual(analysis_summary["finder_ai_summary"]["cached"], 0)
+            self.assertEqual(analysis_summary["finder_ai_summary"]["failed"], 0)
+            self.assertEqual(analysis_summary["finder_ai_summary"]["skipped"], 0)
+            self.assertEqual(
+                analysis_summary["finder_ai_summary"]["latest_generated_at"],
+                "2026-05-05T00:00:00+00:00",
             )
 
     def test_run_pipeline_prefilters_wallets_seen_in_history_registry_by_default(self) -> None:

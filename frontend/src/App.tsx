@@ -94,6 +94,10 @@ export default function App() {
             activeRunId={activeRunId}
             onRunSelected={setActiveRunId}
             onNavigate={navigate}
+            onWalletSelected={(wallet) => {
+              setSelectedWallet(wallet);
+              setCurrentPage('wallet_detail');
+            }}
           />
         );
       case 'rule_config':

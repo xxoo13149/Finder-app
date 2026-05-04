@@ -25,7 +25,7 @@ class ConfigOverrideTests(unittest.TestCase):
         self.assertEqual(config["wallet_filter"]["min_volume"], 0)
         self.assertEqual(config["wallet_filter"]["max_volume"], 40000)
         self.assertEqual(config["wallet_filter"]["min_traded_count"], 11)
-        self.assertEqual(config["wallet_filter"]["max_traded_count"], 99)
+        self.assertEqual(config["wallet_filter"]["max_traded_count"], 200)
         self.assertEqual(config["wallet_filter"]["min_weather_trade_ratio"], 0.5)
         self.assertEqual(config["analysis"]["regional_frequency_min_day_ratio"], 0.4)
         self.assertEqual(config["analysis"]["regional_win_rate_min_trade_count"], 3)

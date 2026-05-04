@@ -1,9 +1,11 @@
-import {Check, ChevronLeft, ChevronRight, Download, Search, X} from 'lucide-react';
+import {Check, ChevronLeft, ChevronRight, Download, Loader2, Search, Send, X} from 'lucide-react';
 import type {ReactNode} from 'react';
 import {useEffect, useMemo, useState} from 'react';
 import {RunPicker} from '../components/RunPicker';
 import {
   RunRecord,
+  SmartProSyncResult,
+  formatBytes,
   WalletRow,
   formatCurrency,
   formatNumber,
@@ -14,6 +16,7 @@ import {
   listRuns,
   runDisplayName,
   shortAddress,
+  syncSmartProImport,
 } from '../lib/api';
 import {cn} from '../lib/utils';
 
@@ -36,6 +39,10 @@ export function WalletList({
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
+  const [smartProSyncing, setSmartProSyncing] = useState(false);
+  const [smartProMessage, setSmartProMessage] = useState<string>();
+  const [smartProError, setSmartProError] = useState<string>();
+  const [smartProStatus, setSmartProStatus] = useState<string>();
 
   const selectedRunId = activeRunId || latestCompletedRun(runs)?.run_id;
   const selectedRun = runs.find((item) => item.run_id === selectedRunId);
@@ -94,7 +101,8 @@ export function WalletList({
       const matchesQuery =
         !q ||
         wallet.wallet?.toLowerCase().includes(q) ||
-        String(wallet.user_name || '').toLowerCase().includes(q);
+        String(wallet.user_name || '').toLowerCase().includes(q) ||
+        String(wallet.x_username || '').toLowerCase().includes(q);
       const matchesTag = tag === 'all' || wallet.labels?.includes(tag);
       const matchesSelected =
         selectedOnly === 'all' ||
@@ -118,6 +126,43 @@ export function WalletList({
     anchor.download = `${selectedRunId}-selected-wallets.json`;
     anchor.click();
     URL.revokeObjectURL(url);
+  };
+
+  const syncToSmartPro = async () => {
+    if (!selectedRunId || !filtered.length) return;
+    const walletsToSync = filtered.map((wallet) => wallet.wallet).filter(Boolean);
+    const walletChunks = chunkWallets(walletsToSync, 5);
+    setSmartProSyncing(true);
+    setSmartProMessage(undefined);
+    setSmartProError(undefined);
+    setSmartProStatus(`正在整理本次筛选结果，共 ${walletsToSync.length} 个钱包，准备分 ${walletChunks.length} 批同步...`);
+    try {
+      let mergedResult: SmartProSyncResult | undefined;
+      for (let index = 0; index < walletChunks.length; index += 1) {
+        const chunk = walletChunks[index];
+        setSmartProStatus(`正在同步第 ${index + 1}/${walletChunks.length} 批，本批 ${chunk.length} 个钱包...`);
+        const result = await syncSmartProImport({
+          runId: selectedRunId,
+          wallets: chunk,
+          filters: {
+            query,
+            tag,
+            selectedOnly,
+          },
+        });
+        mergedResult = mergedResult ? mergeSmartProResults(mergedResult, result) : result;
+        setSmartProStatus(`第 ${index + 1}/${walletChunks.length} 批已完成，累计同步 ${mergedResult.sent_count} 个钱包...`);
+      }
+      const result = mergedResult;
+      if (!result) throw new Error('SmartPro sync returned no result');
+      setSmartProStatus(undefined);
+      setSmartProMessage(describeSmartProResult(result));
+    } catch (err) {
+      setSmartProError(err instanceof Error ? err.message : 'SmartPro sync failed');
+    } finally {
+      setSmartProSyncing(false);
+      setSmartProStatus(undefined);
+    }
   };
 
   if (!selectedRunId) {
@@ -185,18 +230,35 @@ export function WalletList({
             <Download className="mr-2 h-4 w-4 text-slate-500" />
             导出
           </button>
+          <button
+            onClick={syncToSmartPro}
+            disabled={smartProSyncing || !filtered.length}
+            className="inline-flex h-10 items-center rounded-md border border-[#2E5CFF] bg-[#2E5CFF] px-4 text-sm font-medium text-white shadow-sm hover:bg-[#244ad6] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Send className="mr-2 h-4 w-4" />
+            {smartProSyncing ? '同步中...' : `同步 SmartPro (${filtered.length})`}
+          </button>
         </div>
       </div>
 
       {error && <div className="m-4 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
+      {smartProSyncing && smartProStatus && (
+        <div className="m-4 rounded-md border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-700">
+          <div className="flex items-center gap-2">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            <span>{smartProStatus}</span>
+          </div>
+        </div>
+      )}
+      {smartProError && <div className="m-4 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{smartProError}</div>}
+      {smartProMessage && <div className="m-4 rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">{smartProMessage}</div>}
 
       <div className="flex-1 overflow-x-auto">
         <table className="min-w-full divide-y divide-slate-200">
           <thead className="sticky top-0 z-10 bg-slate-50">
             <tr>
               <Header>排名</Header>
-              <Header>钱包</Header>
-              <Header>用户名</Header>
+              <Header>钱包 / 用户名</Header>
               <Header align="right">盈亏</Header>
               <Header align="right">成交量</Header>
               <Header align="right">交易数</Header>
@@ -212,51 +274,62 @@ export function WalletList({
           <tbody className="divide-y divide-slate-200 bg-white">
             {loading ? (
               <tr>
-                <td colSpan={13} className="px-6 py-10 text-center text-sm text-slate-500">
+                <td colSpan={12} className="px-6 py-10 text-center text-sm text-slate-500">
                   正在加载钱包...
                 </td>
               </tr>
             ) : (
-              visible.map((wallet) => (
-                <tr key={wallet.wallet} className="cursor-pointer transition-colors hover:bg-slate-50" onClick={() => onWalletSelected(wallet.wallet)}>
-                  <Cell>{wallet.rank || '-'}</Cell>
-                  <Cell mono>{shortAddress(wallet.wallet)}</Cell>
-                  <Cell>{wallet.user_name || '-'}</Cell>
-                  <Cell align="right">{formatCurrency(wallet.pnl)}</Cell>
-                  <Cell align="right">{formatCurrency(wallet.volume)}</Cell>
-                  <Cell align="right">{formatNumber(wallet.trade_count)}</Cell>
-                  <Cell align="right">{formatPercent(wallet.weather_notional_ratio)}</Cell>
-                  <Cell align="right">{formatPercent(wallet.closed_position_win_rate)}</Cell>
-                  <Cell>{wallet.main_region || wallet.dominant_region || '-'}</Cell>
-                  <Cell align="right">{formatMultiple(wallet.highest_burst ?? wallet.max_region_daily_profit_multiple)}</Cell>
-                  <Cell>{wallet.recent_evidence_date || wallet.highest_burst_date || '-'}</Cell>
-                  <Cell>
-                    <div className="flex max-w-md flex-wrap gap-1.5">
-                      {(wallet.labels || []).slice(0, 3).map((label) => (
-                        <span key={label} className="inline-flex items-center rounded border border-blue-200 bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-700">
-                          {label}
+              visible.map((wallet) => {
+                const walletName = preferredWalletListName(wallet);
+                const aiBriefShort = preferredWalletListAiBrief(wallet);
+                return (
+                  <tr key={wallet.wallet} className="cursor-pointer transition-colors hover:bg-slate-50" onClick={() => onWalletSelected(wallet.wallet)}>
+                    <Cell>{wallet.rank || '-'}</Cell>
+                    <Cell>
+                      <div className="min-w-0">
+                        <div className={cn('truncate', walletName ? 'font-medium text-slate-900' : 'font-mono font-medium text-slate-900')}>
+                          {walletName || shortAddress(wallet.wallet)}
+                        </div>
+                        {walletName && <div className="truncate font-mono text-xs text-slate-500">{shortAddress(wallet.wallet)}</div>}
+                        {aiBriefShort && <div className="mt-1 max-w-[320px] truncate text-xs text-slate-500">{aiBriefShort}</div>}
+                      </div>
+                    </Cell>
+                    <Cell align="right">{formatCurrency(wallet.pnl)}</Cell>
+                    <Cell align="right">{formatCurrency(wallet.volume)}</Cell>
+                    <Cell align="right">{formatNumber(wallet.trade_count)}</Cell>
+                    <Cell align="right">{formatPercent(wallet.weather_notional_ratio)}</Cell>
+                    <Cell align="right">{formatPercent(wallet.closed_position_win_rate)}</Cell>
+                    <Cell>{wallet.main_region || wallet.dominant_region || '-'}</Cell>
+                    <Cell align="right">{formatMultiple(wallet.highest_burst ?? wallet.max_region_daily_profit_multiple)}</Cell>
+                    <Cell>{wallet.recent_evidence_date || wallet.highest_burst_date || '-'}</Cell>
+                    <Cell>
+                      <div className="flex max-w-md flex-wrap gap-1.5">
+                        {(wallet.labels || []).slice(0, 3).map((label) => (
+                          <span key={label} className="inline-flex items-center rounded border border-blue-200 bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-700">
+                            {label}
+                          </span>
+                        ))}
+                        {(wallet.labels || []).length > 3 && <span className="text-xs text-slate-400">+{(wallet.labels || []).length - 3}</span>}
+                      </div>
+                    </Cell>
+                    <Cell align="center">
+                      {wallet.selected !== false ? (
+                        <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-100 text-emerald-600">
+                          <Check className="h-3.5 w-3.5" />
                         </span>
-                      ))}
-                      {(wallet.labels || []).length > 3 && <span className="text-xs text-slate-400">+{(wallet.labels || []).length - 3}</span>}
-                    </div>
-                  </Cell>
-                  <Cell align="center">
-                    {wallet.selected !== false ? (
-                      <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-100 text-emerald-600">
-                        <Check className="h-3.5 w-3.5" />
-                      </span>
-                    ) : (
-                      <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-slate-300 text-slate-300">
-                        <X className="h-3.5 w-3.5" />
-                      </span>
-                    )}
-                  </Cell>
-                </tr>
-              ))
+                      ) : (
+                        <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-slate-300 text-slate-300">
+                          <X className="h-3.5 w-3.5" />
+                        </span>
+                      )}
+                    </Cell>
+                  </tr>
+                );
+              })
             )}
             {!loading && !visible.length && (
               <tr>
-                <td colSpan={13} className="px-6 py-10 text-center text-sm text-slate-500">
+                <td colSpan={12} className="px-6 py-10 text-center text-sm text-slate-500">
                   没有钱包符合当前筛选条件。
                 </td>
               </tr>
@@ -326,6 +399,77 @@ function Cell({
       {children}
     </td>
   );
+}
+
+function preferredWalletListName(wallet: WalletRow): string | undefined {
+  for (const value of [wallet.user_name, wallet.x_username]) {
+    const text = String(value || '').trim();
+    if (!text) continue;
+    const normalized = text.replace(/^@+/, '');
+    if (!normalized) continue;
+    const lowered = normalized.toLowerCase();
+    if (lowered.startsWith('0x') && lowered.length >= 10) continue;
+    return value === wallet.x_username ? `@${normalized}` : normalized;
+  }
+  return undefined;
+}
+
+function preferredWalletListAiBrief(wallet: WalletRow): string | undefined {
+  for (const value of [wallet.ai_brief_short, wallet.ai_strategy_focus]) {
+    const text = String(value || '').trim();
+    if (text) return text;
+  }
+  return undefined;
+}
+
+function describeSmartProResult(result: SmartProSyncResult): string {
+  const summary = result.summary || {};
+  const commit = result.smart_pro?.data?.commit || {};
+  const created = summary.createdCount ?? commit.createdCount ?? 0;
+  const updated = summary.updatedCount ?? commit.updatedCount ?? 0;
+  const failed = summary.failedCount ?? commit.failedRows?.length ?? 0;
+  const valid = summary.validRows ?? result.smart_pro?.data?.validRows ?? result.sent_count;
+  const fallback = summary.fallbackReason || result.smart_pro?.data?.fallbackReason;
+  const payloadText = result.payload_bytes ? `，上传体积 ${formatBytes(result.payload_bytes)}` : '';
+  const base = `SmartPro 同步完成：发送 ${result.sent_count} 条，AI 识别有效 ${valid} 条，新建 ${created} 条，更新 ${updated} 条，失败 ${failed} 条${payloadText}。`;
+  return fallback ? `${base} ${humanizeFallbackReason(fallback)}` : base;
+}
+
+function chunkWallets(wallets: string[], size: number): string[][] {
+  const chunks: string[][] = [];
+  for (let index = 0; index < wallets.length; index += size) {
+    chunks.push(wallets.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function mergeSmartProResults(current: SmartProSyncResult, next: SmartProSyncResult): SmartProSyncResult {
+  const currentSummary = current.summary || {};
+  const nextSummary = next.summary || {};
+  const fallbackParts = [currentSummary.fallbackReason, nextSummary.fallbackReason].filter(Boolean);
+  const uniqueFallback = Array.from(new Set(fallbackParts));
+  return {
+    ...next,
+    sent_count: current.sent_count + next.sent_count,
+    requested_count: (current.requested_count || 0) + (next.requested_count || 0),
+    payload_bytes: (current.payload_bytes || 0) + (next.payload_bytes || 0),
+    summary: {
+      totalRows: (currentSummary.totalRows || 0) + (nextSummary.totalRows || 0),
+      validRows: (currentSummary.validRows || 0) + (nextSummary.validRows || 0),
+      createdCount: (currentSummary.createdCount || 0) + (nextSummary.createdCount || 0),
+      updatedCount: (currentSummary.updatedCount || 0) + (nextSummary.updatedCount || 0),
+      failedCount: (currentSummary.failedCount || 0) + (nextSummary.failedCount || 0),
+      fallbackReason: uniqueFallback.join(' | '),
+    },
+  };
+}
+
+function humanizeFallbackReason(reason: string): string {
+  const normalized = reason.toLowerCase();
+  if (normalized.includes('gemini request failed') || normalized.includes('groq request failed')) {
+    return 'AI 预览通道当前不可用，系统已自动回退到 Finder 本地适配模式，不影响本次同步入库。';
+  }
+  return reason;
 }
 
 function formatMultiple(value?: number): string {

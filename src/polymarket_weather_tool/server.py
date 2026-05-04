@@ -17,12 +17,27 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
+from urllib import error as urlerror
+from urllib import request as urlrequest
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .config import DEFAULT_CONFIG_PATH, apply_overrides, load_config
+from .config import (
+    DEFAULT_CONFIG_PATH,
+    SMART_WALLET_LIBRARY_REFRESH_MODE,
+    apply_analysis_mode,
+    apply_overrides,
+    load_config,
+)
 from .env import load_project_env
+from .finder_ai_contract import compact_finder_ai_result
 from .history_registry import list_wallet_history_records
 from .labels import CORE_LABEL_KEYS
+from .smart_wallet_library import (
+    SMART_WALLET_IMPORT_ROWS_FILENAME,
+    SMART_WALLET_IMPORT_SUMMARY_FILENAME,
+    materialize_smart_wallet_library,
+    normalize_import_wallet_rows,
+)
 
 
 UTC = timezone.utc
@@ -45,6 +60,11 @@ RUN_DETAIL_PRUNE_FILES = (
     "progress.log",
 )
 RUN_DETAIL_PRUNE_DIRS = ("wallets",)
+SMART_PRO_DEFAULT_COMMIT_PATH = "/api/finder/import/commit"
+SMART_PRO_DEFAULT_TIMEOUT_SECONDS = 90
+SMART_PRO_MAX_SYNC_WALLETS = 500
+SMART_PRO_SYNC_BATCH_SIZE = 5
+WALLET_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
 
 @dataclass
@@ -169,6 +189,564 @@ def read_run_summary(output_dir: Path) -> dict[str, Any]:
     if "wallets_core_labeled" not in summary:
         summary["wallets_core_labeled"] = count_core_labeled_wallets(output_dir)
     return summary
+
+
+def text_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value).strip()
+    return ""
+
+
+def compact_text_list(values: Any, *, limit: int = 6, max_length: int = 180) -> list[str]:
+    items = values if isinstance(values, list) else []
+    results: list[str] = []
+    for item in items:
+        text = text_value(item)
+        if not text and isinstance(item, Mapping):
+            text = (
+                text_value(item.get("text"))
+                or text_value(item.get("note"))
+                or text_value(item.get("reason"))
+                or text_value(item.get("summary"))
+                or text_value(item.get("title"))
+            )
+        if not text:
+            continue
+        results.append(text[:max_length])
+        if len(results) >= limit:
+            break
+    return results
+
+
+def compact_mapping(source: Mapping[str, Any] | None, keys: tuple[str, ...]) -> dict[str, Any]:
+    if not isinstance(source, Mapping):
+        return {}
+    payload: dict[str, Any] = {}
+    for key in keys:
+        if key not in source:
+            continue
+        value = source.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                continue
+        payload[key] = value
+    return payload
+
+
+def compact_finder_label_record(item: Mapping[str, Any]) -> dict[str, Any]:
+    payload = compact_mapping(
+        item,
+        (
+            "key",
+            "matched",
+            "display_name",
+            "name",
+            "title",
+            "reason",
+            "description",
+        ),
+    )
+    details_source = item.get("details") if isinstance(item.get("details"), Mapping) else item.get("facts")
+    details = compact_mapping(details_source if isinstance(details_source, Mapping) else None, ("region", "city", "reason"))
+    if details:
+        payload["details"] = details
+    evidence = compact_mapping(item.get("evidence") if isinstance(item.get("evidence"), Mapping) else None, ("reason",))
+    if evidence:
+        payload["evidence"] = evidence
+    return payload
+
+
+def compact_finder_row_for_import(row: Mapping[str, Any]) -> dict[str, Any]:
+    payload = compact_mapping(
+        row,
+        (
+            "wallet",
+            "address",
+            "proxyWallet",
+            "user_name",
+            "userName",
+            "username",
+            "x_username",
+            "xUsername",
+            "pnl",
+            "volume",
+            "trade_count",
+            "weather_trade_ratio",
+            "weather_notional_ratio",
+            "closed_position_win_rate",
+            "closed_profit_multiple",
+            "main_region",
+            "dominant_region",
+            "highest_burst",
+            "highest_burst_date",
+            "max_region_daily_profit_multiple",
+            "recent_evidence_date",
+            "selected",
+            "watchlist",
+            "suggest_watchlist",
+            "recommend_watchlist",
+            "first_seen_at",
+            "firstSeenAt",
+        ),
+    )
+    labels = compact_text_list(row.get("labels"), limit=20, max_length=80)
+    if labels:
+        payload["labels"] = labels
+    reasons = compact_text_list(row.get("reasons"), limit=6, max_length=180)
+    if reasons:
+        payload["reasons"] = reasons
+    return payload
+
+
+def compact_finder_detail_for_import(detail: Mapping[str, Any]) -> dict[str, Any]:
+    payload = compact_mapping(detail, ("wallet", "address"))
+    for key in ("selection_record", "screening"):
+        nested = compact_mapping(detail.get(key) if isinstance(detail.get(key), Mapping) else None, ("wallet", "address", "proxyWallet", "proxy_wallet"))
+        if nested:
+            payload[key] = nested
+
+    leaderboard_entry = compact_mapping(
+        detail.get("leaderboard_entry") if isinstance(detail.get("leaderboard_entry"), Mapping) else None,
+        ("userName", "user_name", "xUsername", "x_username"),
+    )
+    if leaderboard_entry:
+        payload["leaderboard_entry"] = leaderboard_entry
+
+    profile = compact_mapping(
+        detail.get("profile") if isinstance(detail.get("profile"), Mapping) else None,
+        ("userName", "user_name", "xUsername", "x_username"),
+    )
+    if profile:
+        payload["profile"] = profile
+
+    evidence_summary = compact_mapping(
+        detail.get("evidence_summary") if isinstance(detail.get("evidence_summary"), Mapping) else None,
+        ("headline", "main_region", "latest_evidence_date", "suggest_watchlist"),
+    )
+    if evidence_summary:
+        payload["evidence_summary"] = evidence_summary
+
+    metrics = compact_mapping(detail.get("metrics") if isinstance(detail.get("metrics"), Mapping) else None, ("unified_profit",))
+    if metrics:
+        payload["metrics"] = metrics
+
+    strategy_notes = compact_text_list(detail.get("strategy_notes"), limit=6, max_length=180)
+    if strategy_notes:
+        payload["strategy_notes"] = strategy_notes
+
+    label_evaluations = [
+        compact_finder_label_record(item)
+        for item in (detail.get("label_evaluations") if isinstance(detail.get("label_evaluations"), list) else [])
+        if isinstance(item, Mapping)
+    ]
+    label_evaluations = [item for item in label_evaluations if item]
+    if label_evaluations:
+        payload["label_evaluations"] = label_evaluations[:24]
+
+    detail_labels = [
+        compact_finder_label_record(item)
+        for item in (detail.get("labels") if isinstance(detail.get("labels"), list) else [])
+        if isinstance(item, Mapping)
+    ]
+    detail_labels = [item for item in detail_labels if item]
+    if detail_labels:
+        payload["labels"] = detail_labels[:24]
+
+    return payload
+
+
+def json_bytes(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def format_byte_count(size: int) -> str:
+    units = ("B", "KB", "MB", "GB")
+    value = float(size)
+    unit_index = 0
+    while value >= 1024 and unit_index < len(units) - 1:
+        value /= 1024
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(value)} {units[unit_index]}"
+    return f"{value:.2f} {units[unit_index]}"
+
+
+def chunk_items(items: list[str], size: int) -> list[list[str]]:
+    if size <= 0:
+        return [items]
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def finder_wallet_address(row: Mapping[str, Any], detail: Mapping[str, Any] | None = None) -> str:
+    detail = detail or {}
+    nested_sources = (
+        detail.get("selection_record"),
+        detail.get("screening"),
+        detail.get("leaderboard_entry"),
+        detail.get("profile"),
+    )
+    candidates = [
+        row.get("wallet"),
+        row.get("address"),
+        row.get("proxyWallet"),
+        detail.get("wallet"),
+        detail.get("address"),
+    ]
+    for source in nested_sources:
+        if isinstance(source, Mapping):
+            candidates.extend(
+                [
+                    source.get("wallet"),
+                    source.get("address"),
+                    source.get("proxyWallet"),
+                    source.get("proxy_wallet"),
+                ]
+            )
+    for candidate in candidates:
+        value = text_value(candidate).lower()
+        if value:
+            return value
+    return ""
+
+
+def normalized_wallet_file_name(address: str) -> str | None:
+    value = address.strip().lower()
+    return value if WALLET_ADDRESS_RE.match(value) else None
+
+
+def selected_wallet_rows(output_dir: Path) -> list[dict[str, Any]]:
+    rows = read_json_file(output_dir / "selected_wallets.json", []) or []
+    if not isinstance(rows, list):
+        raise ValueError("selected_wallets.json must be a JSON array")
+    return [dict(item) for item in rows if isinstance(item, Mapping)]
+
+
+def filter_wallet_rows(
+    rows: list[dict[str, Any]],
+    requested_wallets: list[str] | None,
+) -> list[dict[str, Any]]:
+    if not requested_wallets:
+        return [row for row in rows if row.get("selected") is not False]
+
+    requested = {value.strip().lower() for value in requested_wallets if value.strip()}
+    return [row for row in rows if finder_wallet_address(row) in requested]
+
+
+def read_wallet_detail_for_import(output_dir: Path, row: Mapping[str, Any]) -> dict[str, Any]:
+    address = normalized_wallet_file_name(finder_wallet_address(row))
+    if not address:
+        return {}
+    wallet_path = ensure_under(output_dir / "wallets", output_dir / "wallets" / f"{address}.json")
+    detail = read_json_file(wallet_path, {}) or {}
+    return dict(detail) if isinstance(detail, Mapping) else {}
+
+
+def build_smart_pro_import_payload(
+    output_dir: Path,
+    run_id: str,
+    *,
+    requested_wallets: list[str] | None = None,
+    filters: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    rows = filter_wallet_rows(selected_wallet_rows(output_dir), requested_wallets)
+    rows = rows[:SMART_PRO_MAX_SYNC_WALLETS]
+    wallets: list[dict[str, Any]] = []
+    for row in rows:
+        detail = read_wallet_detail_for_import(output_dir, row)
+        wallet_payload = {
+            "row": compact_finder_row_for_import(row),
+            "detail": compact_finder_detail_for_import(detail),
+        }
+        finder_ai = compact_finder_ai_result(detail.get("finder_ai") if isinstance(detail, Mapping) else None)
+        if finder_ai:
+            wallet_payload["finderAi"] = finder_ai
+        wallets.append(wallet_payload)
+    if not wallets:
+        raise ValueError("no Finder wallets matched the current selection")
+
+    payload: dict[str, Any] = {
+        "runId": run_id,
+        "sourceName": f"Finder-app:{run_id}",
+        "wallets": wallets,
+    }
+    if filters:
+        payload["filters"] = dict(filters)
+    return payload
+
+
+def smart_pro_base_url_from_env(root: Path) -> str:
+    load_project_env(root)
+    raw_url = (os.environ.get("SMART_PRO_BASE_URL") or os.environ.get("SMART_PRO_URL") or "").strip()
+    if not raw_url:
+        raise ValueError("SMART_PRO_BASE_URL is not configured in .env")
+
+    parsed = urlparse(raw_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("SMART_PRO_BASE_URL must be an http(s) URL")
+    return raw_url.rstrip("/")
+
+
+def smart_pro_token_from_env(root: Path) -> str:
+    load_project_env(root)
+    token = (
+        os.environ.get("SMART_PRO_FINDER_TOKEN")
+        or os.environ.get("SMART_PRO_SYNC_TOKEN")
+        or os.environ.get("FINDER_SYNC_TOKEN")
+        or ""
+    ).strip()
+    if not token:
+        raise ValueError("SMART_PRO_FINDER_TOKEN is not configured in .env")
+    return token
+
+
+def smart_pro_commit_path_from_env(root: Path) -> str:
+    load_project_env(root)
+    path = (os.environ.get("SMART_PRO_FINDER_COMMIT_PATH") or SMART_PRO_DEFAULT_COMMIT_PATH).strip()
+    return path if path.startswith("/") else f"/{path}"
+
+
+def smart_pro_timeout_from_env(root: Path) -> int:
+    load_project_env(root)
+    raw_value = os.environ.get("SMART_PRO_SYNC_TIMEOUT_SECONDS")
+    try:
+        value = int(raw_value or SMART_PRO_DEFAULT_TIMEOUT_SECONDS)
+    except ValueError:
+        value = SMART_PRO_DEFAULT_TIMEOUT_SECONDS
+    return max(10, min(300, value))
+
+
+def smart_pro_access_headers_from_env(root: Path) -> dict[str, str]:
+    load_project_env(root)
+    client_id = text_value(os.environ.get("SMART_PRO_ACCESS_CLIENT_ID"))
+    client_secret = text_value(os.environ.get("SMART_PRO_ACCESS_CLIENT_SECRET"))
+    if not client_id or not client_secret:
+        return {}
+    return {
+        "CF-Access-Client-Id": client_id,
+        "CF-Access-Client-Secret": client_secret,
+    }
+
+
+def smart_pro_config_status(root: Path) -> dict[str, Any]:
+    load_project_env(root)
+    raw_url = (os.environ.get("SMART_PRO_BASE_URL") or os.environ.get("SMART_PRO_URL") or "").strip()
+    token = (
+        os.environ.get("SMART_PRO_FINDER_TOKEN")
+        or os.environ.get("SMART_PRO_SYNC_TOKEN")
+        or os.environ.get("FINDER_SYNC_TOKEN")
+        or ""
+    ).strip()
+    errors: list[str] = []
+    base_url: str | None = None
+
+    if not raw_url:
+        errors.append("SMART_PRO_BASE_URL is not configured in .env")
+    else:
+        parsed = urlparse(raw_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            errors.append("SMART_PRO_BASE_URL must be an http(s) URL")
+        else:
+            base_url = raw_url.rstrip("/")
+
+    if not token:
+        errors.append("SMART_PRO_FINDER_TOKEN is not configured in .env")
+
+    return {
+        "configured": not errors,
+        "base_url": base_url,
+        "commit_path": smart_pro_commit_path_from_env(root),
+        "timeout_seconds": smart_pro_timeout_from_env(root),
+        "token_configured": bool(token),
+        "access_service_token_configured": bool(
+            text_value(os.environ.get("SMART_PRO_ACCESS_CLIENT_ID"))
+            and text_value(os.environ.get("SMART_PRO_ACCESS_CLIENT_SECRET"))
+        ),
+        "errors": errors,
+    }
+
+
+def post_json_to_smart_pro(
+    url: str,
+    token: str,
+    payload: Mapping[str, Any],
+    timeout_seconds: int,
+    *,
+    extra_headers: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    data = json_bytes(payload)
+    headers = {
+        "X-Finder-Sync-Token": token,
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+        ),
+    }
+    if extra_headers:
+        headers.update({key: value for key, value in extra_headers.items() if text_value(value)})
+    request = urlrequest.Request(
+        url,
+        data=data,
+        method="POST",
+        headers=headers,
+    )
+    try:
+        with urlrequest.urlopen(request, timeout=timeout_seconds) as response:
+            body = response.read().decode("utf-8")
+    except urlerror.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(body)
+            message = payload.get("error") if isinstance(payload, Mapping) else None
+        except json.JSONDecodeError:
+            message = None
+        raise ValueError(message or f"SmartPro returned HTTP {exc.code}") from exc
+    except urlerror.URLError as exc:
+        hint = ""
+        reason_text = text_value(exc.reason) or str(exc.reason)
+        if "EOF occurred in violation of protocol" in reason_text:
+            hint = f" while uploading {format_byte_count(len(data))}; Finder will need a smaller sync payload"
+        raise ValueError(f"SmartPro request failed: {reason_text}{hint}") from exc
+
+    try:
+        result = json.loads(body) if body else {}
+    except json.JSONDecodeError as exc:
+        raise ValueError("SmartPro returned a non-JSON response") from exc
+    return dict(result) if isinstance(result, Mapping) else {"data": result}
+
+
+def summarize_smart_pro_response(response: Mapping[str, Any]) -> dict[str, Any]:
+    data = response.get("data") if isinstance(response.get("data"), Mapping) else {}
+    commit = data.get("commit") if isinstance(data.get("commit"), Mapping) else {}
+    failed_rows = commit.get("failedRows") if isinstance(commit.get("failedRows"), list) else []
+    return {
+        "totalRows": data.get("totalRows"),
+        "validRows": data.get("validRows"),
+        "createdCount": commit.get("createdCount"),
+        "updatedCount": commit.get("updatedCount"),
+        "failedCount": len(failed_rows),
+        "fallbackReason": data.get("fallbackReason"),
+    }
+
+
+def merge_smart_pro_sync_result(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    current_summary = current.get("summary") if isinstance(current.get("summary"), Mapping) else {}
+    incoming_summary = incoming.get("summary") if isinstance(incoming.get("summary"), Mapping) else {}
+    fallback_parts = [
+        text_value(current_summary.get("fallbackReason")),
+        text_value(incoming_summary.get("fallbackReason")),
+    ]
+    fallback_reasons = [item for item in dict.fromkeys(fallback_parts) if item]
+
+    return {
+        **incoming,
+        "requested_count": (current.get("requested_count") or 0) + (incoming.get("requested_count") or 0),
+        "sent_count": (current.get("sent_count") or 0) + (incoming.get("sent_count") or 0),
+        "payload_bytes": (current.get("payload_bytes") or 0) + (incoming.get("payload_bytes") or 0),
+        "batch_count": (current.get("batch_count") or 1) + (incoming.get("batch_count") or 1),
+        "summary": {
+            "totalRows": (current_summary.get("totalRows") or 0) + (incoming_summary.get("totalRows") or 0),
+            "validRows": (current_summary.get("validRows") or 0) + (incoming_summary.get("validRows") or 0),
+            "createdCount": (current_summary.get("createdCount") or 0) + (incoming_summary.get("createdCount") or 0),
+            "updatedCount": (current_summary.get("updatedCount") or 0) + (incoming_summary.get("updatedCount") or 0),
+            "failedCount": (current_summary.get("failedCount") or 0) + (incoming_summary.get("failedCount") or 0),
+            "fallbackReason": " | ".join(fallback_reasons) if fallback_reasons else None,
+        },
+    }
+
+
+def sync_run_to_smart_pro_once(
+    state: ServerState,
+    *,
+    run_id: str,
+    requested_wallets: list[str] | None,
+    filters: Mapping[str, Any] | None,
+    post_json,
+) -> dict[str, Any]:
+    output_dir = ensure_under(state.artifacts_root, state.artifacts_root / run_id)
+    if not output_dir.exists():
+        raise ValueError("run not found")
+
+    smart_payload = build_smart_pro_import_payload(
+        output_dir,
+        run_id,
+        requested_wallets=requested_wallets or None,
+        filters=filters,
+    )
+    payload_bytes = len(json_bytes(smart_payload))
+    base_url = smart_pro_base_url_from_env(state.root)
+    commit_path = smart_pro_commit_path_from_env(state.root)
+    endpoint_url = f"{base_url}{commit_path}"
+    try:
+        response = post_json(
+            endpoint_url,
+            smart_pro_token_from_env(state.root),
+            smart_payload,
+            smart_pro_timeout_from_env(state.root),
+            extra_headers=smart_pro_access_headers_from_env(state.root),
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"{exc} (prepared {len(smart_payload['wallets'])} wallet(s), {format_byte_count(payload_bytes)})"
+        ) from exc
+
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "requested_count": len(requested_wallets) if requested_wallets else len(smart_payload["wallets"]),
+        "sent_count": len(smart_payload["wallets"]),
+        "payload_bytes": payload_bytes,
+        "batch_count": 1,
+        "smart_pro_base_url": base_url,
+        "endpoint": commit_path,
+        "smart_pro": response,
+        "summary": summarize_smart_pro_response(response),
+    }
+
+
+def sync_run_to_smart_pro(
+    state: ServerState,
+    body: Mapping[str, Any],
+    *,
+    post_json=post_json_to_smart_pro,
+) -> dict[str, Any]:
+    run_id = text_value(body.get("run_id") or body.get("runId"))
+    if not run_id:
+        raise ValueError("run_id is required")
+
+    requested_raw = body.get("wallets") or body.get("wallet_addresses") or body.get("walletAddresses")
+    if requested_raw is not None and not isinstance(requested_raw, list):
+        raise ValueError("wallets must be a list")
+    requested_wallets = [text_value(item) for item in requested_raw or [] if text_value(item)]
+    filters = body.get("filters") if isinstance(body.get("filters"), Mapping) else None
+    if requested_wallets and len(requested_wallets) > SMART_PRO_SYNC_BATCH_SIZE:
+        merged: dict[str, Any] | None = None
+        for chunk in chunk_items(requested_wallets, SMART_PRO_SYNC_BATCH_SIZE):
+            result = sync_run_to_smart_pro_once(
+                state,
+                run_id=run_id,
+                requested_wallets=chunk,
+                filters=filters,
+                post_json=post_json,
+            )
+            merged = result if merged is None else merge_smart_pro_sync_result(merged, result)
+        if merged is None:
+            raise ValueError("no Finder wallets matched the current selection")
+        return merged
+
+    return sync_run_to_smart_pro_once(
+        state,
+        run_id=run_id,
+        requested_wallets=requested_wallets or None,
+        filters=filters,
+        post_json=post_json,
+    )
 
 
 def runtime_state_path(root: Path) -> Path:
@@ -1072,6 +1650,7 @@ def build_config_for_run(state: ServerState, body: dict[str, Any], run_state: Ru
     ensure_under(state.root, config_path)
     load_project_env(state.root)
     config = load_config(config_path)
+    config = apply_analysis_mode(config, body.get("analysis_mode"))
     overrides = dict(body.get("overrides") or {})
     config = apply_overrides(
         config,
@@ -1083,6 +1662,9 @@ def build_config_for_run(state: ServerState, body: dict[str, Any], run_state: Ru
         min_traded_count=optional_int(overrides.get("min_traded_count")),
         max_traded_count=optional_int(overrides.get("max_traded_count")),
         min_weather_trade_ratio=optional_number(overrides.get("min_weather_trade_ratio")),
+        min_weather_notional_ratio=optional_number(overrides.get("min_weather_notional_ratio")),
+        weather_focus_mode=optional_str(overrides.get("weather_focus_mode")),
+        activity_filter_mode=optional_str(overrides.get("activity_filter_mode")),
         fetch_limit=optional_int(overrides.get("fetch_limit")),
         max_fetch_limit=optional_int(overrides.get("max_fetch_limit")),
         max_weather_events=optional_int(overrides.get("max_weather_events")),
@@ -1095,9 +1677,52 @@ def build_config_for_run(state: ServerState, body: dict[str, Any], run_state: Ru
     )
 
     runtime = config.setdefault("runtime", {})
+    runtime["analysis_mode"] = runtime.get("analysis_mode", "standard")
     runtime["run_id"] = run_state.run_id
     runtime["progress_log_path"] = run_state.progress_log_path
     return config
+
+
+def prepare_smart_wallet_import_for_run(
+    state: ServerState,
+    body: Mapping[str, Any],
+    run_state: RunState,
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    runtime = config.setdefault("runtime", {})
+    analysis_mode = str(runtime.get("analysis_mode") or "").strip().lower()
+    if analysis_mode != SMART_WALLET_LIBRARY_REFRESH_MODE:
+        return None
+
+    import_payload = body.get("smart_wallet_import")
+    if not isinstance(import_payload, Mapping):
+        raise ValueError("后台地址库回流模式需要提供 smart_wallet_import 导入数据")
+
+    rows = normalize_import_wallet_rows(import_payload.get("payload"))
+    if not rows:
+        raise ValueError("未从后台地址库 JSON 中解析到有效的钱包地址记录")
+
+    source_file_name = str(import_payload.get("file_name") or "smart-wallet-export.json").strip()
+    output_dir = ensure_under(state.artifacts_root, Path(run_state.output_dir))
+    rows_path = output_dir / SMART_WALLET_IMPORT_ROWS_FILENAME
+    summary_path = output_dir / SMART_WALLET_IMPORT_SUMMARY_FILENAME
+
+    summary = materialize_smart_wallet_library(
+        state.artifacts_root,
+        rows,
+        source_file_name=source_file_name,
+    )
+    write_json_file(rows_path, rows)
+    write_json_file(summary_path, summary)
+
+    runtime["smart_wallet_library_source_path"] = str(rows_path)
+    runtime["smart_wallet_library_summary_path"] = str(summary_path)
+    runtime["smart_wallet_library_file_name"] = source_file_name
+    runtime["smart_wallet_library_wallet_count"] = int(summary.get("wallet_count") or len(rows))
+    runtime["smart_wallet_library_skip_history_registry"] = True
+    runtime["smart_wallet_library_skip_numeric_prefilter"] = True
+    runtime["smart_wallet_library_process_all"] = True
+    return summary
 
 
 def optional_int(value: Any) -> int | None:
@@ -1181,6 +1806,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             if parts == ["api", "system", "identity"]:
                 self.send_json(runtime_identity(self.app_state.root))
                 return
+            if parts == ["api", "smart-pro", "config"]:
+                self.send_json(smart_pro_config_status(self.app_state.root))
+                return
             if parts == ["api", "config", "default"]:
                 config_path = ensure_under(self.app_state.root, self.app_state.root / DEFAULT_CONFIG_PATH)
                 self.send_json(read_json_file(config_path, {}))
@@ -1213,11 +1841,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             if parts == ["api", "runs"]:
                 run_state = build_run_payload(self.app_state, body)
                 config = build_config_for_run(self.app_state, body, run_state)
-                Path(run_state.output_dir).mkdir(parents=True, exist_ok=True)
                 with self.app_state.lock:
                     if run_state.run_id in self.app_state.runs:
                         self.send_error_json(HTTPStatus.CONFLICT, "run_id already exists")
                         return
+                Path(run_state.output_dir).mkdir(parents=True, exist_ok=True)
+                prepare_smart_wallet_import_for_run(self.app_state, body, run_state, config)
+                with self.app_state.lock:
                     self.app_state.runs[run_state.run_id] = run_state
                 run_in_background(self.app_state, run_state, config)
                 self.send_json(public_run_record(self.app_state, run_state.run_id), status=HTTPStatus.ACCEPTED)
@@ -1225,6 +1855,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             if parts == ["api", "system", "shutdown"]:
                 self.send_json({"ok": True, "message": "application shutdown requested"})
                 schedule_application_shutdown(self.server, self.app_state.root)  # type: ignore[arg-type]
+                return
+            if parts == ["api", "smart-pro", "import", "commit"]:
+                self.send_json(sync_run_to_smart_pro(self.app_state, body))
                 return
             if parts == ["api", "config", "default"]:
                 self.update_default_config(body)

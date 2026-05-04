@@ -1,12 +1,94 @@
-import {ChevronDown, Info, RotateCcw, Save, SlidersHorizontal, Zap} from 'lucide-react';
+import {ChevronDown, Info, RotateCcw, Save, SlidersHorizontal, Upload, X, Zap} from 'lucide-react';
 import {useEffect, useMemo, useState} from 'react';
-import type {ReactNode} from 'react';
-import {type CreateRunInput, getDefaultConfig, saveDefaultConfig, startRun} from '../lib/api';
+import type {ChangeEvent, ReactNode} from 'react';
+import {
+  type ActivityFilterMode,
+  type AnalysisMode,
+  type CreateRunInput,
+  getDefaultConfig,
+  saveDefaultConfig,
+  startRun,
+} from '../lib/api';
 import {cn} from '../lib/utils';
 
-type FormState = Required<Omit<CreateRunInput, 'chain_api_key_env' | 'max_fetch_limit'>>;
+type FormState = Required<
+  Pick<
+    CreateRunInput,
+    | 'analysis_mode'
+    | 'activity_filter_mode'
+    | 'name'
+    | 'target_count'
+    | 'min_pnl'
+    | 'max_pnl'
+    | 'min_volume'
+    | 'max_volume'
+    | 'min_traded_count'
+    | 'max_traded_count'
+    | 'min_weather_trade_ratio'
+    | 'fetch_limit'
+    | 'max_weather_events'
+    | 'max_wallet_offset'
+    | 'concurrent_wallets'
+    | 'use_cache'
+    | 'enable_chain_validation'
+    | 'verbose'
+  >
+>;
+
+const analysisModeOptions: Array<{value: AnalysisMode; label: string; description: string}> = [
+  {
+    value: 'standard',
+    label: '普通分析',
+    description: '按日常排行榜链路抓取候选地址，并按筛选条件完成分析。',
+  },
+  {
+    value: 'weekly_high_profit',
+    label: '本周高盈利榜单',
+    description: '从本周高盈利榜单抓取候选地址，并按周维度指标完成分析。',
+  },
+  {
+    value: 'smart_wallet_library_refresh',
+    label: '后台地址库刷新',
+    description: '导入后台地址库，对名单内地址重新抓取并刷新分析结果。',
+  },
+];
+
+const activityFilterOptions: Array<{value: ActivityFilterMode; label: string; description: string}> = [
+  {
+    value: 'all',
+    label: '不筛选',
+    description: '不过滤活跃度，导入地址全部参与本轮刷新。',
+  },
+  {
+    value: 'normal_active',
+    label: '仅正常活跃',
+    description: '只刷新近期仍处于正常活跃状态的地址。',
+  },
+  {
+    value: 'inactive',
+    label: '仅不活跃',
+    description: '只刷新近期不活跃的地址，方便回看沉寂样本。',
+  },
+];
+
+type SmartWalletImportSummary = {
+  detectedCount: number;
+  validAddressCount: number;
+  namedAddressCount: number;
+  addressOnlyCount: number;
+  latestUpdatedAt?: string;
+  previewPairs: Array<{name: string; address: string}>;
+};
+
+type SmartWalletImportState = {
+  fileName?: string;
+  payload?: unknown;
+  summary?: SmartWalletImportSummary;
+};
 
 const fallbackForm: FormState = {
+  analysis_mode: 'standard',
+  activity_filter_mode: 'all',
   name: '',
   target_count: 10,
   min_pnl: 0.01,
@@ -28,10 +110,12 @@ const fallbackForm: FormState = {
 export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void}) {
   const [config, setConfig] = useState<Record<string, any>>();
   const [form, setForm] = useState<FormState>(fallbackForm);
+  const [smartWalletImport, setSmartWalletImport] = useState<SmartWalletImportState>({});
   const [loading, setLoading] = useState(true);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [importingFile, setImportingFile] = useState(false);
   const [message, setMessage] = useState<string>();
   const [error, setError] = useState<string>();
 
@@ -54,9 +138,28 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
     };
   }, []);
 
+  const isSmartWalletImportMode = form.analysis_mode === 'smart_wallet_library_refresh';
   const validationError = useMemo(() => validateForm(form), [form]);
+  const smartWalletImportNotice = useMemo(
+    () =>
+      isSmartWalletImportMode && smartWalletImport.fileName
+        ? describeSmartWalletImportNotice(smartWalletImport.summary)
+        : null,
+    [isSmartWalletImportMode, smartWalletImport.fileName, smartWalletImport.summary],
+  );
+  const smartWalletImportValidationError = useMemo(
+    () =>
+      isSmartWalletImportMode && smartWalletImport.fileName
+        ? validateSmartWalletImport(smartWalletImport.summary, smartWalletImport.payload)
+        : null,
+    [isSmartWalletImportMode, smartWalletImport.fileName, smartWalletImport.summary, smartWalletImport.payload],
+  );
+  const submitValidationError = useMemo(
+    () => validateSubmit(form, smartWalletImport.summary, smartWalletImport.payload),
+    [form, smartWalletImport.summary, smartWalletImport.payload],
+  );
   const budgetNote = useMemo(() => describeBudgetNote(form, config), [form, config]);
-  const canSubmit = !validationError;
+  const canSubmit = !submitValidationError;
 
   const update = <K extends keyof FormState>(key: K, value: FormState[K]) => {
     setForm((current) => ({...current, [key]: value}));
@@ -64,21 +167,61 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
     setError(undefined);
   };
 
+  const clearSmartWalletImport = () => {
+    setSmartWalletImport({});
+    setMessage(undefined);
+    setError(undefined);
+  };
+
+  const handleSmartWalletImportChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    if (!file) return;
+
+    setImportingFile(true);
+    setMessage(undefined);
+    setError(undefined);
+
+    try {
+      const text = await file.text();
+      const payload = JSON.parse(text) as unknown;
+      setSmartWalletImport({
+        fileName: file.name,
+        payload,
+        summary: summarizeSmartWalletImport(payload),
+      });
+    } catch (err) {
+      setSmartWalletImport({});
+      setError(err instanceof Error ? `地址库导入失败：${err.message}` : '地址库导入失败，请确认 JSON 格式正确。');
+    } finally {
+      setImportingFile(false);
+      input.value = '';
+    }
+  };
+
   const reset = () => {
     setForm(config ? configToForm(config) : fallbackForm);
+    setSmartWalletImport({});
     setMessage('已恢复为默认配置。');
     setError(undefined);
   };
 
   const submit = async () => {
-    if (validationError) {
-      setError(validationError);
+    if (submitValidationError) {
+      setError(submitValidationError);
       return;
     }
     setSubmitting(true);
     setError(undefined);
     try {
-      const run = await startRun(form);
+      const input: CreateRunInput = isSmartWalletImportMode
+        ? {
+            ...form,
+            smart_wallet_import_payload: smartWalletImport.payload,
+            smart_wallet_import_file_name: smartWalletImport.fileName,
+          }
+        : form;
+      const run = await startRun(input);
       onRunCreated(run.run_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -126,6 +269,10 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
       ) : (
         <form className="space-y-6" onSubmit={(event) => event.preventDefault()}>
           <SettingSection title="任务信息" description="名称可选；留空时系统会自动按时间生成分析记录。">
+            <AnalysisModeField
+              value={form.analysis_mode}
+              onChange={(value) => update('analysis_mode', value)}
+            />
             <TextField
               label="分析名称"
               value={form.name}
@@ -134,6 +281,36 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
             />
           </SettingSection>
 
+          {isSmartWalletImportMode && (
+            <SettingSection
+              title="导入地址库"
+              description="上传后台地址库导出的 JSON，作为这次地址库刷新任务的输入源。"
+            >
+              <SmartWalletImportField
+                fileName={smartWalletImport.fileName}
+                summary={smartWalletImport.summary}
+                importing={importingFile}
+                noticeMessage={smartWalletImportNotice}
+                validationMessage={smartWalletImportValidationError}
+                onFileChange={handleSmartWalletImportChange}
+                onClear={clearSmartWalletImport}
+              />
+            </SettingSection>
+          )}
+
+          {isSmartWalletImportMode && (
+            <SettingSection
+              title="活跃度筛选"
+              description="地址库刷新模式下只保留这一项简单筛选，用来区分正常活跃与不活跃地址。"
+            >
+              <ActivityFilterField
+                value={form.activity_filter_mode}
+                onChange={(value) => update('activity_filter_mode', value)}
+              />
+            </SettingSection>
+          )}
+
+          {!isSmartWalletImportMode && (
           <SettingSection title="筛选条件" description="这里决定最终保留哪些钱包，是本次分析最重要的确认项。">
             <NumberField
               label="目标钱包数量"
@@ -187,6 +364,7 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
               step={0.05}
             />
           </SettingSection>
+          )}
 
           <section className="rounded-md border border-slate-200 bg-white shadow-sm">
             <button
@@ -197,15 +375,21 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
                   <SlidersHorizontal className="h-4 w-4 text-slate-400" />
-                  <h2 className="text-base font-semibold text-slate-900">数据范围与分析预算</h2>
+                  <h2 className="text-base font-semibold text-slate-900">
+                    {isSmartWalletImportMode ? '处理范围与运行参数' : '数据范围与分析预算'}
+                  </h2>
                 </div>
                 <p className="mt-1 text-sm text-slate-500">
-                  这里控制候选池大小、事件索引范围和并发预算；默认值适合日常使用。
+                  {isSmartWalletImportMode
+                    ? '这里控制导入地址的处理范围、事件索引上限和并发参数。'
+                    : '这里控制候选池大小、事件索引范围和并发预算；默认值适合日常使用。'}
                 </p>
               </div>
               <div className="flex flex-shrink-0 items-center gap-3">
                 <span className="hidden text-xs text-slate-500 sm:inline">
-                  首轮前 {form.fetch_limit} 名 · 目标入选 {form.target_count} 个 · 并发 {form.concurrent_wallets}
+                  {isSmartWalletImportMode
+                    ? `导入地址全量处理 · 活跃度 ${activityFilterOptions.find((option) => option.value === form.activity_filter_mode)?.label ?? '不筛选'} · 并发 ${form.concurrent_wallets}`
+                    : `首轮前 ${form.fetch_limit} 名 · 目标入选 ${form.target_count} 个 · 并发 ${form.concurrent_wallets}`}
                 </span>
                 <ChevronDown className={cn('h-4 w-4 text-slate-400 transition-transform', advancedOpen && 'rotate-180')} />
               </div>
@@ -215,24 +399,28 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
               <div className="border-t border-slate-100 px-6 py-6">
                 <BudgetNote tone={budgetNote.tone} title={budgetNote.title} body={budgetNote.body} />
                 <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+                  {!isSmartWalletImportMode && (
                   <NumberField
                     label="首轮排行榜范围（前 N 名）"
                     help="先从排行榜前 N 个钱包开始筛选；如果后端还没选满目标钱包，会继续按页扩到系统预算上限。"
                     value={form.fetch_limit}
                     onChange={(value) => update('fetch_limit', value)}
                   />
+                )}
                   <NumberField
                     label="天气事件上限"
                     help="最多索引多少个天气相关市场。"
                     value={form.max_weather_events}
                     onChange={(value) => update('max_weather_events', value)}
                   />
+                  {!isSmartWalletImportMode && (
                   <NumberField
                     label="钱包分页上限"
                     help="限制深分页范围，避免单次运行过慢。"
                     value={form.max_wallet_offset}
                     onChange={(value) => update('max_wallet_offset', value)}
                   />
+                )}
                   <NumberField
                     label="并发钱包数量"
                     help="同时分析的钱包数量，过高可能触发接口限流。"
@@ -296,6 +484,10 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
 function configToForm(config: Record<string, any>): FormState {
   return {
     ...fallbackForm,
+    analysis_mode: 'standard',
+    activity_filter_mode: String(config.wallet_filter?.activity_filter_mode || fallbackForm.activity_filter_mode)
+      .trim()
+      .toLowerCase() as ActivityFilterMode,
     target_count: Number(config.wallet_filter?.target_count ?? fallbackForm.target_count),
     min_pnl: Number(config.wallet_filter?.min_pnl ?? fallbackForm.min_pnl),
     max_pnl: Number(config.wallet_filter?.max_pnl ?? fallbackForm.max_pnl),
@@ -328,6 +520,7 @@ function applyFormToConfig(config: Record<string, any>, form: FormState): Record
     min_traded_count: form.min_traded_count,
     max_traded_count: form.max_traded_count,
     min_weather_trade_ratio: form.min_weather_trade_ratio,
+    activity_filter_mode: form.activity_filter_mode,
   };
   next.leaderboard = {...(next.leaderboard || {}), fetch_limit: form.fetch_limit};
   next.weather = {...(next.weather || {}), max_events: form.max_weather_events};
@@ -339,12 +532,27 @@ function applyFormToConfig(config: Record<string, any>, form: FormState): Record
   return next;
 }
 
+function isPositiveNumber(value: number): boolean {
+  return Number.isFinite(value) && value > 0;
+}
+
 function validateForm(form: FormState): string | null {
-  if (form.target_count <= 0) return '目标钱包数量必须大于 0。';
-  if (form.fetch_limit <= 0) return '首轮排行榜范围必须大于 0。';
-  if (form.max_weather_events <= 0) return '天气事件上限必须大于 0。';
-  if (form.max_wallet_offset <= 0) return '钱包分页上限必须大于 0。';
-  if (form.concurrent_wallets <= 0) return '并发钱包数量必须大于 0。';
+  if (form.analysis_mode === 'smart_wallet_library_refresh') {
+    if (!activityFilterOptions.some((option) => option.value === form.activity_filter_mode)) {
+      return '活跃度筛选选项无效。';
+    }
+    if (!isPositiveNumber(form.max_weather_events)) return '天气事件上限必须大于 0。';
+    if (!isPositiveNumber(form.concurrent_wallets)) return '并发钱包数量必须大于 0。';
+    return null;
+  }
+  if (!activityFilterOptions.some((option) => option.value === form.activity_filter_mode)) {
+    return '活跃度筛选选项无效。';
+  }
+  if (!isPositiveNumber(form.target_count)) return '目标钱包数量必须大于 0。';
+  if (!isPositiveNumber(form.fetch_limit)) return '首轮排行榜范围必须大于 0。';
+  if (!isPositiveNumber(form.max_weather_events)) return '天气事件上限必须大于 0。';
+  if (!isPositiveNumber(form.max_wallet_offset)) return '钱包分页上限必须大于 0。';
+  if (!isPositiveNumber(form.concurrent_wallets)) return '并发钱包数量必须大于 0。';
   if (form.min_pnl < 0 || form.max_pnl < 0) return '盈利区间不能小于 0。';
   if (form.max_pnl < form.min_pnl) return '最高盈利不能小于最低盈利。';
   if (form.min_volume < 0 || form.max_volume < 0) return '交易量区间不能小于 0。';
@@ -357,10 +565,52 @@ function validateForm(form: FormState): string | null {
   return null;
 }
 
+function validateSmartWalletImport(summary?: SmartWalletImportSummary, payload?: unknown): string | null {
+  if (payload == null) {
+    return '请先上传地址库 JSON 文件。';
+  }
+  if ((summary?.detectedCount ?? 0) <= 0) {
+    return '导入文件中未识别到地址库记录，请确认导出文件内容正确。';
+  }
+  if ((summary?.validAddressCount ?? 0) <= 0) {
+    return '导入文件中未识别到有效钱包地址，请确认地址为标准 EVM 地址（0x 开头，42 位长度）。';
+  }
+  return null;
+}
+
+function describeSmartWalletImportNotice(summary?: SmartWalletImportSummary): string | null {
+  if ((summary?.validAddressCount ?? 0) <= 0) {
+    return null;
+  }
+  if ((summary?.namedAddressCount ?? 0) <= 0) {
+    return '当前文件已识别到有效地址，但未识别到对应用户名或显示名；任务仍可按地址刷新，后续人工确认可能不方便。';
+  }
+  if ((summary?.addressOnlyCount ?? 0) > 0) {
+    return `还有 ${summary?.addressOnlyCount ?? 0} 条地址未识别到用户名或显示名，运行时会继续按地址刷新。`;
+  }
+  return null;
+}
+
+function validateSubmit(form: FormState, smartWalletImportSummary?: SmartWalletImportSummary, smartWalletImportPayload?: unknown): string | null {
+  const formError = validateForm(form);
+  if (formError) return formError;
+  if (form.analysis_mode === 'smart_wallet_library_refresh') {
+    return validateSmartWalletImport(smartWalletImportSummary, smartWalletImportPayload);
+  }
+  return null;
+}
+
 function describeBudgetNote(
   form: FormState,
   config?: Record<string, any>,
 ): {tone: 'blue' | 'amber' | 'emerald'; title: string; body: string} {
+  if (form.analysis_mode === 'smart_wallet_library_refresh') {
+    return {
+      tone: 'blue',
+      title: '当前将直接刷新导入地址',
+      body: '系统会按导入地址库逐个刷新分析结果，不再额外套用盈利、交易量和交易笔数筛选，仅保留活跃度这一项简单筛选。',
+    };
+  }
   const leaderboard = config?.leaderboard || {};
   const autoExtendToTarget = Boolean(leaderboard.auto_extend_to_target ?? true);
   const maxFetchLimit = Number(leaderboard.max_fetch_limit);
@@ -461,6 +711,362 @@ function TextField({
         onChange={(event) => onChange(event.target.value)}
         className="block h-10 w-full max-w-xl rounded-md border-0 px-3 text-slate-900 shadow-sm ring-1 ring-inset ring-slate-300 placeholder:text-slate-400 focus:ring-2 focus:ring-inset focus:ring-[#2E5CFF] sm:text-sm"
       />
+    </FieldRow>
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function textValue(value: unknown): string {
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value).trim();
+  return '';
+}
+
+const EVM_ADDRESS_PATTERN = /^0x[a-f0-9]{40}$/;
+
+function normalizeImportAddress(value: unknown): string {
+  const text = textValue(value).toLowerCase();
+  if (!text) return '';
+  const normalized = text.startsWith('0x') ? text : `0x${text}`;
+  return EVM_ADDRESS_PATTERN.test(normalized) ? normalized : '';
+}
+
+function importWalletRows(payload: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(payload)) {
+    return payload.filter(isRecord);
+  }
+  if (!isRecord(payload)) {
+    return [];
+  }
+
+  for (const key of ['wallets', 'items', 'records', 'rows']) {
+    const value = payload[key];
+    if (Array.isArray(value)) {
+      return value.filter(isRecord);
+    }
+  }
+
+  for (const key of ['data', 'payload', 'result']) {
+    const nested = importWalletRows(payload[key]);
+    if (nested.length > 0) {
+      return nested;
+    }
+  }
+
+  if (
+    'wallet' in payload ||
+    'address' in payload ||
+    'normalizedAddress' in payload ||
+    'normalized_address' in payload
+  ) {
+    return [payload];
+  }
+
+  return [];
+}
+
+function normalizedAddressFromImportRow(row: Record<string, unknown>): string {
+  const wallet = isRecord(row.wallet) ? row.wallet : undefined;
+  return normalizeImportAddress(
+    wallet?.normalizedAddress ??
+      wallet?.normalized_address ??
+      wallet?.address ??
+      row.normalizedAddress ??
+      row.normalized_address ??
+      row.address ??
+      row.wallet_address,
+  );
+}
+
+function pickImportIdentityName(row: Record<string, unknown>): string {
+  const wallet = isRecord(row.wallet) ? row.wallet : undefined;
+  const sourceMeta = isRecord(row.sourceMeta) ? row.sourceMeta : isRecord(row.source_meta) ? row.source_meta : undefined;
+  const xUsername = textValue(
+    row.xUsername ?? row.x_username ?? sourceMeta?.xUsername ?? sourceMeta?.x_username ?? sourceMeta?.twitter,
+  ).replace(/^@+/, '');
+
+  return (
+    textValue(row.userName) ||
+    textValue(row.user_name) ||
+    textValue(sourceMeta?.userName) ||
+    textValue(sourceMeta?.username) ||
+    textValue(wallet?.displayName) ||
+    textValue(wallet?.display_name) ||
+    textValue(row.displayName) ||
+    textValue(row.display_name) ||
+    textValue(wallet?.alias) ||
+    textValue(row.alias) ||
+    (xUsername ? `@${xUsername}` : '')
+  );
+}
+
+function latestUpdatedAtFromImportRows(rows: Array<Record<string, unknown>>): string | undefined {
+  let latestValue: string | undefined;
+  let latestTime = Number.NEGATIVE_INFINITY;
+
+  for (const row of rows) {
+    const wallet = isRecord(row.wallet) ? row.wallet : undefined;
+    const candidates = [
+      textValue(wallet?.updatedAt),
+      textValue(wallet?.updated_at),
+      textValue(row.updatedAt),
+      textValue(row.updated_at),
+    ].filter(Boolean);
+
+    for (const candidate of candidates) {
+      const parsed = Date.parse(candidate);
+      if (Number.isNaN(parsed) || parsed <= latestTime) {
+        continue;
+      }
+      latestTime = parsed;
+      latestValue = candidate;
+    }
+  }
+
+  return latestValue;
+}
+
+function summarizeSmartWalletImport(payload: unknown): SmartWalletImportSummary {
+  const rows = importWalletRows(payload);
+  const previewPairs: Array<{name: string; address: string}> = [];
+  let validAddressCount = 0;
+  let namedAddressCount = 0;
+
+  for (const row of rows) {
+    const address = normalizedAddressFromImportRow(row);
+    if (!address) {
+      continue;
+    }
+    validAddressCount += 1;
+    const name = pickImportIdentityName(row);
+    if (!name) {
+      continue;
+    }
+    namedAddressCount += 1;
+    if (previewPairs.length < 5) {
+      previewPairs.push({name, address});
+    }
+  }
+
+  return {
+    detectedCount: rows.length,
+    validAddressCount,
+    namedAddressCount,
+    addressOnlyCount: Math.max(0, validAddressCount - namedAddressCount),
+    latestUpdatedAt: latestUpdatedAtFromImportRows(rows),
+    previewPairs,
+  };
+}
+
+function formatImportTimestamp(value?: string): string {
+  if (!value) return '未识别';
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) return value;
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(new Date(parsed));
+}
+
+function AnalysisModeField({
+  value,
+  onChange,
+}: {
+  value: AnalysisMode;
+  onChange: (value: AnalysisMode) => void;
+}) {
+  const selectedMode = analysisModeOptions.find((option) => option.value === value) ?? analysisModeOptions[0];
+  const modeNote =
+    value === 'weekly_high_profit'
+      ? '按周榜单找地址，盈利、交易量和交易笔数都按周口径衡量。'
+      : value === 'smart_wallet_library_refresh'
+        ? '按导入地址直接刷新分析，仅保留活跃度这一项简单筛选。'
+        : '按日常分析链路运行，盈利、交易量和交易笔数都按日口径衡量。';
+
+  return (
+    <FieldRow label="分析模式" help="先确定这次任务走哪条分析链路。">
+      <div className="space-y-3">
+        <div className="space-y-2">
+          {analysisModeOptions.map((option) => {
+            const checked = option.value === value;
+            return (
+              <label
+                key={option.value}
+                className={cn(
+                  'flex cursor-pointer gap-3 rounded-md border px-4 py-3 transition-colors',
+                  checked ? 'border-[#2E5CFF] bg-blue-50/60' : 'border-slate-200 hover:border-slate-300',
+                )}
+              >
+                <input
+                  type="radio"
+                  name="analysis_mode"
+                  value={option.value}
+                  checked={checked}
+                  onChange={() => onChange(option.value)}
+                  className="mt-1 h-4 w-4 border-slate-300 text-[#2E5CFF] focus:ring-[#2E5CFF]"
+                />
+                <span className="min-w-0">
+                  <span className="block text-sm font-medium text-slate-900">{option.label}</span>
+                  <span className="mt-1 block text-xs leading-5 text-slate-500">{option.description}</span>
+                </span>
+              </label>
+            );
+          })}
+        </div>
+        <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-600">
+          <span className="font-medium text-slate-800">{selectedMode.label}</span>
+          <span className="ml-2">{modeNote}</span>
+        </div>
+      </div>
+    </FieldRow>
+  );
+}
+
+function ActivityFilterField({
+  value,
+  onChange,
+}: {
+  value: ActivityFilterMode;
+  onChange: (value: ActivityFilterMode) => void;
+}) {
+  return (
+    <FieldRow
+      label="活跃度筛选"
+      help="对导入地址库做活跃状态筛选，可选择仅正常活跃、仅不活跃或不筛选。"
+    >
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+        {activityFilterOptions.map((option) => {
+          const checked = option.value === value;
+          return (
+            <label
+              key={option.value}
+              className={cn(
+                'flex cursor-pointer gap-3 rounded-md border px-4 py-3 transition-colors',
+                checked ? 'border-[#2E5CFF] bg-blue-50/60' : 'border-slate-200 hover:border-slate-300',
+              )}
+            >
+              <input
+                type="radio"
+                name="activity_filter_mode"
+                value={option.value}
+                checked={checked}
+                onChange={() => onChange(option.value)}
+                className="mt-1 h-4 w-4 border-slate-300 text-[#2E5CFF] focus:ring-[#2E5CFF]"
+              />
+              <span className="min-w-0">
+                <span className="block text-sm font-medium text-slate-900">{option.label}</span>
+                <span className="mt-1 block text-xs leading-5 text-slate-500">{option.description}</span>
+              </span>
+            </label>
+          );
+        })}
+      </div>
+    </FieldRow>
+  );
+}
+
+function SmartWalletImportField({
+  fileName,
+  summary,
+  importing,
+  noticeMessage,
+  validationMessage,
+  onFileChange,
+  onClear,
+}: {
+  fileName?: string;
+  summary?: SmartWalletImportSummary;
+  importing: boolean;
+  noticeMessage?: string | null;
+  validationMessage?: string | null;
+  onFileChange: (event: ChangeEvent<HTMLInputElement>) => void;
+  onClear: () => void;
+}) {
+  return (
+    <FieldRow
+      label="地址库 JSON"
+      help="支持上传后台导出的地址库 JSON，地址提取与结构兼容由系统自动处理。"
+    >
+      <div className="space-y-3">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+          <label className="inline-flex h-10 cursor-pointer items-center justify-center rounded-md border border-slate-300 bg-white px-4 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50">
+            <Upload className="mr-2 h-4 w-4" />
+            {importing ? '导入中...' : '选择地址库 JSON'}
+            <input
+              type="file"
+              accept=".json,application/json"
+              onChange={onFileChange}
+              className="sr-only"
+            />
+          </label>
+          {fileName && (
+            <button
+              type="button"
+              onClick={onClear}
+              className="inline-flex h-10 items-center justify-center rounded-md px-3 text-sm font-medium text-slate-500 hover:bg-slate-100"
+            >
+              <X className="mr-2 h-4 w-4" />
+              清除文件
+            </button>
+          )}
+        </div>
+
+        {fileName ? (
+          <div className="rounded-md border border-slate-200 bg-slate-50 px-4 py-3">
+            <div className="flex flex-col gap-2 text-sm text-slate-700">
+              <div className="font-medium text-slate-900">{fileName}</div>
+              <div className="grid grid-cols-1 gap-2 text-xs text-slate-600 sm:grid-cols-2 xl:grid-cols-5">
+                <div>检测记录数：{summary?.detectedCount ?? 0}</div>
+                <div>可用地址数：{summary?.validAddressCount ?? 0}</div>
+                <div>用户名/显示名配对数：{summary?.namedAddressCount ?? 0}</div>
+                <div>仅地址无名称：{summary?.addressOnlyCount ?? 0}</div>
+                <div>最新更新时间：{formatImportTimestamp(summary?.latestUpdatedAt)}</div>
+              </div>
+
+              {(summary?.previewPairs.length ?? 0) > 0 && (
+                <div className="space-y-2 border-t border-slate-200 pt-3">
+                  <div className="text-xs font-medium text-slate-700">已识别用户名/显示名样例</div>
+                  <div className="space-y-2">
+                    {summary?.previewPairs.map((item) => (
+                      <div
+                        key={`${item.address}:${item.name}`}
+                        className="rounded-md border border-slate-200 bg-white px-3 py-2"
+                      >
+                        <div className="text-sm font-medium text-slate-900">{item.name}</div>
+                        <div className="break-all font-mono text-xs text-slate-500">{item.address}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="rounded-md border border-dashed border-slate-200 px-4 py-3 text-sm text-slate-500">
+            请先上传地址库 JSON 文件，导入完成后即可开始这次地址库刷新。
+          </div>
+        )}
+
+        {fileName && noticeMessage && !validationMessage && (
+          <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+            {noticeMessage}
+          </div>
+        )}
+
+        {fileName && validationMessage && (
+          <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            {validationMessage}
+          </div>
+        )}
+      </div>
     </FieldRow>
   );
 }

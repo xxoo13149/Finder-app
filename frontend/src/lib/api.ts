@@ -34,6 +34,7 @@ export type AnalysisSummary = {
   wallets_screened?: number;
   wallets_selected?: number;
   wallets_core_labeled?: number;
+  finder_ai_summary?: FinderAiRunSummary;
   errors?: number;
   label_counts?: Record<string, number>;
   averages?: Record<string, number>;
@@ -41,9 +42,24 @@ export type AnalysisSummary = {
   top_wallets_by_frequency?: WalletRankSummary[];
 };
 
+export type FinderAiRunSummary = {
+  selected_wallets?: number;
+  finder_ai_present?: number;
+  eligible?: number;
+  generated?: number;
+  cached?: number;
+  failed?: number;
+  skipped?: number;
+  needs_review?: number;
+  has_conflict?: number;
+  latest_generated_at?: string;
+};
+
 export type WalletRankSummary = {
   wallet: string;
   rank?: string | number;
+  user_name?: string;
+  x_username?: string;
   pnl?: number;
   closed_profit_multiple?: number;
   closed_position_win_rate?: number;
@@ -55,6 +71,12 @@ export type WalletRow = {
   wallet: string;
   rank?: string | number;
   user_name?: string;
+  x_username?: string;
+  ai_strategy_focus?: string;
+  ai_brief_short?: string;
+  ai_needs_review?: boolean;
+  ai_has_conflict?: boolean;
+  ai_evidence_level?: string;
   pnl?: number;
   volume?: number;
   trade_count?: number;
@@ -133,6 +155,79 @@ export type LabelEvaluation = Omit<LabelEvidence, 'facts'> & {
   records?: Array<string | LabelEvidenceRecord>;
 };
 
+export type FinderAiLabel = {
+  kind?: string;
+  value?: string;
+  source?: string;
+  evidence?: string;
+};
+
+export type FinderAiPrimarySignal = {
+  key?: string;
+  label?: string;
+  matched?: boolean;
+  reason?: string;
+};
+
+export type FinderAiMetric = {
+  key?: string;
+  label?: string;
+  value?: string | number | boolean | null;
+};
+
+export type FinderAiWeatherSignals = {
+  marketScope?: string;
+  resolutionSource?: string;
+  forecastBasis?: string;
+  timingWindow?: string;
+  edgeStyle?: string;
+  weatherDrivers?: string[];
+  evidenceQuality?: string;
+};
+
+export type FinderAiProviderMeta = {
+  provider?: string;
+  model?: string;
+  promptVersion?: string;
+  generatedAt?: string;
+  inputHash?: string;
+  requestId?: string;
+  generationScope?: 'brief' | 'deep' | string;
+  outputSchemaVersion?: string;
+};
+
+export type FinderAiBriefGeneration = {
+  enabled?: boolean;
+  status?: string;
+  reason?: string;
+};
+
+export type FinderAiResult = {
+  sourceName?: string;
+  runId?: string;
+  normalizedAddress?: string;
+  wallet?: {
+    address?: string;
+    displayName?: string;
+    alias?: string;
+  };
+  matched?: boolean;
+  strategyFocus?: string;
+  aiBriefShort?: string;
+  aiBriefNote?: string;
+  aiDeepNote?: string;
+  evidenceLevel?: string;
+  hasConflict?: boolean;
+  needsReview?: boolean;
+  labels?: FinderAiLabel[];
+  primarySignals?: FinderAiPrimarySignal[];
+  keyMetrics?: FinderAiMetric[];
+  sourceExcerpt?: string;
+  weatherSignals?: FinderAiWeatherSignals;
+  providerMeta?: FinderAiProviderMeta;
+  briefGeneration?: FinderAiBriefGeneration;
+};
+
 export type WalletDetail = {
   wallet: string;
   leaderboard_entry?: Record<string, unknown>;
@@ -151,6 +246,7 @@ export type WalletDetail = {
   raw_counts?: Record<string, number>;
   evidence_summary?: EvidenceSummary;
   operation_audit?: OperationAudit;
+  finder_ai?: FinderAiResult;
 };
 
 export type EvidenceSummary = {
@@ -222,8 +318,14 @@ export type MarketRecord = {
   [key: string]: unknown;
 };
 
+export type AnalysisMode = 'standard' | 'weekly_high_profit' | 'smart_wallet_library_refresh';
+
+export type ActivityFilterMode = 'all' | 'normal_active' | 'inactive';
+
 export type CreateRunInput = {
+  analysis_mode?: AnalysisMode;
   name?: string;
+  activity_filter_mode?: ActivityFilterMode;
   target_count?: number;
   min_pnl?: number;
   max_pnl?: number;
@@ -241,6 +343,8 @@ export type CreateRunInput = {
   enable_chain_validation?: boolean;
   verbose?: boolean;
   chain_api_key_env?: string;
+  smart_wallet_import_payload?: unknown;
+  smart_wallet_import_file_name?: string;
 };
 
 export type Paginated<T> = {
@@ -363,6 +467,59 @@ export type ShutdownPayload = {
   message: string;
 };
 
+export type SmartProConfigPayload = {
+  configured: boolean;
+  base_url?: string | null;
+  commit_path: string;
+  timeout_seconds: number;
+  token_configured: boolean;
+  access_service_token_configured?: boolean;
+  errors: string[];
+};
+
+export type SmartProSyncInput = {
+  runId: string;
+  wallets?: string[];
+  filters?: Record<string, string>;
+};
+
+export type SmartProCommitResult = {
+  createdCount?: number;
+  updatedCount?: number;
+  failedRows?: Array<{rowNumber?: number; displayName?: string; reason?: string}>;
+};
+
+export type SmartProSyncResult = {
+  ok: boolean;
+  run_id: string;
+  requested_count?: number | null;
+  sent_count: number;
+  payload_bytes?: number;
+  smart_pro_base_url?: string;
+  endpoint?: string;
+  smart_pro?: {
+    ok?: boolean;
+    data?: {
+      totalRows?: number;
+      validRows?: number;
+      sourceName?: string;
+      runId?: string;
+      fallbackReason?: string;
+      commit?: SmartProCommitResult;
+    };
+    error?: string;
+    [key: string]: unknown;
+  };
+  summary?: {
+    totalRows?: number;
+    validRows?: number;
+    createdCount?: number;
+    updatedCount?: number;
+    failedCount?: number;
+    fallbackReason?: string;
+  };
+};
+
 const API_BASE = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') || '';
 
 export const apiBaseLabel = API_BASE || '同源 /api 代理';
@@ -428,6 +585,21 @@ export async function shutdownApplication(): Promise<ShutdownPayload> {
   }
 }
 
+export async function getSmartProConfig(): Promise<SmartProConfigPayload> {
+  return apiJson<SmartProConfigPayload>('/api/smart-pro/config');
+}
+
+export async function syncSmartProImport(input: SmartProSyncInput): Promise<SmartProSyncResult> {
+  return apiJson<SmartProSyncResult>('/api/smart-pro/import/commit', {
+    method: 'POST',
+    body: JSON.stringify({
+      run_id: input.runId,
+      wallets: input.wallets,
+      filters: input.filters,
+    }),
+  });
+}
+
 export async function getRun(runId: string): Promise<RunRecord> {
   return apiJson<RunRecord>(`/api/runs/${encodeURIComponent(runId)}`);
 }
@@ -480,6 +652,7 @@ export async function saveDefaultConfig(config: Record<string, any>): Promise<{o
 export async function startRun(input: CreateRunInput): Promise<RunRecord> {
   const runName = input.name?.trim();
   const body = {
+    analysis_mode: input.analysis_mode,
     run_id: runName ? slugifyRunId(runName) : undefined,
     overrides: {
       target_count: input.target_count,
@@ -490,6 +663,7 @@ export async function startRun(input: CreateRunInput): Promise<RunRecord> {
       min_traded_count: input.min_traded_count,
       max_traded_count: input.max_traded_count,
       min_weather_trade_ratio: input.min_weather_trade_ratio,
+      activity_filter_mode: input.activity_filter_mode,
       fetch_limit: input.fetch_limit,
       max_fetch_limit: input.max_fetch_limit,
       max_weather_events: input.max_weather_events,
@@ -500,6 +674,13 @@ export async function startRun(input: CreateRunInput): Promise<RunRecord> {
       verbose: input.verbose,
       chain_api_key_env: input.chain_api_key_env,
     },
+    smart_wallet_import:
+      input.smart_wallet_import_payload != null
+        ? {
+            file_name: input.smart_wallet_import_file_name,
+            payload: input.smart_wallet_import_payload,
+          }
+        : undefined,
   };
   return apiJson<RunRecord>('/api/runs', {
     method: 'POST',

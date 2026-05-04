@@ -1,16 +1,20 @@
 ﻿import {Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis} from 'recharts';
 import {ArrowUp, FileText, Play, RefreshCcw} from 'lucide-react';
 import {useEffect, useMemo, useState} from 'react';
+import {FinderAiRunSummaryStrip, hasFinderAiPreview, toFinderAiPreviewItem} from '../components/FinderAiRunSummaryStrip';
 import {RunPicker} from '../components/RunPicker';
 import {
   AnalysisSummary,
   RunRecord,
+  WalletRankSummary,
+  WalletRow,
   formatCurrency,
   formatDateTime,
   formatNumber,
   formatPercent,
   getRun,
   getSummary,
+  getWallets,
   latestCompletedRun,
   listRuns,
   runDisplayName,
@@ -33,6 +37,7 @@ export function Dashboard({
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [run, setRun] = useState<RunRecord>();
   const [summary, setSummary] = useState<AnalysisSummary>();
+  const [previewWallets, setPreviewWallets] = useState<WalletRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
 
@@ -77,6 +82,24 @@ export function Dashboard({
     };
   }, [selectedRunId]);
 
+  useEffect(() => {
+    if (!selectedRunId) {
+      setPreviewWallets([]);
+      return;
+    }
+    let cancelled = false;
+    getWallets(selectedRunId, {limit: 500})
+      .then((payload) => {
+        if (!cancelled) setPreviewWallets(payload.items || []);
+      })
+      .catch(() => {
+        if (!cancelled) setPreviewWallets([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedRunId]);
+
   const tagData = useMemo(
     () =>
       Object.entries(summary?.label_counts || {})
@@ -87,6 +110,15 @@ export function Dashboard({
 
   const topWallets = summary?.top_wallets_by_pnl || [];
   const averages = summary?.averages || {};
+  const finderAiPreviewItems = useMemo(
+    () =>
+      [...previewWallets]
+        .filter(hasFinderAiPreview)
+        .sort((left, right) => Number(right.pnl || 0) - Number(left.pnl || 0))
+        .slice(0, 10)
+        .map(toFinderAiPreviewItem),
+    [previewWallets],
+  );
   const stats = [
     {title: '排行榜记录', value: formatNumber(summary?.leaderboard_rows_fetched), trend: '最近运行'},
     {title: '已筛选钱包', value: formatNumber(summary?.wallets_screened), trend: '本次分析'},
@@ -168,6 +200,15 @@ export function Dashboard({
           </button>
         </div>
 
+        <FinderAiRunSummaryStrip
+          summary={summary?.finder_ai_summary}
+          previewItems={finderAiPreviewItems}
+          onPreviewWalletOpen={onWalletSelected}
+          compact
+          embedded
+          className="mb-6"
+        />
+
         <div className="grid grid-cols-1 gap-8 lg:grid-cols-3">
           <div className="lg:col-span-2">
             <div className="mb-4 flex items-center justify-between">
@@ -211,8 +252,11 @@ export function Dashboard({
                   {topWallets.map((wallet) => (
                     <tr key={wallet.wallet} className="cursor-pointer hover:bg-slate-50/80" onClick={() => onWalletSelected?.(wallet.wallet)}>
                       <td className="whitespace-nowrap px-2 py-2.5 text-sm text-slate-600">{wallet.rank || '-'}</td>
-                      <td className="whitespace-nowrap px-2 py-2.5 font-mono text-sm font-medium text-slate-900">
-                        {shortAddress(wallet.wallet)}
+                      <td className="px-2 py-2.5 text-sm text-slate-900">
+                        <div className="min-w-0">
+                          <div className="truncate font-medium text-slate-900">{preferredDashboardWalletName(wallet) || shortAddress(wallet.wallet)}</div>
+                          <div className="truncate font-mono text-xs text-slate-500">{shortAddress(wallet.wallet)}</div>
+                        </div>
                       </td>
                       <td className="whitespace-nowrap px-2 py-2.5 text-right text-sm text-slate-600">{formatCurrency(wallet.pnl)}</td>
                     </tr>
@@ -232,6 +276,19 @@ export function Dashboard({
       </div>
     </div>
   );
+}
+
+function preferredDashboardWalletName(wallet: WalletRankSummary): string | undefined {
+  for (const value of [wallet.user_name, wallet.x_username]) {
+    const text = String(value || '').trim();
+    if (!text) continue;
+    const normalized = text.replace(/^@+/, '');
+    if (!normalized) continue;
+    const lowered = normalized.toLowerCase();
+    if (lowered.startsWith('0x') && lowered.length >= 10) continue;
+    return value === wallet.x_username ? `@${normalized}` : normalized;
+  }
+  return undefined;
 }
 
 function PanelMessage({

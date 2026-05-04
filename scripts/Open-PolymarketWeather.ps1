@@ -115,6 +115,37 @@ function Read-RuntimeState {
   }
 }
 
+function Get-LatestWriteTimeUtc {
+  param([Parameter(Mandatory = $true)][string[]]$Paths)
+
+  $latest = [datetime]::MinValue
+  foreach ($path in $Paths) {
+    if (-not (Test-Path -LiteralPath $path)) {
+      continue
+    }
+
+    $entry = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+    if (-not $entry) {
+      continue
+    }
+
+    $items = if ($entry.PSIsContainer) {
+      @(Get-ChildItem -LiteralPath $path -Recurse -File -ErrorAction SilentlyContinue)
+    }
+    else {
+      @($entry)
+    }
+
+    foreach ($item in $items) {
+      if ($item.LastWriteTimeUtc -gt $latest) {
+        $latest = $item.LastWriteTimeUtc
+      }
+    }
+  }
+
+  return $latest
+}
+
 function Reclaim-StaleLauncher {
   param([int]$MaxAgeSeconds = 90)
 
@@ -413,10 +444,47 @@ function Save-RuntimeState {
   [System.IO.File]::WriteAllText($runtimeStatePath, $json, $utf8NoBom)
 }
 
-function Ensure-FrontendBuild {
-  $indexPath = Join-Path $frontendRoot 'dist\index.html'
-  if (Test-Path -LiteralPath $indexPath) {
+function Stop-RuntimeBrowserWindow {
+  $runtime = Read-RuntimeState
+  if (-not $runtime -or -not $runtime.browser_pid) {
     return
+  }
+
+  try {
+    $browserProcessId = [int]$runtime.browser_pid
+  }
+  catch {
+    return
+  }
+
+  if ($browserProcessId -gt 0 -and $browserProcessId -ne $PID) {
+    Stop-Process -Id $browserProcessId -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 300
+  }
+}
+
+function Test-FrontendBuildStale {
+  $indexPath = Join-Path $frontendRoot 'dist\index.html'
+  if (-not (Test-Path -LiteralPath $indexPath)) {
+    return $true
+  }
+
+  $buildTime = (Get-Item -LiteralPath $indexPath).LastWriteTimeUtc
+  $sourceTime = Get-LatestWriteTimeUtc -Paths @(
+    (Join-Path $frontendRoot 'src'),
+    (Join-Path $frontendRoot 'public'),
+    (Join-Path $frontendRoot 'index.html'),
+    (Join-Path $frontendRoot 'package.json'),
+    (Join-Path $frontendRoot 'vite.config.ts')
+  )
+
+  return $sourceTime -gt $buildTime
+}
+
+function Ensure-FrontendBuild {
+  $needsBuild = Test-FrontendBuildStale
+  if (-not $needsBuild) {
+    return $false
   }
 
   Push-Location $frontendRoot
@@ -429,6 +497,8 @@ function Ensure-FrontendBuild {
   finally {
     Pop-Location
   }
+
+  return $true
 }
 
 try {
@@ -440,30 +510,18 @@ try {
     throw 'Polymarket Weather Tool is already starting. Please wait a few seconds and try again.'
   }
 
-  Ensure-FrontendBuild
+  $frontendRebuilt = Ensure-FrontendBuild
 
-  if (Test-ManagedApi) {
-    # Existing managed API is already the single service; keep warm launch fast.
-  }
-  else {
-    Stop-RuntimeStateProcesses
-    Stop-ProjectPortListeners -Ports @($apiPort)
-    Stop-ProjectPortListeners -Ports @($devPort) -IgnoreForeign
-    Wait-PortsReleased -Ports @($apiPort) -TimeoutSeconds 8
+  if ($frontendRebuilt) {
+    Stop-RuntimeBrowserWindow
   }
 
-  if ((Test-HttpOk -Url $healthUrl) -and -not (Test-ManagedApi)) {
-    Stop-ProjectPortListeners -Ports @($apiPort)
-    Wait-PortsReleased -Ports @($apiPort) -TimeoutSeconds 8
-    Start-Sleep -Seconds 2
-  }
+  Stop-RuntimeStateProcesses
+  Stop-ProjectPortListeners -Ports @($apiPort)
+  Stop-ProjectPortListeners -Ports @($devPort) -IgnoreForeign
+  Wait-PortsReleased -Ports @($apiPort) -TimeoutSeconds 8
 
-  $apiProcess = $null
-  if (-not (Test-HttpOk -Url $healthUrl)) {
-    Stop-ProjectPortListeners -Ports @($apiPort)
-    Wait-PortsReleased -Ports @($apiPort) -TimeoutSeconds 8
-    $apiProcess = Start-HiddenPythonServer
-  }
+  $apiProcess = Start-HiddenPythonServer
 
   Save-RuntimeState -ApiProcessId $(if ($apiProcess) { $apiProcess.Id } else { 0 }) -BrowserProcessId 0
 

@@ -1,6 +1,7 @@
-import {RefreshCcw, Save, Trash2} from 'lucide-react';
+import {AlertCircle, CheckCircle2, Loader2, RefreshCcw, Save, Trash2} from 'lucide-react';
 import type {ReactNode} from 'react';
-import {useState} from 'react';
+import {useEffect, useState} from 'react';
+import {getSmartProConfig, type SmartProConfigPayload} from '../lib/api';
 import {
   ConsolePreferences,
   clearLocalPreferences,
@@ -12,11 +13,33 @@ import {
 export function SettingsPage({onNavigate}: {onNavigate: (page: string) => void}) {
   const [preferences, setPreferences] = useState<ConsolePreferences>(loadPreferences);
   const [message, setMessage] = useState<string>();
+  const [smartProConfig, setSmartProConfig] = useState<SmartProConfigPayload>();
+  const [smartProLoading, setSmartProLoading] = useState(true);
+  const [smartProError, setSmartProError] = useState<string>();
 
   const updatePreference = <Key extends keyof ConsolePreferences>(key: Key, value: ConsolePreferences[Key]) => {
     setPreferences((current) => ({...current, [key]: value}));
     setMessage(undefined);
   };
+
+  const loadSmartProStatus = () => {
+    setSmartProLoading(true);
+    setSmartProError(undefined);
+    getSmartProConfig()
+      .then((payload) => {
+        setSmartProConfig(payload);
+      })
+      .catch((err) => {
+        setSmartProError(err instanceof Error ? err.message : 'SmartPro configuration load failed');
+      })
+      .finally(() => {
+        setSmartProLoading(false);
+      });
+  };
+
+  useEffect(() => {
+    loadSmartProStatus();
+  }, []);
 
   const save = () => {
     setPreferences(savePreferences(preferences));
@@ -69,6 +92,59 @@ export function SettingsPage({onNavigate}: {onNavigate: (page: string) => void})
             onChange={(value) => updatePreference('tablePageSize', value)}
           />
         </SettingRow>
+      </div>
+
+      <div className="border-t border-slate-100 px-6 py-5">
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <div className="text-sm font-medium text-slate-900">SmartPro 对接状态</div>
+            <div className="mt-1 text-sm text-slate-500">钱包列表页的“同步 SmartPro”按钮会读取本地 `.env` 里的共享地址和 token。</div>
+          </div>
+          <div className="flex items-center gap-2">
+            {smartProLoading ? (
+              <span className="inline-flex items-center rounded-md border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-500">
+                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                检查中
+              </span>
+            ) : smartProConfig?.configured ? (
+              <span className="inline-flex items-center rounded-md border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-medium text-emerald-700">
+                <CheckCircle2 className="mr-1.5 h-3.5 w-3.5" />
+                已连接
+              </span>
+            ) : (
+              <span className="inline-flex items-center rounded-md border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700">
+                <AlertCircle className="mr-1.5 h-3.5 w-3.5" />
+                待配置
+              </span>
+            )}
+            <button
+              onClick={loadSmartProStatus}
+              className="inline-flex items-center rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+            >
+              <RefreshCcw className="mr-1.5 h-3.5 w-3.5" />
+              刷新
+            </button>
+          </div>
+        </div>
+
+        {smartProError ? (
+          <div className="mt-4 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{smartProError}</div>
+        ) : smartProConfig ? (
+          <>
+            <div className="mt-4 grid gap-3 md:grid-cols-2">
+              <ConfigItem label="SmartPro 地址" value={smartProConfig.base_url || '未配置'} mono />
+              <ConfigItem label="提交路径" value={smartProConfig.commit_path} mono />
+              <ConfigItem label="共享 Token" value={smartProConfig.token_configured ? '已配置' : '未配置'} />
+              <ConfigItem label="Access 凭据" value={smartProConfig.access_service_token_configured ? '已配置' : '未配置'} />
+              <ConfigItem label="超时时间" value={`${smartProConfig.timeout_seconds} 秒`} />
+            </div>
+            {!!smartProConfig.errors.length && (
+              <div className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+                {smartProConfig.errors.join('；')}
+              </div>
+            )}
+          </>
+        ) : null}
       </div>
 
       {message && <div className="mx-6 mt-5 rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">{message}</div>}
@@ -149,5 +225,14 @@ function NumberInput({
       onChange={(event) => onChange(Number(event.target.value))}
       className="w-44 rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-900"
     />
+  );
+}
+
+function ConfigItem({label, value, mono = false}: {label: string; value: string; mono?: boolean}) {
+  return (
+    <div className="rounded-md border border-slate-200 bg-slate-50 px-4 py-3">
+      <div className="text-xs font-medium uppercase tracking-wide text-slate-500">{label}</div>
+      <div className={`mt-1 text-sm text-slate-700 ${mono ? 'font-mono break-all' : ''}`}>{value}</div>
+    </div>
   );
 }

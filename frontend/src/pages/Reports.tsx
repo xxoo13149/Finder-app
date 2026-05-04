@@ -2,6 +2,7 @@ import {Bar, BarChart, CartesianGrid, Cell as BarCell, ResponsiveContainer, Tool
 import {Download, FileText, RefreshCcw, Table2, Wallet} from 'lucide-react';
 import type {ReactNode} from 'react';
 import {useEffect, useMemo, useState} from 'react';
+import {FinderAiRunSummaryStrip, hasFinderAiPreview, toFinderAiPreviewItem} from '../components/FinderAiRunSummaryStrip';
 import {RunPicker} from '../components/RunPicker';
 import {
   AnalysisSummary,
@@ -25,10 +26,12 @@ export function Reports({
   activeRunId,
   onRunSelected,
   onNavigate,
+  onWalletSelected,
 }: {
   activeRunId?: string;
   onRunSelected: (runId: string) => void;
   onNavigate?: (page: string) => void;
+  onWalletSelected?: (wallet: string) => void;
 }) {
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [summary, setSummary] = useState<AnalysisSummary>();
@@ -65,6 +68,16 @@ export function Reports({
       [...wallets]
         .sort((left, right) => Number(right.pnl || 0) - Number(left.pnl || 0))
         .slice(0, 8),
+    [wallets],
+  );
+
+  const finderAiPreviewItems = useMemo(
+    () =>
+      [...wallets]
+        .filter(hasFinderAiPreview)
+        .sort((left, right) => Number(right.pnl || 0) - Number(left.pnl || 0))
+        .slice(0, 10)
+        .map(toFinderAiPreviewItem),
     [wallets],
   );
 
@@ -165,6 +178,12 @@ export function Reports({
 
       {error && <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
 
+      <FinderAiRunSummaryStrip
+        summary={summary?.finder_ai_summary}
+        previewItems={finderAiPreviewItems}
+        onPreviewWalletOpen={onWalletSelected}
+      />
+
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
         {stats.map((stat) => (
           <section key={stat.label} className="rounded-md border border-slate-200 bg-white p-5 shadow-sm">
@@ -257,7 +276,6 @@ export function Reports({
             <thead className="bg-slate-50">
               <tr>
                 <Header>钱包</Header>
-                <Header>用户名</Header>
                 <Header align="right">盈亏</Header>
                 <Header align="right">胜率</Header>
                 <Header align="right">交易数</Header>
@@ -267,15 +285,26 @@ export function Reports({
             <tbody className="divide-y divide-slate-100 bg-white">
               {loading ? (
                 <tr>
-                  <td colSpan={6} className="px-6 py-10 text-center text-sm text-slate-500">
+                  <td colSpan={5} className="px-6 py-10 text-center text-sm text-slate-500">
                     正在加载钱包表现...
                   </td>
                 </tr>
               ) : topWallets.length ? (
                 topWallets.map((wallet) => (
                   <tr key={wallet.wallet} className="hover:bg-slate-50">
-                    <TableCell mono>{shortAddress(wallet.wallet)}</TableCell>
-                    <TableCell>{wallet.user_name || '-'}</TableCell>
+                    <td className="px-6 py-4 text-sm text-slate-900">
+                      <div className="min-w-0">
+                        <div className="truncate font-medium text-slate-900">
+                          {preferredReportWalletName(wallet) || shortAddress(wallet.wallet)}
+                        </div>
+                        {preferredReportWalletName(wallet) && (
+                          <div className="truncate font-mono text-xs text-slate-500">{shortAddress(wallet.wallet)}</div>
+                        )}
+                        {preferredReportAiBrief(wallet) && (
+                          <div className="mt-1 max-w-[340px] truncate text-xs text-slate-500">{preferredReportAiBrief(wallet)}</div>
+                        )}
+                      </div>
+                    </td>
                     <TableCell align="right">{formatCurrency(wallet.pnl)}</TableCell>
                     <TableCell align="right">{formatPercent(wallet.closed_position_win_rate)}</TableCell>
                     <TableCell align="right">{formatNumber(wallet.trade_count)}</TableCell>
@@ -293,7 +322,7 @@ export function Reports({
                 ))
               ) : (
                 <tr>
-                  <td colSpan={6} className="px-6 py-10 text-center text-sm text-slate-500">
+                  <td colSpan={5} className="px-6 py-10 text-center text-sm text-slate-500">
                     本次分析暂无入选钱包。
                   </td>
                 </tr>
@@ -359,6 +388,27 @@ function TableCell({
 
 function EmptyPanel({text}: {text: string}) {
   return <div className="flex h-full items-center justify-center rounded-md border border-dashed border-slate-200 text-sm text-slate-500">{text}</div>;
+}
+
+function preferredReportWalletName(wallet: WalletRow): string | undefined {
+  for (const value of [wallet.user_name, wallet.x_username]) {
+    const text = String(value || '').trim();
+    if (!text) continue;
+    const normalized = text.replace(/^@+/, '');
+    if (!normalized) continue;
+    const lowered = normalized.toLowerCase();
+    if (lowered.startsWith('0x') && lowered.length >= 10) continue;
+    return value === wallet.x_username ? `@${normalized}` : normalized;
+  }
+  return undefined;
+}
+
+function preferredReportAiBrief(wallet: WalletRow): string | undefined {
+  for (const value of [wallet.ai_brief_short, wallet.ai_strategy_focus]) {
+    const text = String(value || '').trim();
+    if (text) return text;
+  }
+  return undefined;
 }
 
 function downloadBlob(filename: string, content: string, type: string) {

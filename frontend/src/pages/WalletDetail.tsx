@@ -1,7 +1,7 @@
 ﻿import {ArrowDown, ArrowUp, CheckCircle2, Copy} from 'lucide-react';
 import type {ReactNode} from 'react';
 import {useEffect, useMemo, useState} from 'react';
-import {Cell, Pie, PieChart, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid} from 'recharts';
+import {Pie, PieChart, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid} from 'recharts';
 import {LabelEvidencePanel, normalizeEvidenceRows, type EvidenceRow} from '../components/LabelEvidencePanel';
 import {
   MarketRecord,
@@ -15,6 +15,9 @@ import {
   getWallets,
   shortAddress,
 } from '../lib/api';
+import {Sparkles} from 'lucide-react';
+import {Cell as PieSliceCell} from 'recharts';
+import {type FinderAiMetric, type FinderAiResult, formatDateTime} from '../lib/api';
 
 export function WalletDetail({
   activeRunId,
@@ -72,16 +75,39 @@ export function WalletDetail({
 
   const metrics = detail?.metrics || {};
   const selection = detail?.selection_record || detail?.screening || {};
+  const selectionMeta = safeRecord(detail?.selection_record || detail?.screening || {});
   const leaderboardEntry = (detail?.leaderboard_entry || {}) as Record<string, unknown>;
   const profile = (detail?.profile || metrics.profile || {}) as Record<string, unknown>;
+  const profileWallet = safeRecord(profile.wallet);
   const evidenceSummary = (detail?.evidence_summary || {}) as Record<string, unknown>;
   const operationAudit = (detail?.operation_audit || metrics.operation_audit || {}) as OperationAudit;
+  const finderAi = detail?.finder_ai;
   const costData = useMemo(() => costBasisData(profile, metrics), [profile, metrics]);
   const frequencyData = useMemo(() => tradeFrequencyData(metrics), [metrics]);
   const serverEvidence = detail?.label_evaluations || detail?.label_evidence || detail?.label_match_details;
   const evidenceRows = useMemo(() => normalizeEvidenceRows(serverEvidence), [serverEvidence]);
+  const walletXUserName = preferredWalletHandle(
+    selectionMeta.x_username,
+    selectionMeta.xUsername,
+    leaderboardEntry.xUsername,
+    profile.x_username,
+    profile.xUsername,
+  );
   const walletUserName =
-    preferredWalletUserName(selection.user_name, leaderboardEntry.userName, targetWallet) || '未设置用户名';
+    preferredWalletUserName(
+      selection.user_name,
+      selectionMeta.userName,
+      leaderboardEntry.userName,
+      profile.user_name,
+      profile.username,
+      profile.userName,
+      profile.display_name,
+      profile.displayName,
+      profileWallet.displayName,
+      profileWallet.alias,
+      walletXUserName,
+      targetWallet,
+    ) || '未设置用户名';
 
   const copyWallet = async () => {
     if (!targetWallet) return;
@@ -112,6 +138,9 @@ export function WalletDetail({
           <div className="mb-2 flex flex-wrap items-center gap-2 text-sm">
             <span className="rounded border border-slate-200 bg-slate-50 px-2 py-0.5 text-xs font-medium text-slate-500">用户名</span>
             <span className="text-lg font-semibold tracking-tight text-slate-900">{walletUserName}</span>
+            {walletXUserName && !sameIdentity(walletUserName, walletXUserName) && (
+              <span className="text-sm text-slate-500">X：{walletXUserName}</span>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-3 text-sm">
             <span className="font-mono text-lg tracking-tight text-slate-800">{targetWallet}</span>
@@ -147,7 +176,9 @@ export function WalletDetail({
         />
       </div>
 
-      <EvidenceSummaryStrip selection={selection} metrics={metrics} rows={evidenceRows} summary={evidenceSummary} />
+      <EvidenceSummaryStrip selection={selection} metrics={metrics} rows={evidenceRows} summary={evidenceSummary} finderAi={finderAi} />
+
+      <FinderAiPanel finderAi={finderAi} />
 
       <AuditSummaryPanel audit={operationAudit} />
 
@@ -165,7 +196,7 @@ export function WalletDetail({
                     <PieChart>
                       <Pie data={costData} dataKey="value" nameKey="name" innerRadius={42} outerRadius={72} paddingAngle={2}>
                         {costData.map((entry) => (
-                          <Cell key={entry.name} fill={entry.color} />
+                          <PieSliceCell key={entry.name} fill={entry.color} />
                         ))}
                       </Pie>
                     </PieChart>
@@ -262,31 +293,51 @@ function preferredWalletUserName(...values: Array<unknown>): string | undefined 
   return undefined;
 }
 
+function preferredWalletHandle(...values: Array<unknown>): string | undefined {
+  for (const value of values) {
+    const text = String(value || '').trim().replace(/^@+/, '');
+    if (!text) continue;
+    const lowered = text.toLowerCase();
+    if (lowered.startsWith('0x') && lowered.length >= 10) continue;
+    return `@${text}`;
+  }
+  return undefined;
+}
+
+function sameIdentity(left: string, right: string): boolean {
+  return left.replace(/^@+/, '').trim().toLowerCase() === right.replace(/^@+/, '').trim().toLowerCase();
+}
+
 function EvidenceSummaryStrip({
   selection,
   metrics,
   rows,
   summary,
+  finderAi,
 }: {
   selection: WalletRow;
   metrics: Record<string, unknown>;
   rows: EvidenceRow[];
   summary: Record<string, unknown>;
+  finderAi?: FinderAiResult;
 }) {
   const matched = rows.filter((row) => row.matched);
-  const latestReason = String(summary.headline || matched[0]?.reason || rows[0]?.reason || '后端尚未返回标签证据摘要。');
+  const latestReason = String(
+    finderAi?.aiBriefNote || finderAi?.sourceExcerpt || summary.headline || matched[0]?.reason || rows[0]?.reason || '后端尚未返回标签证据摘要。',
+  );
+  const aiState = resolveFinderAiDisplayState(finderAi);
   const summaryItems = [
     {
       label: '命中标签',
       value: `${numberValue(summary.matched_label_count ?? matched.length)}/${numberValue(summary.label_count ?? rows.length ?? 0)}`,
     },
     {
-      label: '主地区',
-      value: String(summary.main_region || selection.main_region || selection.dominant_region || metrics.dominant_region || '-'),
+      label: 'AI 状态',
+      value: aiState.label,
     },
     {
-      label: '最高暴击',
-      value: formatMultiple(summary.highlight_multiple ?? selection.highest_burst ?? selection.max_region_daily_profit_multiple ?? metrics.max_region_daily_profit_multiple),
+      label: '主地区',
+      value: String(summary.main_region || selection.main_region || selection.dominant_region || metrics.dominant_region || '-'),
     },
     {
       label: '最近证据日',
@@ -298,8 +349,8 @@ function EvidenceSummaryStrip({
     <section className="rounded-md border border-slate-200 bg-white p-5 shadow-sm">
       <div className="grid gap-4 md:grid-cols-[1.4fr_repeat(4,minmax(0,1fr))]">
         <div>
-          <h2 className="text-base font-semibold text-slate-900">证据摘要条</h2>
-          <p className="mt-1 line-clamp-2 text-sm leading-6 text-slate-600">{latestReason}</p>
+          <h2 className="text-base font-semibold text-slate-900">研判摘要</h2>
+          <p className="mt-1 line-clamp-3 text-sm leading-6 text-slate-600">{latestReason}</p>
         </div>
         {summaryItems.map((item) => (
           <div key={item.label} className="border-t border-slate-100 pt-3 md:border-l md:border-t-0 md:pl-4 md:pt-0">
@@ -309,6 +360,137 @@ function EvidenceSummaryStrip({
             </div>
           </div>
         ))}
+      </div>
+    </section>
+  );
+}
+
+function FinderAiPanel({finderAi}: {finderAi?: FinderAiResult}) {
+  const hasAiContent =
+    !!finderAi &&
+    Boolean(
+      String(finderAi.aiBriefNote || '').trim() ||
+        String(finderAi.aiDeepNote || '').trim() ||
+        String(finderAi.strategyFocus || '').trim() ||
+        (finderAi.primarySignals || []).length ||
+        (finderAi.keyMetrics || []).length,
+    );
+  if (!hasAiContent) return null;
+
+  const aiState = resolveFinderAiDisplayState(finderAi);
+  const primarySignals = (finderAi?.primarySignals || []).filter((item) => item?.label || item?.reason).slice(0, 4);
+  const labels = (finderAi?.labels || []).filter((item) => item?.value).slice(0, 6);
+  const keyMetrics = (finderAi?.keyMetrics || []).filter((item) => item?.label && item?.value != null).slice(0, 6);
+  const briefNote = String(finderAi?.aiBriefNote || '').trim();
+  const deepNote = String(finderAi?.aiDeepNote || '').trim();
+  const sourceExcerpt = String(finderAi?.sourceExcerpt || '').trim();
+
+  return (
+    <section className="rounded-md border border-slate-200 bg-white p-6 shadow-sm">
+      <div className="flex flex-col gap-4 border-b border-slate-100 pb-5 lg:flex-row lg:items-start lg:justify-between">
+        <div className="max-w-3xl">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="inline-flex items-center gap-1 rounded-full border border-blue-200 bg-blue-50 px-2.5 py-1 text-xs font-medium text-blue-700">
+              <Sparkles className="h-3.5 w-3.5" />
+              AI 研判
+            </span>
+            <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${aiState.tone}`}>
+              {aiState.label}
+            </span>
+            <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-medium text-slate-600">
+              {finderAiEvidenceLevelLabel(finderAi?.evidenceLevel)}
+            </span>
+          </div>
+          <div className="mt-3 text-sm leading-6 text-slate-500">{aiState.note}</div>
+          <div className="mt-4 rounded-md border border-blue-100 bg-blue-50/70 px-4 py-3 text-sm leading-6 text-slate-700">
+            <span className="font-medium text-slate-900">这是 AI 研判结果。</span>
+            <span className="ml-1">文案基于下方结构化信号、关键指标和证据摘录生成；即使 AI 未写出自然语言解读，结构化证据底座仍然有效。</span>
+          </div>
+        </div>
+        <div className="grid gap-3 text-sm text-slate-600 sm:grid-cols-2 lg:min-w-[250px] lg:grid-cols-1">
+          <MetaRow label="研判状态" value={aiState.label} />
+          <MetaRow label="模型" value={finderAiModelName(finderAi?.providerMeta?.model)} />
+          <MetaRow label="证据底座" value={finderAiEvidenceLevelLabel(finderAi?.evidenceLevel)} />
+          <MetaRow label="生成时间" value={formatDateTime(finderAi?.providerMeta?.generatedAt || null)} />
+          <MetaRow label="来源" value={finderAiProviderLabel(finderAi)} />
+        </div>
+      </div>
+
+      <div className="grid gap-6 pt-5 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,0.9fr)]">
+        <div className="space-y-5">
+          {finderAi?.strategyFocus ? (
+            <div>
+              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">策略焦点</div>
+              <div className="mt-2 text-sm font-semibold leading-6 text-slate-900">{finderAi.strategyFocus}</div>
+            </div>
+          ) : null}
+
+          {briefNote ? (
+            <div>
+              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">AI 短摘</div>
+              <p className="mt-2 text-[15px] leading-7 text-slate-700">{briefNote}</p>
+            </div>
+          ) : null}
+
+          {deepNote ? (
+            <div>
+              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">深度解读</div>
+              <div className="mt-2 rounded-md border border-slate-200 bg-slate-50/70 px-4 py-3 text-sm leading-7 text-slate-700">
+                {deepNote}
+              </div>
+            </div>
+          ) : null}
+
+          {sourceExcerpt ? (
+            <div>
+              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">结构化证据摘录</div>
+              <p className="mt-2 text-sm leading-6 text-slate-600">{sourceExcerpt}</p>
+            </div>
+          ) : null}
+
+          {primarySignals.length ? (
+            <div>
+              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">AI 使用的主要信号</div>
+              <ul className="mt-3 space-y-3">
+                {primarySignals.map((signal, index) => (
+                  <li key={`${signal.key || signal.label || 'signal'}-${index}`} className="border-b border-slate-100 pb-3 last:border-b-0 last:pb-0">
+                    <div className="text-sm font-medium text-slate-900">{signal.label || signal.key || '未命名信号'}</div>
+                    {signal.reason ? <div className="mt-1 text-sm leading-6 text-slate-600">{signal.reason}</div> : null}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+
+          {labels.length ? (
+            <div>
+              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">研判标签</div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {labels.map((label, index) => (
+                  <span key={`${label.kind || 'tag'}-${label.value || index}`} className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-medium text-slate-700">
+                    {label.value}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </div>
+
+        <div>
+          <div className="text-xs font-medium uppercase tracking-wide text-slate-500">AI 使用的关键指标</div>
+          {keyMetrics.length ? (
+            <div className="mt-3 grid gap-4 sm:grid-cols-2">
+              {keyMetrics.map((metric, index) => (
+                <div key={`${metric.key || metric.label || 'metric'}-${index}`} className="border-b border-slate-100 pb-3">
+                  <div className="text-xs text-slate-500">{metric.label || metric.key || '指标'}</div>
+                  <div className="mt-1 text-sm font-semibold text-slate-900">{formatFinderAiMetricValue(metric)}</div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <EmptyInline text="当前结果暂无可展示的 AI 指标底座。" />
+          )}
+        </div>
       </div>
     </section>
   );
@@ -410,6 +592,15 @@ function MiniStat({title, value}: {title: string; value: string}) {
     <div className="rounded border border-slate-200 bg-slate-50 px-4 py-3">
       <div className="text-xs text-slate-500">{title}</div>
       <div className="mt-1 text-sm font-semibold text-slate-900">{value}</div>
+    </div>
+  );
+}
+
+function MetaRow({label, value}: {label: string; value: string}) {
+  return (
+    <div className="border-b border-slate-100 pb-2 last:border-b-0 last:pb-0">
+      <div className="text-xs text-slate-500">{label}</div>
+      <div className="mt-1 text-sm font-medium text-slate-900">{value || '-'}</div>
     </div>
   );
 }
@@ -535,6 +726,105 @@ function formatMultiple(value: unknown): string {
   if (value == null || value === '') return '-';
   const number = numberValue(value);
   return Number.isFinite(number) ? `${formatNumber(number, 2)}x` : '-';
+}
+
+function formatFinderAiMetricValue(metric: FinderAiMetric): string {
+  const key = String(metric.key || '').toLowerCase();
+  const value = metric.value;
+  if (value == null || value === '') return '-';
+  if (typeof value === 'string') {
+    const numeric = Number(value);
+    if (!Number.isNaN(numeric) && value.trim() !== '') {
+      return formatFinderAiMetricValue({...metric, value: numeric});
+    }
+    return value;
+  }
+  if (typeof value === 'boolean') return value ? '是' : '否';
+  if (typeof value !== 'number' || Number.isNaN(value)) return String(value);
+  if (key.includes('ratio') || key.includes('win_rate')) return formatPercent(value);
+  if (key.includes('pnl') || key.includes('volume')) return formatCurrency(value);
+  return formatNumber(value, value % 1 === 0 ? 0 : 2);
+}
+
+function finderAiProviderLabel(finderAi?: FinderAiResult): string {
+  const provider = String(finderAi?.providerMeta?.provider || '').trim();
+  if (!provider) return '本次分析';
+  return provider.toLowerCase() === 'deepseek' ? 'DeepSeek' : provider;
+}
+
+function finderAiModelName(model?: string): string {
+  const value = String(model || '').trim();
+  if (!value) return '-';
+  if (value === 'deepseek-v4-flash') return 'DeepSeek V4 Flash';
+  return value;
+}
+
+function finderAiEvidenceLevelLabel(value?: string): string {
+  const labels: Record<string, string> = {
+    insufficient: '证据不足',
+    structured_only: '结构化证据已齐备',
+    medium: '证据较完整',
+    high: '证据较强',
+  };
+  return labels[String(value || '').trim()] || String(value || '未标注');
+}
+
+function resolveFinderAiDisplayState(finderAi?: FinderAiResult): {label: string; tone: string; note: string} {
+  const status = String(finderAi?.briefGeneration?.status || '').trim().toLowerCase();
+  if (status === 'cached') {
+    return {
+      label: '已载入缓存解读',
+      tone: 'border-blue-200 bg-blue-50 text-blue-700',
+      note: '当前展示的是已缓存的 AI 解读，仍然基于这次任务的结构化证据底座组织。',
+    };
+  }
+  if (status === 'generated' || String(finderAi?.aiBriefNote || '').trim()) {
+    return {
+      label: '已生成 AI 解读',
+      tone: 'border-blue-200 bg-blue-50 text-blue-700',
+      note: '当前已经生成自然语言研判，可直接结合下方结构化信号与证据摘录一起阅读。',
+    };
+  }
+  if (status === 'failed') {
+    return {
+      label: 'AI 生成未完成',
+      tone: 'border-red-200 bg-red-50 text-red-700',
+      note: '这次没有成功产出自然语言解读，但下方结构化证据底座仍可正常用于判断。',
+    };
+  }
+  if (finderAi?.needsReview || status === 'needs_review') {
+    return {
+      label: '建议人工复核',
+      tone: 'border-amber-200 bg-amber-50 text-amber-700',
+      note: '结构化信号已经具备，但当前更适合先由人复核，再决定是否采纳这条 AI 研判。',
+    };
+  }
+  if (finderAi?.evidenceLevel === 'insufficient' || status === 'insufficient') {
+    return {
+      label: '暂不生成 AI 文案',
+      tone: 'border-slate-200 bg-slate-50 text-slate-600',
+      note: '当前结构化证据还不够稳定，所以系统没有强行生成“像 AI 的一段话”。',
+    };
+  }
+  if (finderAi?.hasConflict) {
+    return {
+      label: '信号存在冲突',
+      tone: 'border-amber-200 bg-amber-50 text-amber-700',
+      note: '不同信号之间存在分歧，建议重点对照下方证据摘录和标签证据表。',
+    };
+  }
+  if (status === 'ready') {
+    return {
+      label: '待写入 AI 文案',
+      tone: 'border-slate-200 bg-slate-50 text-slate-600',
+      note: '结构化底座已经齐备，但当前还没有拿到自然语言解读结果。',
+    };
+  }
+  return {
+    label: '仅有结构化结果',
+    tone: 'border-slate-200 bg-slate-50 text-slate-600',
+    note: '当前页先展示规则与指标层的结果；AI 文案会在结构化底座满足条件后补上。',
+  };
 }
 
 function safeRecord(value: unknown): Record<string, unknown> {

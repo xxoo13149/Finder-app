@@ -12,6 +12,9 @@ from typing import Any, Callable, Mapping
 from urllib.error import HTTPError
 
 from .client import PolymarketClient, resolve_api_key
+from .config import SMART_WALLET_LIBRARY_REFRESH_MODE
+from .finder_ai_contract import build_finder_ai_contract, enrich_finder_ai_generation_context
+from .finder_ai_generation import generate_finder_ai_brief
 from .labels import CORE_LABEL_KEYS, build_strategy_notes, evaluate_label_evaluations, evaluate_labels
 from .metrics import (
     DEFAULT_REGION_FIELDS,
@@ -36,6 +39,7 @@ from .metrics import (
     win_rate_summary as summarize_win_rate,
 )
 from .report import build_report
+from .smart_wallet_library import leaderboard_entries_from_import_rows, load_import_wallet_rows
 
 
 UTC = timezone.utc
@@ -59,6 +63,8 @@ class WeatherIndex:
 
 def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    runtime = config.setdefault("runtime", {})
+    runtime["run_id"] = str(runtime.get("run_id") or output_dir.name).strip()
     wallets_dir = output_dir / "wallets"
     wallets_dir.mkdir(parents=True, exist_ok=True)
     history_registry_dir = wallet_history_registry_dir(output_dir)
@@ -78,9 +84,21 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
         None if raw_max_leaderboard_rows in (None, "") else max(0, int(raw_max_leaderboard_rows))
     )
 
-    progress(config, "Fetching leaderboard")
-    leaderboard = fetch_leaderboard(client, config)
-    progress(config, f"Fetched {len(leaderboard)} leaderboard rows")
+    imported_rows = load_import_wallet_rows_from_config(config)
+    if imported_rows is not None:
+        progress(config, "Loading imported Smart Pro wallet library")
+        leaderboard = leaderboard_entries_from_import_rows(imported_rows)
+        if not leaderboard:
+            raise ValueError("Smart Pro 导入地址库为空，无法启动回流分析")
+        progress(config, f"Loaded {len(leaderboard)} imported wallet rows")
+        auto_extend_leaderboard = False
+        max_leaderboard_rows = len(leaderboard)
+        if runtime_should_process_all_candidates(config):
+            target_count = max(target_count, len(leaderboard))
+    else:
+        progress(config, "Fetching leaderboard")
+        leaderboard = fetch_leaderboard(client, config)
+        progress(config, f"Fetched {len(leaderboard)} leaderboard rows")
 
     screening_records: list[dict[str, Any]] = []
     selected_wallets: list[dict[str, Any]] = []
@@ -186,6 +204,14 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
             wallet_result = result["wallet_result"]
             screening_records.append(wallet_result["screening"])
             if wallet_result["screening"]["selected"]:
+                wallet_result["finder_ai"] = generate_finder_ai_brief(
+                    payload=wallet_result.get("finder_ai"),
+                    wallet_result=wallet_result,
+                )
+                wallet_result["selection_record"] = sync_selection_record_finder_ai_fields(
+                    wallet_result.get("selection_record"),
+                    wallet_result.get("finder_ai"),
+                )
                 wallet_results.append(wallet_result)
                 selected_wallets.append(wallet_result["selection_record"])
                 write_json(wallets_dir / f"{wallet}.json", wallet_result)
@@ -861,6 +887,27 @@ def wallet_history_registry_dir(output_dir: Path) -> Path:
     return output_dir.parent / HISTORY_REGISTRY_DIRNAME
 
 
+def is_smart_wallet_library_mode(config: Mapping[str, Any]) -> bool:
+    runtime = config.get("runtime", {}) if isinstance(config, Mapping) else {}
+    analysis_mode = str(runtime.get("analysis_mode") or "").strip().lower()
+    return analysis_mode == SMART_WALLET_LIBRARY_REFRESH_MODE or bool(
+        str(runtime.get("smart_wallet_library_source_path") or "").strip()
+    )
+
+
+def runtime_should_process_all_candidates(config: Mapping[str, Any]) -> bool:
+    runtime = config.get("runtime", {}) if isinstance(config, Mapping) else {}
+    return bool(runtime.get("smart_wallet_library_process_all"))
+
+
+def load_import_wallet_rows_from_config(config: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+    runtime = config.get("runtime", {}) if isinstance(config, Mapping) else {}
+    source_path = str(runtime.get("smart_wallet_library_source_path") or "").strip()
+    if not source_path:
+        return None
+    return load_import_wallet_rows(Path(source_path))
+
+
 def resolve_history_run_id(config: dict[str, Any], output_dir: Path) -> str:
     runtime = config.get("runtime", {})
     run_id = str(runtime.get("run_id") or output_dir.name).strip()
@@ -948,6 +995,47 @@ def split_leaderboard_prefilter_candidates(
     return candidates, screening_records
 
 
+def normalize_leaderboard_time_period(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    if normalized == "1D":
+        return "DAY"
+    return normalized
+
+
+def screening_trade_window_start(
+    config: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> datetime | None:
+    time_period = normalize_leaderboard_time_period(
+        config.get("leaderboard", {}).get("time_period")
+    )
+    if time_period == "DAY":
+        return (now or resolve_analysis_now(config)) - timedelta(days=1)
+    if time_period == "WEEK":
+        return (now or resolve_analysis_now(config)) - timedelta(days=7)
+    return None
+
+
+def trades_in_screening_window(
+    trades: list[dict[str, Any]],
+    config: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    current = now or resolve_analysis_now(config)
+    window_start = screening_trade_window_start(config, now=current)
+    if window_start is None:
+        return list(trades)
+
+    return [
+        trade
+        for trade in trades
+        if (trade_dt := epoch_to_datetime(trade.get("timestamp"))) is not None
+        and window_start <= trade_dt <= current
+    ]
+
+
 def build_leaderboard_prefilter_record(
     wallet: str,
     leaderboard_entry: dict[str, Any],
@@ -956,6 +1044,7 @@ def build_leaderboard_prefilter_record(
     history_registry_dir: Path | None = None,
 ) -> dict[str, Any] | None:
     filter_config = config["wallet_filter"]
+    runtime = config.get("runtime", {})
     include_wallets = {
         normalize_address(item) for item in filter_config.get("include_wallets", [])
     }
@@ -972,13 +1061,17 @@ def build_leaderboard_prefilter_record(
         )
     if wallet in include_wallets:
         return None
-    if wallet_is_in_history_registry(history_registry_dir, wallet):
+    if not bool(runtime.get("smart_wallet_library_skip_history_registry")) and wallet_is_in_history_registry(
+        history_registry_dir, wallet
+    ):
         return prefilter_screening_record(
             wallet,
             leaderboard_entry,
             reasons=[HISTORY_ALREADY_FETCHED_REASON],
             stage="leaderboard",
         )
+    if bool(runtime.get("smart_wallet_library_skip_numeric_prefilter")):
+        return None
 
     checks = [
         (
@@ -1022,11 +1115,20 @@ def probe_wallet_trade_window(
     leaderboard_entry: dict[str, Any],
     config: dict[str, Any],
 ) -> dict[str, Any]:
+    if is_smart_wallet_library_mode(config):
+        return {"prefetched_trades": None, "trade_probe_fetched": False}
+
     filter_config = config["wallet_filter"]
     include_wallets = {
         normalize_address(item) for item in filter_config.get("include_wallets", [])
     }
     if wallet in include_wallets:
+        return {"prefetched_trades": None, "trade_probe_fetched": False}
+
+    # When trade-count screening follows the leaderboard period, the first-page
+    # probe can no longer safely stand in for lifetime trade history. Fall back
+    # to the full snapshot so day/week filters stay accurate.
+    if screening_trade_window_start(config) is not None:
         return {"prefetched_trades": None, "trade_probe_fetched": False}
 
     min_traded_count = int(filter_config.get("min_traded_count", 0) or 0)
@@ -1228,60 +1330,85 @@ def analyze_wallet(
         metrics=metrics,
         recent_evidence_date=recent_evidence_date,
     )
-    return {
+    selection_record = {
+        "wallet": wallet,
+        "rank": leaderboard_entry.get("rank"),
+        "user_name": leaderboard_entry.get("userName"),
+        "pnl": metrics["leaderboard_pnl"],
+        "volume": metrics["leaderboard_volume"],
+        "trade_count": metrics.get("screening_trade_count", metrics["trade_count"]),
+        "weather_trade_count": metrics.get(
+            "screening_weather_trade_count",
+            metrics["weather_trade_count"],
+        ),
+        "weather_trade_ratio": metrics.get(
+            "screening_weather_trade_ratio",
+            metrics["weather_trade_ratio"],
+        ),
+        "weather_notional_ratio": metrics.get(
+            "screening_weather_notional_ratio",
+            metrics["weather_notional_ratio"],
+        ),
+        "closed_position_win_rate": metrics["closed_position_win_rate"],
+        "closed_profit_multiple": metrics["closed_profit_multiple"],
+        "median_trade_notional": metrics["median_trade_notional"],
+        "trades_per_active_day": metrics["trades_per_active_day"],
+        "dominant_region": metrics["dominant_region"],
+        "main_region": metrics["dominant_region"],
+        "dominant_region_trade_ratio": metrics["dominant_region_trade_ratio"],
+        "max_region_daily_profit_multiple": metrics["max_region_daily_profit_multiple"],
+        "highest_burst": metrics["max_region_daily_profit_multiple"],
+        "highest_burst_region": metrics["max_region_daily_profit_region"],
+        "highest_burst_date": metrics["max_region_daily_profit_date"],
+        "recent_evidence_date": recent_evidence_date,
+        "best_region_win_rate_region": metrics["best_region_win_rate_region"],
+        "best_region_positive_return_day_ratio": metrics[
+            "best_region_positive_return_day_ratio"
+        ],
+        "best_region_trade_count": metrics["best_region_trade_count"],
+        "low_chip_cost_trade_ratio": metrics["low_chip_cost_trade_ratio"],
+        "liquidity_swap_ratio": metrics["liquidity_swap_ratio"],
+        "liquidity_sell_dominant_region_day_ratio": metrics[
+            "liquidity_sell_dominant_region_day_ratio"
+        ],
+        "activity_level": metrics["activity_level"],
+        "latest_trade_date": metrics["latest_trade_date"],
+        "days_since_latest_trade": metrics["days_since_latest_trade"],
+        "wallet_registration_date": metrics["wallet_registration_date"],
+        "wallet_age_days": metrics["wallet_age_days"],
+        "wallet_registration_source": metrics["wallet_registration_source"],
+        "high_temp_off_day_buy_ratio": metrics["high_temp_off_day_buy_ratio"],
+        "split_avg_chip_cost": metrics["split_avg_chip_cost"],
+        "split_evidence_count": metrics["split_evidence_count"],
+        "split_player_validation_passed": metrics["split_player_validation_passed"],
+        "trade_liquidity_profit": metrics["trade_liquidity_profit"],
+        "final_settlement_profit": metrics["final_settlement_profit"],
+        "unified_profit": metrics["unified_profit"],
+        "audit_complete": metrics["snapshot_complete"],
+        "labels": [label["display_name"] for label in labels],
+        "selected": screening["selected"],
+        "reasons": screening["reasons"],
+    }
+    top_trades = top_records(
+        snapshot["trades"],
+        limit=int(config["analysis"]["top_trades_in_report"]),
+        sort_key=lambda item: record_notional(item),
+    )
+    top_positions = top_records(
+        snapshot["positions"],
+        limit=int(config["analysis"]["top_positions_in_report"]),
+        sort_key=lambda item: to_float(item.get("currentValue")),
+    )
+    top_closed_positions = top_records(
+        snapshot["closed_positions"],
+        limit=int(config["analysis"]["top_closed_positions_in_report"]),
+        sort_key=lambda item: to_float(item.get("realizedPnl")),
+    )
+    wallet_result = {
         "wallet": wallet,
         "leaderboard_entry": leaderboard_entry,
         "screening": screening,
-        "selection_record": {
-            "wallet": wallet,
-            "rank": leaderboard_entry.get("rank"),
-            "user_name": leaderboard_entry.get("userName"),
-            "pnl": metrics["leaderboard_pnl"],
-            "volume": metrics["leaderboard_volume"],
-            "trade_count": metrics["trade_count"],
-            "weather_trade_count": metrics["weather_trade_count"],
-            "weather_trade_ratio": metrics["weather_trade_ratio"],
-            "weather_notional_ratio": metrics["weather_notional_ratio"],
-            "closed_position_win_rate": metrics["closed_position_win_rate"],
-            "closed_profit_multiple": metrics["closed_profit_multiple"],
-            "median_trade_notional": metrics["median_trade_notional"],
-            "trades_per_active_day": metrics["trades_per_active_day"],
-            "dominant_region": metrics["dominant_region"],
-            "main_region": metrics["dominant_region"],
-            "dominant_region_trade_ratio": metrics["dominant_region_trade_ratio"],
-            "max_region_daily_profit_multiple": metrics["max_region_daily_profit_multiple"],
-            "highest_burst": metrics["max_region_daily_profit_multiple"],
-            "highest_burst_region": metrics["max_region_daily_profit_region"],
-            "highest_burst_date": metrics["max_region_daily_profit_date"],
-            "recent_evidence_date": recent_evidence_date,
-            "best_region_win_rate_region": metrics["best_region_win_rate_region"],
-            "best_region_positive_return_day_ratio": metrics[
-                "best_region_positive_return_day_ratio"
-            ],
-            "best_region_trade_count": metrics["best_region_trade_count"],
-            "low_chip_cost_trade_ratio": metrics["low_chip_cost_trade_ratio"],
-            "liquidity_swap_ratio": metrics["liquidity_swap_ratio"],
-            "liquidity_sell_dominant_region_day_ratio": metrics[
-                "liquidity_sell_dominant_region_day_ratio"
-            ],
-            "activity_level": metrics["activity_level"],
-            "latest_trade_date": metrics["latest_trade_date"],
-            "days_since_latest_trade": metrics["days_since_latest_trade"],
-            "wallet_registration_date": metrics["wallet_registration_date"],
-            "wallet_age_days": metrics["wallet_age_days"],
-            "wallet_registration_source": metrics["wallet_registration_source"],
-            "high_temp_off_day_buy_ratio": metrics["high_temp_off_day_buy_ratio"],
-            "split_avg_chip_cost": metrics["split_avg_chip_cost"],
-            "split_evidence_count": metrics["split_evidence_count"],
-            "split_player_validation_passed": metrics["split_player_validation_passed"],
-            "trade_liquidity_profit": metrics["trade_liquidity_profit"],
-            "final_settlement_profit": metrics["final_settlement_profit"],
-            "unified_profit": metrics["unified_profit"],
-            "audit_complete": metrics["snapshot_complete"],
-            "labels": [label["display_name"] for label in labels],
-            "selected": screening["selected"],
-            "reasons": screening["reasons"],
-        },
+        "selection_record": selection_record,
         "labels": labels,
         "label_evaluations": label_evaluations,
         "label_evidence": label_evidence,
@@ -1291,21 +1418,9 @@ def analyze_wallet(
         "strategy_notes": strategy_notes,
         "metrics": metrics,
         "operation_audit": operation_audit,
-        "top_trades": top_records(
-            snapshot["trades"],
-            limit=int(config["analysis"]["top_trades_in_report"]),
-            sort_key=lambda item: record_notional(item),
-        ),
-        "top_positions": top_records(
-            snapshot["positions"],
-            limit=int(config["analysis"]["top_positions_in_report"]),
-            sort_key=lambda item: to_float(item.get("currentValue")),
-        ),
-        "top_closed_positions": top_records(
-            snapshot["closed_positions"],
-            limit=int(config["analysis"]["top_closed_positions_in_report"]),
-            sort_key=lambda item: to_float(item.get("realizedPnl")),
-        ),
+        "top_trades": top_trades,
+        "top_positions": top_positions,
+        "top_closed_positions": top_closed_positions,
         "raw_counts": {
             "activity_count": len(snapshot["activity"]),
             "trade_count": len(snapshot["trades"]),
@@ -1315,6 +1430,254 @@ def analyze_wallet(
             "operation_record_count": len(operation_audit.get("records", [])),
         },
     }
+    wallet_result["finder_ai"] = build_finder_ai_contract(
+        run_id=str(config.get("runtime", {}).get("run_id") or ""),
+        wallet_result=wallet_result,
+    )
+    wallet_result["structured_materials"] = build_structured_materials(
+        config=config,
+        wallet_result=wallet_result,
+        snapshot=snapshot,
+        weather_index=weather_index,
+    )
+    wallet_result["finder_ai"] = enrich_finder_ai_generation_context(
+        payload=wallet_result["finder_ai"],
+        wallet_result=wallet_result,
+    )
+    return wallet_result
+
+
+def build_structured_materials(
+    *,
+    config: dict[str, Any],
+    wallet_result: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    weather_index: WeatherIndex,
+) -> dict[str, Any]:
+    finder_ai = wallet_result.get("finder_ai") if isinstance(wallet_result.get("finder_ai"), Mapping) else {}
+    selection_record = (
+        wallet_result.get("selection_record")
+        if isinstance(wallet_result.get("selection_record"), Mapping)
+        else {}
+    )
+    evidence_summary = (
+        wallet_result.get("evidence_summary")
+        if isinstance(wallet_result.get("evidence_summary"), Mapping)
+        else {}
+    )
+    strategy_notes = [
+        str(item).strip()
+        for item in wallet_result.get("strategy_notes", [])
+        if str(item).strip()
+    ][:4]
+    time_period = normalize_leaderboard_time_period(
+        config.get("leaderboard", {}).get("time_period")
+    )
+    wallet_meta = finder_ai.get("wallet") if isinstance(finder_ai.get("wallet"), Mapping) else {}
+    identity = {
+        "normalized_address": str(finder_ai.get("normalizedAddress") or wallet_result.get("wallet") or ""),
+        "wallet_address": str(wallet_result.get("wallet") or ""),
+        "display_name": str(
+            wallet_meta.get("displayName")
+            or selection_record.get("user_name")
+            or ""
+        ),
+        "alias": str(wallet_meta.get("alias") or ""),
+        "run_id": str(finder_ai.get("runId") or config.get("runtime", {}).get("run_id") or ""),
+        "source_name": str(finder_ai.get("sourceName") or "finder"),
+        "analysis_mode": str(config.get("runtime", {}).get("analysis_mode") or "standard"),
+        "time_period": time_period,
+        "captured_at": resolve_analysis_now(config).isoformat(),
+    }
+    summary = {
+        "headline": str(evidence_summary.get("headline") or ""),
+        "source_excerpt": str(finder_ai.get("sourceExcerpt") or evidence_summary.get("headline") or ""),
+        "strategy_notes": strategy_notes,
+        "main_region": str(evidence_summary.get("main_region") or selection_record.get("main_region") or ""),
+        "latest_evidence_date": str(evidence_summary.get("latest_evidence_date") or ""),
+        "audit_complete": bool(evidence_summary.get("audit_complete")),
+    }
+    weather_signals = (
+        finder_ai.get("weatherSignals")
+        if isinstance(finder_ai.get("weatherSignals"), Mapping)
+        else {}
+    )
+    signals = {
+        "label_hits": build_structured_material_label_hits(
+            wallet_result.get("label_evaluations"),
+            lookback_window=time_period,
+        ),
+        "primary_signals": list(finder_ai.get("primarySignals", []))[:6],
+        "labels": list(finder_ai.get("labels", []))[:12],
+        "key_metrics": list(finder_ai.get("keyMetrics", []))[:8],
+        "weather_signals": {
+            "market_scope": str(weather_signals.get("marketScope") or "weather"),
+            "resolution_source": str(weather_signals.get("resolutionSource") or ""),
+            "forecast_basis": str(weather_signals.get("forecastBasis") or ""),
+            "timing_window": str(weather_signals.get("timingWindow") or time_period),
+            "edge_style": str(weather_signals.get("edgeStyle") or ""),
+            "weather_drivers": [
+                str(item).strip()
+                for item in weather_signals.get("weatherDrivers", [])
+                if str(item).strip()
+            ][:4],
+            "evidence_quality": str(
+                weather_signals.get("evidenceQuality")
+                or finder_ai.get("evidenceLevel")
+                or "insufficient"
+            ),
+            "main_region": str(selection_record.get("main_region") or ""),
+            "activity_level": str(selection_record.get("activity_level") or ""),
+            "weather_trade_ratio": selection_record.get("weather_trade_ratio"),
+            "weather_notional_ratio": selection_record.get("weather_notional_ratio"),
+            "dominant_region_trade_ratio": selection_record.get("dominant_region_trade_ratio"),
+        },
+    }
+    records = {
+        "trade_samples": build_structured_material_trade_samples(
+            trades=snapshot.get("trades") if isinstance(snapshot.get("trades"), list) else [],
+            weather_index=weather_index,
+            config=config,
+            limit=6,
+        ),
+    }
+    return {
+        "identity": identity,
+        "summary": summary,
+        "signals": signals,
+        "records": records,
+    }
+
+
+def sync_selection_record_finder_ai_fields(
+    selection_record: Mapping[str, Any] | None,
+    finder_ai: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    result = dict(selection_record) if isinstance(selection_record, Mapping) else {}
+    payload = dict(finder_ai) if isinstance(finder_ai, Mapping) else {}
+    result["ai_strategy_focus"] = str(payload.get("strategyFocus") or "").strip()
+    result["ai_brief_short"] = str(payload.get("aiBriefShort") or "").strip()
+    result["ai_needs_review"] = bool(payload.get("needsReview"))
+    result["ai_has_conflict"] = bool(payload.get("hasConflict"))
+    result["ai_evidence_level"] = str(payload.get("evidenceLevel") or "").strip()
+    return result
+
+
+def build_structured_material_label_hits(
+    label_evaluations: Any,
+    *,
+    lookback_window: str,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    evaluations = label_evaluations if isinstance(label_evaluations, list) else []
+    for item in evaluations:
+        if not isinstance(item, Mapping) or not item.get("matched"):
+            continue
+        records = item.get("records") if isinstance(item.get("records"), list) else []
+        results.append(
+            {
+                "label_key": str(item.get("key") or ""),
+                "matched": True,
+                "display_name": str(
+                    item.get("display_name")
+                    or item.get("title")
+                    or item.get("name")
+                    or item.get("key")
+                    or ""
+                ),
+                "reason": str(item.get("reason") or ""),
+                "details": compact_scalar_mapping(item.get("details"), limit=8),
+                "numeric_evidence": compact_scalar_mapping(item.get("facts"), limit=8),
+                "sample_size": len([record for record in records if isinstance(record, Mapping)]),
+                "lookback_window": lookback_window,
+                "example_markets": collect_example_markets(records),
+                "confidence": "rule_matched",
+            }
+        )
+        if len(results) >= 6:
+            break
+    return results
+
+
+def compact_scalar_mapping(value: Any, *, limit: int) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    payload: dict[str, Any] = {}
+    for key, item in value.items():
+        if item in (None, "") or isinstance(item, (Mapping, list, tuple, set)):
+            continue
+        payload[str(key)] = item
+        if len(payload) >= limit:
+            break
+    return payload
+
+
+def collect_example_markets(records: list[Any], *, limit: int = 4) -> list[str]:
+    results: list[str] = []
+    seen: set[str] = set()
+    for record in records:
+        if isinstance(record, Mapping):
+            candidate = str(
+                record.get("title")
+                or record.get("market")
+                or record.get("slug")
+                or record.get("conditionId")
+                or ""
+            ).strip()
+        else:
+            candidate = str(record or "").strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        results.append(candidate)
+        if len(results) >= limit:
+            break
+    return results
+
+
+def build_structured_material_trade_samples(
+    *,
+    trades: list[dict[str, Any]],
+    weather_index: WeatherIndex,
+    config: dict[str, Any],
+    limit: int,
+) -> list[dict[str, Any]]:
+    raw_region_fields = config.get("analysis", {}).get("region_fields", DEFAULT_REGION_FIELDS)
+    if isinstance(raw_region_fields, str):
+        configured_region_fields = (raw_region_fields,)
+    else:
+        configured_region_fields = tuple(str(field) for field in raw_region_fields)
+    source_records = [record for record in trades if is_weather_record(record, weather_index)] or list(trades)
+    enriched = enrich_trades_with_regions(
+        source_records,
+        weather_index=weather_index,
+        region_fields=configured_region_fields,
+    )
+    sorted_records = sorted(
+        enriched,
+        key=lambda item: to_float(item.get("timestamp")),
+        reverse=True,
+    )
+    results: list[dict[str, Any]] = []
+    for trade in sorted_records[:limit]:
+        entered_at = epoch_to_datetime(trade.get("timestamp"))
+        results.append(
+            {
+                "market_title": str(trade.get("title") or trade.get("slug") or ""),
+                "market_slug": str(trade.get("slug") or trade.get("marketSlug") or ""),
+                "condition_id": str(trade.get("conditionId") or ""),
+                "event_slug": str(trade.get("eventSlug") or ""),
+                "city": str(trade.get("_region") or trade.get("region") or ""),
+                "side": str(trade.get("side") or "").upper(),
+                "size_usd": record_notional(trade),
+                "entry_price": to_float(trade.get("price")),
+                "current_price": to_float(trade.get("curPrice") or trade.get("currentPrice")),
+                "entered_at": entered_at.isoformat() if entered_at else "",
+                "market_date": record_market_date(trade, weather_index),
+                "outcome": str(trade.get("outcome") or ""),
+            }
+        )
+    return results
 
 
 def build_label_evidence_records(labels: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1468,6 +1831,16 @@ def compute_metrics(
         settlement_records=closed_positions,
     )
     snapshot_complete = bool(operation_audit.get("complete", True))
+    now = resolve_analysis_now(config)
+    screening_trades = trades_in_screening_window(trades, config, now=now)
+    screening_trade_notionals = [record_notional(record) for record in screening_trades]
+    screening_total_trade_notional = sum(screening_trade_notionals)
+    screening_weather_trades = [
+        record for record in screening_trades if is_weather_record(record, weather_index)
+    ]
+    screening_weather_trade_notional = sum(
+        record_notional(record) for record in screening_weather_trades
+    )
 
     trade_notionals = [record_notional(record) for record in trades]
     total_trade_notional = sum(trade_notionals)
@@ -1497,8 +1870,6 @@ def compute_metrics(
     holding_stats = estimate_holding_stats(trades)
     end_lookup = build_end_lookup(snapshot)
     time_to_end_hours = collect_time_to_end_hours(trades, end_lookup)
-
-    now = resolve_analysis_now(config)
     long_dated_cutoff = now + timedelta(
         days=int(config["analysis"].get("long_dated_threshold_days", 90))
     )
@@ -1616,16 +1987,32 @@ def compute_metrics(
         split_cost_summary["matched_split_avg_chip_cost"] and split_chain_verified
     )
 
+    leaderboard_pnl = to_float(leaderboard_entry.get("pnl"))
+    leaderboard_volume = to_float(leaderboard_entry.get("vol"))
+    if is_smart_wallet_library_mode(config):
+        leaderboard_pnl = to_float(audit_profit_summary["unified_profit"])
+        leaderboard_volume = screening_total_trade_notional or total_trade_notional
+
     return {
-        "leaderboard_pnl": to_float(leaderboard_entry.get("pnl")),
-        "leaderboard_volume": to_float(leaderboard_entry.get("vol")),
+        "leaderboard_pnl": leaderboard_pnl,
+        "leaderboard_volume": leaderboard_volume,
         "trade_count": len(trades),
+        "screening_trade_count": len(screening_trades),
         "buy_trade_count": len(buy_trades),
         "sell_trade_count": len(sell_trades),
         "weather_trade_count": len(weather_trades),
+        "screening_weather_trade_count": len(screening_weather_trades),
         "weather_trade_ratio": ratio(len(weather_trades), len(trades)),
+        "screening_weather_trade_ratio": ratio(
+            len(screening_weather_trades),
+            len(screening_trades),
+        ),
         "weather_notional": weather_trade_notional,
         "weather_notional_ratio": ratio(weather_trade_notional, total_trade_notional),
+        "screening_weather_notional_ratio": ratio(
+            screening_weather_trade_notional,
+            screening_total_trade_notional,
+        ),
         "distinct_event_count": len(distinct_events),
         "largest_event_notional_ratio": (
             max(event_notionals.values()) / total_trade_notional if event_notionals and total_trade_notional else 0.0
@@ -1804,12 +2191,15 @@ def build_analysis_summary(
         ):
             wallets_core_labeled += 1
 
+    finder_ai_summary = build_finder_ai_run_summary(wallet_results)
+
     return {
         "leaderboard_rows_fetched": len(leaderboard),
         "weather_events_indexed": len(weather_events),
         "wallets_screened": len(screening_records),
         "wallets_selected": len(wallet_results),
         "wallets_core_labeled": wallets_core_labeled,
+        "finder_ai_summary": finder_ai_summary,
         "errors": len(errors),
         "label_counts": dict(label_counts.most_common()),
         "averages": {
@@ -1830,6 +2220,9 @@ def build_analysis_summary(
             {
                 "wallet": wallet["wallet"],
                 "rank": wallet["leaderboard_entry"].get("rank"),
+                "user_name": wallet.get("selection_record", {}).get("user_name")
+                or wallet["leaderboard_entry"].get("userName"),
+                "x_username": wallet["leaderboard_entry"].get("xUsername"),
                 "pnl": wallet["metrics"]["leaderboard_pnl"],
                 "closed_profit_multiple": wallet["metrics"]["closed_profit_multiple"],
                 "closed_position_win_rate": wallet["metrics"]["closed_position_win_rate"],
@@ -1844,6 +2237,9 @@ def build_analysis_summary(
             {
                 "wallet": wallet["wallet"],
                 "rank": wallet["leaderboard_entry"].get("rank"),
+                "user_name": wallet.get("selection_record", {}).get("user_name")
+                or wallet["leaderboard_entry"].get("userName"),
+                "x_username": wallet["leaderboard_entry"].get("xUsername"),
                 "trades_per_active_day": wallet["metrics"]["trades_per_active_day"],
                 "trade_count": wallet["metrics"]["trade_count"],
             }
@@ -1854,6 +2250,71 @@ def build_analysis_summary(
             )[:10]
         ],
     }
+
+
+def build_finder_ai_run_summary(wallet_results: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = {
+        "selected_wallets": len(wallet_results),
+        "finder_ai_present": 0,
+        "eligible": 0,
+        "generated": 0,
+        "cached": 0,
+        "failed": 0,
+        "skipped": 0,
+        "needs_review": 0,
+        "has_conflict": 0,
+    }
+    latest_generated_at = ""
+    latest_generated_dt: datetime | None = None
+
+    for wallet in wallet_results:
+        finder_ai = wallet.get("finder_ai") if isinstance(wallet.get("finder_ai"), Mapping) else {}
+        if not finder_ai:
+            continue
+
+        summary["finder_ai_present"] += 1
+        brief_generation = (
+            finder_ai.get("briefGeneration")
+            if isinstance(finder_ai.get("briefGeneration"), Mapping)
+            else {}
+        )
+        gate = brief_generation.get("gate") if isinstance(brief_generation.get("gate"), Mapping) else {}
+        if gate.get("eligible"):
+            summary["eligible"] += 1
+
+        status = str(brief_generation.get("status") or "").strip().lower()
+        if status == "generated":
+            summary["generated"] += 1
+        elif status == "cached":
+            summary["cached"] += 1
+        elif status == "failed":
+            summary["failed"] += 1
+        else:
+            summary["skipped"] += 1
+
+        if finder_ai.get("needsReview"):
+            summary["needs_review"] += 1
+        if finder_ai.get("hasConflict"):
+            summary["has_conflict"] += 1
+
+        provider_meta = (
+            finder_ai.get("providerMeta")
+            if isinstance(finder_ai.get("providerMeta"), Mapping)
+            else {}
+        )
+        generated_at = str(provider_meta.get("generatedAt") or "").strip()
+        if not generated_at:
+            continue
+        generated_dt = parse_metric_datetime(generated_at)
+        if generated_dt is None:
+            continue
+        if latest_generated_dt is None or generated_dt > latest_generated_dt:
+            latest_generated_dt = generated_dt
+            latest_generated_at = generated_at
+
+    if latest_generated_at:
+        summary["latest_generated_at"] = latest_generated_at
+    return summary
 
 
 def build_operation_audit(
@@ -2226,6 +2687,16 @@ def build_screening_record(
 ) -> dict[str, Any]:
     filter_config = config["wallet_filter"]
     normalized_wallet = normalize_address(wallet)
+    screening_trade_count = int(metrics.get("screening_trade_count", metrics["trade_count"]) or 0)
+    screening_weather_trade_count = int(
+        metrics.get("screening_weather_trade_count", metrics["weather_trade_count"]) or 0
+    )
+    screening_weather_trade_ratio = to_float(
+        metrics.get("screening_weather_trade_ratio", metrics["weather_trade_ratio"])
+    )
+    screening_weather_notional_ratio = to_float(
+        metrics.get("screening_weather_notional_ratio", metrics["weather_notional_ratio"])
+    )
     include_wallets = {
         normalize_address(item) for item in filter_config.get("include_wallets", [])
     }
@@ -2235,6 +2706,42 @@ def build_screening_record(
 
     reasons: list[str] = []
     selected = True
+
+    if is_smart_wallet_library_mode(config):
+        activity_filter_mode = str(filter_config.get("activity_filter_mode") or "all").strip().lower()
+        if normalized_wallet in exclude_wallets:
+            selected = False
+            reasons.append("wallet in exclude list")
+        elif normalized_wallet in include_wallets:
+            reasons.append("wallet in include list")
+        elif activity_filter_mode == "normal_active":
+            if str(metrics.get("activity_level") or "").strip().lower() == "normal_active":
+                reasons.append("activity_level==normal_active")
+            else:
+                selected = False
+                reasons.append("failed:activity_level==normal_active")
+        elif activity_filter_mode == "inactive":
+            if str(metrics.get("activity_level") or "").strip().lower() == "inactive":
+                reasons.append("activity_level==inactive")
+            else:
+                selected = False
+                reasons.append("failed:activity_level==inactive")
+        else:
+            reasons.append("smart_wallet_library_refresh:skip_numeric_filters")
+        return {
+            "wallet": wallet,
+            "rank": leaderboard_entry.get("rank"),
+            "user_name": leaderboard_entry.get("userName"),
+            "x_username": leaderboard_entry.get("xUsername"),
+            "pnl": metrics["leaderboard_pnl"],
+            "volume": metrics["leaderboard_volume"],
+            "trade_count": screening_trade_count,
+            "weather_trade_count": screening_weather_trade_count,
+            "weather_trade_ratio": screening_weather_trade_ratio,
+            "weather_notional_ratio": screening_weather_notional_ratio,
+            "selected": selected,
+            "reasons": reasons,
+        }
 
     if normalized_wallet in exclude_wallets:
         selected = False
@@ -2252,16 +2759,43 @@ def build_screening_record(
                 f"volume>={filter_config.get('min_volume')}",
             ),
             (
-                metrics["trade_count"] >= int(filter_config.get("min_traded_count", 0)),
+                screening_trade_count >= int(filter_config.get("min_traded_count", 0)),
                 f"trade_count>={filter_config.get('min_traded_count')}",
             ),
         ]
         min_weather_trade_ratio = filter_config.get("min_weather_trade_ratio")
-        if min_weather_trade_ratio not in (None, ""):
+        min_weather_notional_ratio = filter_config.get("min_weather_notional_ratio")
+        weather_focus_mode = str(filter_config.get("weather_focus_mode") or "trade_ratio").strip().lower()
+        if weather_focus_mode == "trade_or_notional":
+            focus_checks: list[tuple[bool, str]] = []
+            if min_weather_trade_ratio not in (None, ""):
+                focus_checks.append(
+                    (
+                        screening_weather_trade_ratio >= to_float(min_weather_trade_ratio),
+                        f"weather_trade_ratio>={min_weather_trade_ratio}",
+                    )
+                )
+            if min_weather_notional_ratio not in (None, ""):
+                focus_checks.append(
+                    (
+                        screening_weather_notional_ratio >= to_float(min_weather_notional_ratio),
+                        f"weather_notional_ratio>={min_weather_notional_ratio}",
+                    )
+                )
+            if focus_checks:
+                checks.append((any(ok for ok, _label in focus_checks), " or ".join(label for _ok, label in focus_checks)))
+        elif min_weather_trade_ratio not in (None, ""):
             checks.append(
                 (
-                    metrics["weather_trade_ratio"] >= to_float(min_weather_trade_ratio),
+                    screening_weather_trade_ratio >= to_float(min_weather_trade_ratio),
                     f"weather_trade_ratio>={min_weather_trade_ratio}",
+                )
+            )
+        elif min_weather_notional_ratio not in (None, ""):
+            checks.append(
+                (
+                    screening_weather_notional_ratio >= to_float(min_weather_notional_ratio),
+                    f"weather_notional_ratio>={min_weather_notional_ratio}",
                 )
             )
         if filter_config.get("max_pnl") is not None:
@@ -2281,8 +2815,23 @@ def build_screening_record(
         if filter_config.get("max_traded_count") is not None:
             checks.append(
                 (
-                    metrics["trade_count"] <= int(filter_config.get("max_traded_count")),
+                    screening_trade_count <= int(filter_config.get("max_traded_count")),
                     f"trade_count<={filter_config.get('max_traded_count')}",
+                )
+            )
+        activity_filter_mode = str(filter_config.get("activity_filter_mode") or "all").strip().lower()
+        if activity_filter_mode == "normal_active":
+            checks.append(
+                (
+                    str(metrics.get("activity_level") or "").strip().lower() == "normal_active",
+                    "activity_level==normal_active",
+                )
+            )
+        elif activity_filter_mode == "inactive":
+            checks.append(
+                (
+                    str(metrics.get("activity_level") or "").strip().lower() == "inactive",
+                    "activity_level==inactive",
                 )
             )
         failed = [label for ok, label in checks if not ok]
@@ -2299,10 +2848,10 @@ def build_screening_record(
         "x_username": leaderboard_entry.get("xUsername"),
         "pnl": metrics["leaderboard_pnl"],
         "volume": metrics["leaderboard_volume"],
-        "trade_count": metrics["trade_count"],
-        "weather_trade_count": metrics["weather_trade_count"],
-        "weather_trade_ratio": metrics["weather_trade_ratio"],
-        "weather_notional_ratio": metrics["weather_notional_ratio"],
+        "trade_count": screening_trade_count,
+        "weather_trade_count": screening_weather_trade_count,
+        "weather_trade_ratio": screening_weather_trade_ratio,
+        "weather_notional_ratio": screening_weather_notional_ratio,
         "selected": selected,
         "reasons": reasons,
     }

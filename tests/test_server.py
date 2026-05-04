@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -14,12 +15,16 @@ from polymarket_weather_tool.history_registry import wallet_history_registry_dir
 from polymarket_weather_tool.server import (
     RunState,
     ServerState,
+    build_smart_pro_import_payload,
     build_cleanup_inventory,
     build_config_for_run,
     ensure_cleanup_path_allowed,
     perform_cleanup_delete,
     read_run_summary,
+    smart_pro_config_status,
+    sync_run_to_smart_pro,
 )
+from polymarket_weather_tool.config import WEEKLY_HIGH_PROFIT_MODE
 
 
 class ServerConfigTests(unittest.TestCase):
@@ -39,6 +44,69 @@ class ServerConfigTests(unittest.TestCase):
             (output_dir / "errors.json").write_text("[]", encoding="utf-8")
             (output_dir / "progress.log").write_text("working", encoding="utf-8")
         return output_dir
+
+    def build_smart_pro_sync_run(self, base: Path, run_id: str) -> tuple[Path, str, str]:
+        first_wallet = "0xaaa0000000000000000000000000000000000000"
+        second_wallet = "0xbbb0000000000000000000000000000000000000"
+        output_dir = base / "artifacts" / run_id
+        wallets_dir = output_dir / "wallets"
+        wallets_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "selected_wallets.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "wallet": first_wallet,
+                        "user_name": "weather-pro",
+                        "selected": True,
+                        "labels": ["high frequency"],
+                    },
+                    {
+                        "wallet": second_wallet,
+                        "user_name": "storm-chaser",
+                        "selected": True,
+                        "labels": ["lottery"],
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (wallets_dir / f"{first_wallet}.json").write_text(
+            json.dumps(
+                {
+                    "wallet": first_wallet,
+                    "selection_record": {"wallet": first_wallet},
+                    "label_evaluations": [{"key": "high_frequency_region", "matched": True}],
+                    "finder_ai": {
+                        "sourceName": "finder",
+                        "runId": run_id,
+                        "normalizedAddress": first_wallet,
+                        "matched": True,
+                        "wallet": {"address": first_wallet, "displayName": "weather-pro"},
+                        "primarySignals": [{"key": "high_frequency_region", "label": "High frequency", "matched": True}],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (wallets_dir / f"{second_wallet}.json").write_text(
+            json.dumps(
+                {
+                    "wallet": second_wallet,
+                    "selection_record": {"wallet": second_wallet},
+                    "label_evaluations": [{"key": "lottery_player", "matched": True}],
+                    "finder_ai": {
+                        "sourceName": "finder",
+                        "runId": run_id,
+                        "normalizedAddress": second_wallet,
+                        "matched": True,
+                        "wallet": {"address": second_wallet, "displayName": "storm-chaser"},
+                        "primarySignals": [{"key": "lottery_player", "label": "Lottery player", "matched": True}],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return output_dir, first_wallet, second_wallet
 
     def build_wallet_registry_record(
         self,
@@ -105,6 +173,48 @@ class ServerConfigTests(unittest.TestCase):
         self.assertEqual(config["wallet_filter"]["max_traded_count"], 99)
         self.assertEqual(config["wallet_filter"]["min_weather_trade_ratio"], 0.55)
         self.assertEqual(config["leaderboard"]["max_fetch_limit"], 250)
+        self.assertEqual(config["runtime"]["run_id"], run_state.run_id)
+        self.assertEqual(config["runtime"]["progress_log_path"], run_state.progress_log_path)
+
+    def test_build_config_for_run_applies_weekly_high_profit_mode_before_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = ServerState(root=ROOT, artifacts_root=Path(temp_dir))
+            run_state = RunState(
+                run_id="weekly-mode-test",
+                status="queued",
+                output_dir=str(Path(temp_dir) / "weekly-mode-test"),
+                created_at="2026-04-27T00:00:00+00:00",
+                progress_log_path=str(Path(temp_dir) / "weekly-mode-test" / "progress.log"),
+            )
+
+            config = build_config_for_run(
+                state,
+                {
+                    "analysis_mode": WEEKLY_HIGH_PROFIT_MODE,
+                    "overrides": {
+                        "target_count": "7",
+                        "max_fetch_limit": "250",
+                    },
+                },
+                run_state,
+            )
+
+        self.assertEqual(config["leaderboard"]["time_period"], "WEEK")
+        self.assertEqual(config["leaderboard"]["order_by"], "PNL")
+        self.assertEqual(config["leaderboard"]["fetch_limit"], 300)
+        self.assertEqual(config["leaderboard"]["max_fetch_limit"], 250)
+        self.assertEqual(config["wallet_filter"]["target_count"], 7)
+        self.assertEqual(config["wallet_filter"]["min_pnl"], 25)
+        self.assertEqual(config["wallet_filter"]["max_pnl"], 2000)
+        self.assertEqual(config["wallet_filter"]["min_volume"], 500)
+        self.assertEqual(config["wallet_filter"]["max_volume"], 1000000)
+        self.assertEqual(config["wallet_filter"]["min_traded_count"], 5)
+        self.assertEqual(config["wallet_filter"]["max_traded_count"], 2000)
+        self.assertEqual(config["wallet_filter"]["min_weather_trade_ratio"], 0.2)
+        self.assertEqual(config["wallet_filter"]["min_weather_notional_ratio"], 0.45)
+        self.assertEqual(config["wallet_filter"]["weather_focus_mode"], "trade_or_notional")
+        self.assertEqual(config["runtime"]["analysis_mode"], WEEKLY_HIGH_PROFIT_MODE)
+        self.assertEqual(config["runtime"]["analysis_mode_label"], "本周高盈利榜单")
         self.assertEqual(config["runtime"]["run_id"], run_state.run_id)
         self.assertEqual(config["runtime"]["progress_log_path"], run_state.progress_log_path)
 
@@ -480,6 +590,314 @@ class ServerConfigTests(unittest.TestCase):
                 ensure_cleanup_path_allowed(state, frontend_test_results_child),
                 frontend_test_results_child.resolve(),
             )
+
+    def test_build_smart_pro_import_payload_filters_requested_wallets_and_reads_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir, first_wallet, second_wallet = self.build_smart_pro_sync_run(root, "sync-run")
+
+            payload = build_smart_pro_import_payload(
+                output_dir,
+                "sync-run",
+                requested_wallets=[second_wallet],
+                filters={"tag": "lottery"},
+            )
+
+        self.assertEqual(payload["runId"], "sync-run")
+        self.assertEqual(payload["sourceName"], "Finder-app:sync-run")
+        self.assertEqual(payload["filters"], {"tag": "lottery"})
+        self.assertEqual(len(payload["wallets"]), 1)
+        self.assertEqual(payload["wallets"][0]["row"]["wallet"], second_wallet)
+        self.assertEqual(payload["wallets"][0]["detail"]["wallet"], second_wallet)
+        self.assertEqual(payload["wallets"][0]["finderAi"]["normalizedAddress"], second_wallet)
+        self.assertTrue(payload["wallets"][0]["finderAi"]["matched"])
+        self.assertNotEqual(payload["wallets"][0]["row"]["wallet"], first_wallet)
+
+    def test_build_smart_pro_import_payload_compacts_large_detail_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir, first_wallet, _ = self.build_smart_pro_sync_run(root, "sync-run")
+            selected_wallets_path = output_dir / "selected_wallets.json"
+            selected_wallets = json.loads(selected_wallets_path.read_text(encoding="utf-8"))
+            selected_wallets[0]["raw_positions"] = [{"market": "x", "notes": "z" * 4000}]
+            selected_wallets_path.write_text(json.dumps(selected_wallets), encoding="utf-8")
+
+            wallet_path = output_dir / "wallets" / f"{first_wallet}.json"
+            wallet_detail = json.loads(wallet_path.read_text(encoding="utf-8"))
+            wallet_detail["raw_transactions"] = [{"hash": "0x1", "payload": "x" * 12000}]
+            wallet_detail["evidence_summary"] = {
+                "headline": "high conviction",
+                "main_region": "Shanghai",
+                "latest_evidence_date": "2026-04-28",
+                "suggest_watchlist": True,
+                "full_report": "y" * 5000,
+            }
+            wallet_detail["label_evaluations"] = [
+                {
+                    "key": "high_frequency_region",
+                    "matched": True,
+                    "display_name": "High frequency",
+                    "reason": "picked",
+                    "details": {"region": "Shanghai", "city": "Shanghai", "reason": "burst", "huge": "q" * 9000},
+                    "evidence": {"reason": "evidence kept", "blob": "w" * 9000},
+                }
+            ]
+            wallet_detail["structured_materials"] = {
+                "summary": {"headline": "high conviction", "source_excerpt": "s" * 5000},
+                "records": {"trade_samples": [{"market_title": "x", "notes": "k" * 9000}]},
+            }
+            wallet_detail["finder_ai"]["layeredInput"] = {"L2": {"sourceExcerpt": "s" * 5000}}
+            wallet_detail["finder_ai"]["aiBriefShort"] = "同步短摘要"
+            wallet_detail["finder_ai"]["aiBriefNote"] = "这是同步给 Smart Pro 的 AI 简报。"
+            wallet_detail["finder_ai"]["providerMeta"] = {
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "promptVersion": "finder-weather-brief-v1",
+                "generatedAt": "2026-05-05T00:00:00+00:00",
+                "inputHash": "sha256:test",
+                "cacheKey": "cache|" + ("m" * 2000),
+                "generationScope": "brief",
+                "outputSchemaVersion": "finder-ai-v1",
+            }
+            wallet_detail["finder_ai"]["briefGeneration"] = {
+                "enabled": True,
+                "cacheKey": "cache|" + ("z" * 5000),
+                "gate": {"eligible": True, "reason": "ready"},
+            }
+            wallet_path.write_text(json.dumps(wallet_detail), encoding="utf-8")
+
+            payload = build_smart_pro_import_payload(output_dir, "sync-run", requested_wallets=[first_wallet])
+
+        compact_wallet = payload["wallets"][0]
+        compact_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        raw_bytes = len(json.dumps({"wallets": [{"row": selected_wallets[0], "detail": wallet_detail}]}, ensure_ascii=False).encode("utf-8"))
+
+        self.assertLess(compact_bytes, raw_bytes)
+        self.assertNotIn("raw_positions", compact_wallet["row"])
+        self.assertNotIn("raw_transactions", compact_wallet["detail"])
+        self.assertEqual(compact_wallet["detail"]["evidence_summary"]["headline"], "high conviction")
+        self.assertNotIn("full_report", compact_wallet["detail"]["evidence_summary"])
+        self.assertEqual(compact_wallet["detail"]["label_evaluations"][0]["details"]["region"], "Shanghai")
+        self.assertNotIn("huge", compact_wallet["detail"]["label_evaluations"][0]["details"])
+        self.assertEqual(compact_wallet["detail"]["label_evaluations"][0]["evidence"]["reason"], "evidence kept")
+        self.assertNotIn("structured_materials", compact_wallet["detail"])
+        self.assertNotIn("layeredInput", compact_wallet["finderAi"])
+        self.assertNotIn("briefGeneration", compact_wallet["finderAi"])
+        self.assertEqual(compact_wallet["finderAi"]["aiBriefShort"], "同步短摘要")
+        self.assertEqual(compact_wallet["finderAi"]["aiBriefNote"], "这是同步给 Smart Pro 的 AI 简报。")
+        self.assertEqual(compact_wallet["finderAi"]["wallet"]["address"], first_wallet)
+        self.assertEqual(compact_wallet["finderAi"]["wallet"]["displayName"], "weather-pro")
+        self.assertEqual(compact_wallet["finderAi"]["primarySignals"][0]["key"], "high_frequency_region")
+        self.assertEqual(
+            compact_wallet["finderAi"]["providerMeta"]["generatedAt"],
+            "2026-05-05T00:00:00+00:00",
+        )
+
+    def test_smart_pro_config_status_reports_missing_token_without_exposing_secrets(self) -> None:
+        env_keys = [
+            "SMART_PRO_BASE_URL",
+            "SMART_PRO_URL",
+            "SMART_PRO_FINDER_TOKEN",
+            "SMART_PRO_SYNC_TOKEN",
+            "FINDER_SYNC_TOKEN",
+            "SMART_PRO_FINDER_COMMIT_PATH",
+            "SMART_PRO_SYNC_TIMEOUT_SECONDS",
+            "SMART_PRO_ACCESS_CLIENT_ID",
+            "SMART_PRO_ACCESS_CLIENT_SECRET",
+        ]
+        old_env = {key: os.environ.get(key) for key in env_keys}
+        for key in env_keys:
+            os.environ.pop(key, None)
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                (root / ".env").write_text(
+                    "SMART_PRO_BASE_URL=https://smart.example\nSMART_PRO_SYNC_TIMEOUT_SECONDS=120\n",
+                    encoding="utf-8",
+                )
+                payload = smart_pro_config_status(root)
+
+            self.assertFalse(payload["configured"])
+            self.assertEqual(payload["base_url"], "https://smart.example")
+            self.assertEqual(payload["commit_path"], "/api/finder/import/commit")
+            self.assertEqual(payload["timeout_seconds"], 120)
+            self.assertFalse(payload["token_configured"])
+            self.assertFalse(payload["access_service_token_configured"])
+            self.assertEqual(payload["errors"], ["SMART_PRO_FINDER_TOKEN is not configured in .env"])
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_sync_run_to_smart_pro_posts_commit_payload_with_env_token(self) -> None:
+        env_keys = [
+            "SMART_PRO_BASE_URL",
+            "SMART_PRO_URL",
+            "SMART_PRO_FINDER_TOKEN",
+            "SMART_PRO_SYNC_TOKEN",
+            "FINDER_SYNC_TOKEN",
+            "SMART_PRO_FINDER_COMMIT_PATH",
+            "SMART_PRO_SYNC_TIMEOUT_SECONDS",
+            "SMART_PRO_ACCESS_CLIENT_ID",
+            "SMART_PRO_ACCESS_CLIENT_SECRET",
+        ]
+        old_env = {key: os.environ.get(key) for key in env_keys}
+        for key in env_keys:
+            os.environ.pop(key, None)
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                artifacts_root = root / "artifacts"
+                artifacts_root.mkdir(parents=True)
+                _, first_wallet, _ = self.build_smart_pro_sync_run(root, "sync-run")
+                (root / ".env").write_text(
+                    "SMART_PRO_BASE_URL=https://smart.example\nSMART_PRO_FINDER_TOKEN=test-token\n",
+                    encoding="utf-8",
+                )
+                captured: dict[str, object] = {}
+
+                def fake_post(
+                    url: str,
+                    token: str,
+                    payload: dict[str, object],
+                    timeout_seconds: int,
+                    *,
+                    extra_headers: dict[str, str] | None = None,
+                ) -> dict[str, object]:
+                    captured["url"] = url
+                    captured["token"] = token
+                    captured["payload"] = payload
+                    captured["timeout_seconds"] = timeout_seconds
+                    captured["extra_headers"] = extra_headers or {}
+                    return {
+                        "ok": True,
+                        "data": {
+                            "totalRows": 1,
+                            "validRows": 1,
+                            "commit": {
+                                "createdCount": 1,
+                                "updatedCount": 0,
+                                "failedRows": [],
+                            },
+                        },
+                    }
+
+                result = sync_run_to_smart_pro(
+                    ServerState(root=root, artifacts_root=artifacts_root),
+                    {"run_id": "sync-run", "wallets": [first_wallet]},
+                    post_json=fake_post,
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["sent_count"], 1)
+            self.assertGreater(result["payload_bytes"], 0)
+            self.assertEqual(result["summary"]["createdCount"], 1)
+            self.assertEqual(captured["url"], "https://smart.example/api/finder/import/commit")
+            self.assertEqual(captured["token"], "test-token")
+            self.assertEqual(captured["timeout_seconds"], 90)
+            self.assertEqual(captured["extra_headers"], {})
+            self.assertEqual(captured["payload"]["wallets"][0]["row"]["wallet"], first_wallet)
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_sync_run_to_smart_pro_splits_large_wallet_lists_into_batches(self) -> None:
+        env_keys = [
+            "SMART_PRO_BASE_URL",
+            "SMART_PRO_URL",
+            "SMART_PRO_FINDER_TOKEN",
+            "SMART_PRO_SYNC_TOKEN",
+            "FINDER_SYNC_TOKEN",
+            "SMART_PRO_FINDER_COMMIT_PATH",
+            "SMART_PRO_SYNC_TIMEOUT_SECONDS",
+            "SMART_PRO_ACCESS_CLIENT_ID",
+            "SMART_PRO_ACCESS_CLIENT_SECRET",
+        ]
+        old_env = {key: os.environ.get(key) for key in env_keys}
+        for key in env_keys:
+            os.environ.pop(key, None)
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                artifacts_root = root / "artifacts"
+                artifacts_root.mkdir(parents=True)
+                output_dir = artifacts_root / "sync-run"
+                wallets_dir = output_dir / "wallets"
+                wallets_dir.mkdir(parents=True, exist_ok=True)
+
+                wallets: list[str] = []
+                rows: list[dict[str, object]] = []
+                for index in range(7):
+                    wallet = f"0x{index + 1:040x}"
+                    wallets.append(wallet)
+                    rows.append({"wallet": wallet, "selected": True, "user_name": f"user-{index}"})
+                    (wallets_dir / f"{wallet}.json").write_text(
+                        json.dumps({"wallet": wallet, "selection_record": {"wallet": wallet}}),
+                        encoding="utf-8",
+                    )
+
+                (output_dir / "selected_wallets.json").write_text(json.dumps(rows), encoding="utf-8")
+                (root / ".env").write_text(
+                    "SMART_PRO_BASE_URL=https://smart.example\nSMART_PRO_FINDER_TOKEN=test-token\n",
+                    encoding="utf-8",
+                )
+
+                calls: list[dict[str, object]] = []
+
+                def fake_post(
+                    url: str,
+                    token: str,
+                    payload: dict[str, object],
+                    timeout_seconds: int,
+                    *,
+                    extra_headers: dict[str, str] | None = None,
+                ) -> dict[str, object]:
+                    calls.append(
+                        {
+                            "url": url,
+                            "token": token,
+                            "timeout_seconds": timeout_seconds,
+                            "wallet_count": len(payload["wallets"]),
+                        }
+                    )
+                    count = len(payload["wallets"])
+                    return {
+                        "ok": True,
+                        "data": {
+                            "totalRows": count,
+                            "validRows": count,
+                            "commit": {
+                                "createdCount": 0,
+                                "updatedCount": count,
+                                "failedRows": [],
+                            },
+                        },
+                    }
+
+                result = sync_run_to_smart_pro(
+                    ServerState(root=root, artifacts_root=artifacts_root),
+                    {"run_id": "sync-run", "wallets": wallets},
+                    post_json=fake_post,
+                )
+
+            self.assertEqual([call["wallet_count"] for call in calls], [5, 2])
+            self.assertEqual(result["sent_count"], 7)
+            self.assertEqual(result["batch_count"], 2)
+            self.assertEqual(result["summary"]["updatedCount"], 7)
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":
