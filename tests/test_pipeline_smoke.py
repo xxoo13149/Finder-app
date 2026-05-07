@@ -8,6 +8,7 @@ from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from unittest.mock import patch
 
 
@@ -130,7 +131,9 @@ class FakePolymarketClient:
 
     def fetch_positions_page(self, **kwargs: Any) -> list[dict[str, Any]]:
         self.calls.append(("positions", kwargs))
-        return [
+        limit = int(kwargs["limit"])
+        offset = int(kwargs["offset"])
+        records = [
             {
                 "title": "Long dated rain basket",
                 "outcome": "Yes",
@@ -142,15 +145,315 @@ class FakePolymarketClient:
                 "endDate": "2030-01-01T00:00:00Z",
             }
         ]
+        return records[offset : offset + limit]
 
     def fetch_closed_positions_page(self, **kwargs: Any) -> list[dict[str, Any]]:
         self.calls.append(("closed_positions", kwargs))
         end_date = (BASE_DT + timedelta(days=10)).isoformat()
-        return [
+        limit = int(kwargs["limit"])
+        offset = int(kwargs["offset"])
+        records = [
             {"title": "A", "conditionId": "cond-weather-yes", "realizedPnl": "20", "totalBought": "50", "endDate": end_date},
             {"title": "B", "conditionId": "cond-other", "realizedPnl": "-5", "totalBought": "20", "endDate": end_date},
             {"title": "C", "conditionId": "cond-third", "realizedPnl": "1", "totalBought": "10", "endDate": end_date},
         ]
+        return records[offset : offset + limit]
+
+
+def raise_terminal_http_400(section: str, *, limit: int, offset: int) -> None:
+    error = HTTPError(
+        url=f"https://data-api.polymarket.com/{section}?limit={limit}&offset={offset}",
+        code=400,
+        msg="Bad Request",
+        hdrs=None,
+        fp=None,
+    )
+    raise RuntimeError("Request failed") from error
+
+
+def raise_terminal_transport_error(section: str, *, limit: int, offset: int) -> None:
+    error = URLError(f"{section} pagination transport failed at offset={offset}, limit={limit}")
+    raise RuntimeError("Request failed") from error
+
+
+class PartitionRecoveringPolymarketClient(FakePolymarketClient):
+    def __init__(self, api_config: dict[str, Any]) -> None:
+        super().__init__(api_config)
+        self.trade_records = [
+            {
+                "asset": "rain-yes",
+                "side": "BUY",
+                "title": "NYC rain",
+                "outcome": "Yes",
+                "eventId": "weather-event-1",
+                "eventSlug": "rain-in-nyc",
+                "conditionId": "cond-weather-yes",
+                "slug": "rain-in-nyc-yes",
+                "timestamp": BASE_TS,
+                "size": "100",
+                "price": "0.40",
+                "usdcSize": "40",
+                "transactionHash": "0xtx-1",
+            },
+            {
+                "asset": "rain-yes",
+                "side": "SELL",
+                "title": "NYC rain",
+                "outcome": "Yes",
+                "eventId": "weather-event-1",
+                "eventSlug": "rain-in-nyc",
+                "conditionId": "cond-weather-yes",
+                "slug": "rain-in-nyc-yes",
+                "timestamp": BASE_TS + 48 * 3600,
+                "size": "50",
+                "price": "0.70",
+                "usdcSize": "35",
+                "transactionHash": "0xtx-2",
+            },
+            {
+                "asset": "snow-no",
+                "side": "BUY",
+                "title": "Boston snow",
+                "outcome": "No",
+                "eventId": "other-event",
+                "eventSlug": "snow-in-boston",
+                "conditionId": "cond-other",
+                "slug": "snow-in-boston-no",
+                "timestamp": BASE_TS + 72 * 3600,
+                "size": "100",
+                "price": "1.00",
+                "usdcSize": "100",
+                "transactionHash": "0xtx-3",
+            },
+            {
+                "asset": "rain-yes-late",
+                "side": "BUY",
+                "title": "NYC rain",
+                "outcome": "Yes",
+                "eventSlug": "rain-in-nyc",
+                "conditionId": "cond-weather-yes",
+                "timestamp": BASE_TS + 96 * 3600,
+                "size": "50",
+                "price": "0.50",
+                "usdcSize": "25",
+                "transactionHash": "0xtx-4",
+            },
+        ]
+        self.activity_records = [
+            {"type": "REWARD", "usdcSize": "12.34", "timestamp": BASE_TS + 110 * 3600, "transactionHash": "0xreward"},
+            *[
+                {
+                    **record,
+                    "type": "TRADE",
+                }
+                for record in self.trade_records
+            ],
+        ]
+
+    def fetch_activity_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.calls.append(("activity", kwargs))
+        limit = int(kwargs["limit"])
+        offset = int(kwargs["offset"])
+        activity_type = str(kwargs.get("activity_type") or "").upper()
+        start = kwargs.get("start")
+        end = kwargs.get("end")
+        records = [
+            dict(record)
+            for record in self.activity_records
+            if not activity_type or str(record.get("type") or "").upper() == activity_type
+        ]
+        if start is None and end is None:
+            if offset == 0:
+                records.sort(key=lambda record: int(record["timestamp"]), reverse=True)
+                return records[:1]
+            raise_terminal_http_400("activity", limit=limit, offset=offset)
+        filtered = [
+            record
+            for record in records
+            if int(record["timestamp"]) >= int(start) and int(record["timestamp"]) <= int(end)
+        ]
+        filtered.sort(key=lambda record: int(record["timestamp"]), reverse=True)
+        return filtered[offset : offset + limit]
+
+    def fetch_trades_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.calls.append(("trades", kwargs))
+        limit = int(kwargs["limit"])
+        offset = int(kwargs["offset"])
+        if offset == 0:
+            records = sorted(
+                (dict(record) for record in self.trade_records),
+                key=lambda record: int(record["timestamp"]),
+                reverse=True,
+            )
+            return records[:1]
+        raise_terminal_http_400("trades", limit=limit, offset=offset)
+
+
+class GraphQLHistoryPipelineClient(FakePolymarketClient):
+    def __init__(self, api_config: dict[str, Any]) -> None:
+        super().__init__(api_config)
+        self.graphql_calls: list[dict[str, Any]] = []
+
+    def fetch_activity_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.calls.append(("activity", kwargs))
+        return [
+            {
+                "type": "REWARD",
+                "usdcSize": "12.34",
+                "timestamp": BASE_TS + 110 * 3600,
+                "transactionHash": "0xreward",
+            }
+        ]
+
+    def fetch_trades_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.calls.append(("trades", kwargs))
+        raise AssertionError("provider smoke should not rely on REST trades")
+
+    def fetch_graphql(
+        self,
+        *,
+        endpoint_url: str,
+        query: str,
+        variables: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.graphql_calls.append(
+            {
+                "endpoint_url": endpoint_url,
+                "query": query,
+                "variables": dict(variables or {}),
+            }
+        )
+        if "WalletOrderFills" in query:
+            return {
+                "data": {
+                    "maker": [
+                        {
+                            "id": "graphql-fill-1",
+                            "transactionHash": "0xfill-1",
+                            "timestamp": str(BASE_TS),
+                            "maker": WALLET,
+                            "taker": "0x0000000000000000000000000000000000000001",
+                            "makerAssetId": "0",
+                            "takerAssetId": "1001",
+                            "makerAmountFilled": "40000000",
+                            "takerAmountFilled": "100000000",
+                            "fee": "10000",
+                        },
+                        {
+                            "id": "graphql-fill-2",
+                            "transactionHash": "0xfill-2",
+                            "timestamp": str(BASE_TS + 48 * 3600),
+                            "maker": WALLET,
+                            "taker": "0x0000000000000000000000000000000000000002",
+                            "makerAssetId": "1001",
+                            "takerAssetId": "0",
+                            "makerAmountFilled": "50000000",
+                            "takerAmountFilled": "35000000",
+                            "fee": "10000",
+                        },
+                    ],
+                    "taker": [
+                        {
+                            "id": "graphql-fill-3",
+                            "transactionHash": "0xfill-3",
+                            "timestamp": str(BASE_TS + 72 * 3600),
+                            "maker": "0x0000000000000000000000000000000000000003",
+                            "taker": WALLET,
+                            "makerAssetId": "0",
+                            "takerAssetId": "1001",
+                            "makerAmountFilled": "25000000",
+                            "takerAmountFilled": "50000000",
+                            "fee": "5000",
+                        },
+                    ],
+                }
+            }
+        if "TokenIdConditions" in query:
+            return {
+                "data": {
+                    "tokenIdConditions": [
+                        {
+                            "id": "1001",
+                            "complement": False,
+                            "outcomeIndex": "0",
+                            "condition": {"id": "cond-weather-yes"},
+                        }
+                    ]
+                }
+            }
+        if "WalletSplits" in query:
+            return {"data": {"splits": []}}
+        if "WalletMerges" in query:
+            return {"data": {"merges": []}}
+        if "WalletRedemptions" in query:
+            return {"data": {"redemptions": []}}
+        if "WalletNegRiskConversions" in query:
+            return {"data": {"negRiskConversions": []}}
+        raise AssertionError(f"unexpected graphql query: {query}")
+
+
+class TransportRecoveringPolymarketClient(PartitionRecoveringPolymarketClient):
+    def fetch_activity_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.calls.append(("activity", kwargs))
+        limit = int(kwargs["limit"])
+        offset = int(kwargs["offset"])
+        activity_type = str(kwargs.get("activity_type") or "").upper()
+        start = kwargs.get("start")
+        end = kwargs.get("end")
+        records = [
+            dict(record)
+            for record in self.activity_records
+            if not activity_type or str(record.get("type") or "").upper() == activity_type
+        ]
+        if start is None and end is None:
+            if offset == 0:
+                records.sort(key=lambda record: int(record["timestamp"]), reverse=True)
+                return records[:1]
+            raise_terminal_transport_error("activity", limit=limit, offset=offset)
+        filtered = [
+            record
+            for record in records
+            if int(record["timestamp"]) >= int(start) and int(record["timestamp"]) <= int(end)
+        ]
+        filtered.sort(key=lambda record: int(record["timestamp"]), reverse=True)
+        return filtered[offset : offset + limit]
+
+    def fetch_trades_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.calls.append(("trades", kwargs))
+        limit = int(kwargs["limit"])
+        offset = int(kwargs["offset"])
+        if offset == 0:
+            records = sorted(
+                (dict(record) for record in self.trade_records),
+                key=lambda record: int(record["timestamp"]),
+                reverse=True,
+            )
+            return records[:1]
+        raise_terminal_transport_error("trades", limit=limit, offset=offset)
+
+
+class InitialTransportRecoveringPolymarketClient(PartitionRecoveringPolymarketClient):
+    def fetch_activity_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.calls.append(("activity", kwargs))
+        limit = int(kwargs["limit"])
+        offset = int(kwargs["offset"])
+        activity_type = str(kwargs.get("activity_type") or "").upper()
+        start = kwargs.get("start")
+        end = kwargs.get("end")
+        records = [
+            dict(record)
+            for record in self.activity_records
+            if not activity_type or str(record.get("type") or "").upper() == activity_type
+        ]
+        if start is None and end is None:
+            raise_terminal_transport_error("activity", limit=limit, offset=offset)
+        filtered = [
+            record
+            for record in records
+            if int(record["timestamp"]) >= int(start) and int(record["timestamp"]) <= int(end)
+        ]
+        filtered.sort(key=lambda record: int(record["timestamp"]), reverse=True)
+        return filtered[offset : offset + limit]
 
 
 def small_config(cache_dir: Path) -> dict[str, Any]:
@@ -409,6 +712,28 @@ class PipelineSmokeTests(unittest.TestCase):
         self.assertIn("failed:weather_trade_ratio>=0.5", standard_screening["reasons"])
         self.assertTrue(weekly_screening["selected"])
         self.assertEqual(weekly_screening["reasons"], ["passed all numeric filters"])
+
+    def test_build_screening_record_rejects_incomplete_snapshot_by_default(self) -> None:
+        config = small_config(Path("cache"))
+        metrics = {
+            "leaderboard_pnl": 120.0,
+            "leaderboard_volume": 2000.0,
+            "trade_count": 12,
+            "weather_trade_count": 8,
+            "weather_trade_ratio": 8 / 12,
+            "weather_notional_ratio": 0.7,
+            "snapshot_complete": False,
+        }
+
+        screening = analysis.build_screening_record(
+            WALLET,
+            {"rank": 1, "userName": "screening-incomplete", "xUsername": "screening_incomplete"},
+            metrics,
+            config,
+        )
+
+        self.assertFalse(screening["selected"])
+        self.assertIn("failed:snapshot_complete", screening["reasons"])
 
     def test_weather_index_maps_market_dates_for_high_temperature_records(self) -> None:
         weather_index = analysis.build_weather_index(
@@ -795,7 +1120,7 @@ class PipelineSmokeTests(unittest.TestCase):
             self.assertEqual(wallet_result["finder_ai"]["providerMeta"]["provider"], "deepseek")
             self.assertEqual(
                 wallet_result["finder_ai"]["providerMeta"]["promptVersion"],
-                "finder-weather-brief-v1",
+                "finder-weather-brief-v3",
             )
             self.assertTrue(
                 str(wallet_result["finder_ai"]["providerMeta"]["inputHash"]).startswith("sha256:")
@@ -813,7 +1138,11 @@ class PipelineSmokeTests(unittest.TestCase):
             self.assertTrue(wallet_result["finder_ai"]["briefGeneration"]["enabled"])
             self.assertEqual(
                 wallet_result["finder_ai"]["briefGeneration"]["status"],
-                "ready",
+                "fallback",
+            )
+            self.assertEqual(
+                wallet_result["finder_ai"]["briefGeneration"]["reason"],
+                "local_fallback",
             )
             self.assertGreaterEqual(
                 wallet_result["finder_ai"]["briefGeneration"]["gate"]["structuredEvidenceCount"],
@@ -886,6 +1215,231 @@ class PipelineSmokeTests(unittest.TestCase):
                 ],
             )
 
+    def test_run_pipeline_smoke_can_use_graphql_history_provider_without_rest_trades(self) -> None:
+        GraphQLHistoryPipelineClient.instances.clear()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            config = small_config(temp_path / "cache")
+            config["wallet_filter"]["min_traded_count"] = 0
+            config["history_provider"] = {
+                "enabled": True,
+                "always_for_full_snapshot": True,
+                "page_size": 50,
+                "max_pages_per_stream": 1,
+                "token_lookup_chunk_size": 10,
+            }
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(analysis, "PolymarketClient", GraphQLHistoryPipelineClient)
+                )
+                if not hasattr(analysis, "progress"):
+                    stack.enter_context(
+                        patch.object(
+                            analysis,
+                            "progress",
+                            lambda *_args, **_kwargs: None,
+                            create=True,
+                        )
+                    )
+                if not hasattr(analysis, "build_analysis_summary"):
+                    stack.enter_context(
+                        patch.object(
+                            analysis,
+                            "build_analysis_summary",
+                            fallback_analysis_summary,
+                            create=True,
+                        )
+                    )
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+            self.assertEqual(result["selected_wallet_count"], 1)
+            client = GraphQLHistoryPipelineClient.instances[0]
+            self.assertTrue(client.graphql_calls)
+            self.assertFalse(any(name == "trades" for name, _kwargs in client.calls))
+
+            wallet_result = json.loads(
+                (output_dir / "wallets" / f"{WALLET}.json").read_text(encoding="utf-8")
+            )
+            metrics = wallet_result["metrics"]
+            self.assertTrue(metrics["snapshot_complete"])
+            self.assertEqual(metrics["trade_count"], 3)
+            self.assertAlmostEqual(metrics["weather_notional_ratio"], 1.0)
+            self.assertEqual(
+                metrics["snapshot_collection_status"]["trades"]["collection_mode"],
+                "history_provider",
+            )
+            self.assertTrue(
+                metrics["snapshot_collection_status"]["history_provider"]["trades_complete"]
+            )
+
+    def test_run_pipeline_recovers_partitioned_activity_and_keeps_finder_ai_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            config = small_config(temp_path / "cache")
+            config["pagination"] = {"page_size": 1, "max_offset": 10}
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(analysis, "PolymarketClient", PartitionRecoveringPolymarketClient)
+                )
+                stack.enter_context(
+                    patch.object(
+                        analysis,
+                        "current_partition_end_epoch",
+                        return_value=BASE_TS + 120 * 3600,
+                    )
+                )
+                if not hasattr(analysis, "progress"):
+                    stack.enter_context(
+                        patch.object(analysis, "progress", lambda *_args, **_kwargs: None, create=True)
+                    )
+                if not hasattr(analysis, "build_analysis_summary"):
+                    stack.enter_context(
+                        patch.object(
+                            analysis,
+                            "build_analysis_summary",
+                            fallback_analysis_summary,
+                            create=True,
+                        )
+                    )
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+            self.assertEqual(result["selected_wallet_count"], 1)
+            wallet_result = json.loads(
+                (output_dir / "wallets" / f"{WALLET}.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(wallet_result["metrics"]["snapshot_complete"])
+            self.assertTrue(wallet_result["operation_audit"]["complete"])
+            self.assertTrue(wallet_result["finder_ai"]["briefGeneration"]["enabled"])
+            self.assertTrue(wallet_result["finder_ai"]["briefGeneration"]["gate"]["auditComplete"])
+            self.assertEqual(
+                wallet_result["finder_ai"]["briefGeneration"]["gate"]["reason"],
+                "ready_for_brief",
+            )
+            self.assertFalse(wallet_result["finder_ai"]["needsReview"])
+            self.assertEqual(
+                wallet_result["metrics"]["snapshot_collection_status"]["activity"]["collection_mode"],
+                "partition_recovery",
+            )
+            self.assertEqual(
+                wallet_result["metrics"]["snapshot_collection_status"]["trades"]["collection_mode"],
+                "activity_projection",
+            )
+            self.assertEqual(
+                wallet_result["metrics"]["snapshot_collection_status"]["trades"]["stop_reason"],
+                "projected_from_activity",
+            )
+
+    def test_run_pipeline_recovers_partitioned_activity_after_transport_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            config = small_config(temp_path / "cache")
+            config["pagination"] = {"page_size": 1, "max_offset": 10}
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(analysis, "PolymarketClient", TransportRecoveringPolymarketClient)
+                )
+                stack.enter_context(
+                    patch.object(
+                        analysis,
+                        "current_partition_end_epoch",
+                        return_value=BASE_TS + 120 * 3600,
+                    )
+                )
+                if not hasattr(analysis, "progress"):
+                    stack.enter_context(
+                        patch.object(analysis, "progress", lambda *_args, **_kwargs: None, create=True)
+                    )
+                if not hasattr(analysis, "build_analysis_summary"):
+                    stack.enter_context(
+                        patch.object(
+                            analysis,
+                            "build_analysis_summary",
+                            fallback_analysis_summary,
+                            create=True,
+                        )
+                    )
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+            self.assertEqual(result["selected_wallet_count"], 1)
+            wallet_result = json.loads(
+                (output_dir / "wallets" / f"{WALLET}.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(wallet_result["metrics"]["snapshot_complete"])
+            self.assertTrue(wallet_result["operation_audit"]["complete"])
+            self.assertTrue(wallet_result["finder_ai"]["briefGeneration"]["enabled"])
+            self.assertEqual(
+                wallet_result["metrics"]["snapshot_collection_status"]["activity"]["recovered_from"],
+                "terminal_transport_error",
+            )
+            self.assertEqual(
+                wallet_result["metrics"]["snapshot_collection_status"]["trades"]["recovered_from"],
+                "terminal_transport_error",
+            )
+            self.assertEqual(
+                wallet_result["metrics"]["snapshot_collection_status"]["trades"]["collection_mode"],
+                "activity_projection",
+            )
+
+    def test_run_pipeline_recovers_from_initial_activity_transport_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            config = small_config(temp_path / "cache")
+            config["pagination"] = {"page_size": 1, "max_offset": 10}
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(
+                        analysis,
+                        "PolymarketClient",
+                        InitialTransportRecoveringPolymarketClient,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        analysis,
+                        "current_partition_end_epoch",
+                        return_value=BASE_TS + 120 * 3600,
+                    )
+                )
+                if not hasattr(analysis, "progress"):
+                    stack.enter_context(
+                        patch.object(analysis, "progress", lambda *_args, **_kwargs: None, create=True)
+                    )
+                if not hasattr(analysis, "build_analysis_summary"):
+                    stack.enter_context(
+                        patch.object(
+                            analysis,
+                            "build_analysis_summary",
+                            fallback_analysis_summary,
+                            create=True,
+                        )
+                    )
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+            self.assertEqual(result["selected_wallet_count"], 1)
+            wallet_result = json.loads(
+                (output_dir / "wallets" / f"{WALLET}.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(wallet_result["metrics"]["snapshot_complete"])
+            self.assertTrue(
+                wallet_result["metrics"]["snapshot_collection_status"]["activity"]["initial_request_failed"]
+            )
+            self.assertEqual(
+                wallet_result["metrics"]["snapshot_collection_status"]["activity"]["recovered_from"],
+                "initial_transport_error",
+            )
+            self.assertEqual(
+                wallet_result["metrics"]["snapshot_collection_status"]["trades"]["collection_mode"],
+                "activity_projection",
+            )
+
     def test_build_analysis_summary_tracks_finder_ai_run_stats(self) -> None:
         def wallet_result(
             wallet: str,
@@ -930,7 +1484,7 @@ class PipelineSmokeTests(unittest.TestCase):
         summary = analysis.build_analysis_summary(
             leaderboard=[{"wallet": "a"}],
             weather_events=[{"id": "weather-event"}],
-            screening_records=[{"wallet": "a"}, {"wallet": "b"}, {"wallet": "c"}, {"wallet": "d"}],
+            screening_records=[{"wallet": "a"}, {"wallet": "b"}, {"wallet": "c"}, {"wallet": "d"}, {"wallet": "e"}],
             wallet_results=[
                 wallet_result(
                     "0x0000000000000000000000000000000000000001",
@@ -950,6 +1504,10 @@ class PipelineSmokeTests(unittest.TestCase):
                 ),
                 wallet_result(
                     "0x0000000000000000000000000000000000000004",
+                    status="fallback",
+                ),
+                wallet_result(
+                    "0x0000000000000000000000000000000000000005",
                     status="insufficient",
                     eligible=False,
                 ),
@@ -957,13 +1515,14 @@ class PipelineSmokeTests(unittest.TestCase):
             errors=[],
         )
 
-        self.assertEqual(summary["wallets_selected"], 4)
+        self.assertEqual(summary["wallets_selected"], 5)
         self.assertEqual(summary["wallets_core_labeled"], 1)
-        self.assertEqual(summary["finder_ai_summary"]["selected_wallets"], 4)
-        self.assertEqual(summary["finder_ai_summary"]["finder_ai_present"], 4)
-        self.assertEqual(summary["finder_ai_summary"]["eligible"], 3)
+        self.assertEqual(summary["finder_ai_summary"]["selected_wallets"], 5)
+        self.assertEqual(summary["finder_ai_summary"]["finder_ai_present"], 5)
+        self.assertEqual(summary["finder_ai_summary"]["eligible"], 4)
         self.assertEqual(summary["finder_ai_summary"]["generated"], 1)
         self.assertEqual(summary["finder_ai_summary"]["cached"], 1)
+        self.assertEqual(summary["finder_ai_summary"]["fallback"], 1)
         self.assertEqual(summary["finder_ai_summary"]["failed"], 1)
         self.assertEqual(summary["finder_ai_summary"]["skipped"], 1)
         self.assertEqual(summary["finder_ai_summary"]["needs_review"], 1)
@@ -1019,7 +1578,7 @@ class PipelineSmokeTests(unittest.TestCase):
 
             self.assertEqual(result["selected_wallet_count"], 1)
             self.assertEqual(captured["normalizedAddress"], WALLET)
-            self.assertEqual(captured["promptVersion"], "finder-weather-brief-v1")
+            self.assertEqual(captured["promptVersion"], "finder-weather-brief-v3")
             self.assertEqual(captured["statusBefore"], "ready")
             self.assertEqual(captured["primarySignalKey"], "high_frequency_region")
             self.assertTrue(str(captured["cacheKey"]).startswith(f"{WALLET}|sha256:"))
@@ -1039,6 +1598,8 @@ class PipelineSmokeTests(unittest.TestCase):
             )
             self.assertEqual(selected_wallets[0]["ai_brief_short"], "测试短摘要")
             self.assertEqual(selected_wallets[0]["ai_strategy_focus"], wallet_result["finder_ai"]["strategyFocus"])
+            self.assertEqual(selected_wallets[0]["ai_generation_status"], "generated")
+            self.assertEqual(selected_wallets[0]["ai_generation_reason"], "generated")
             self.assertFalse(selected_wallets[0]["ai_needs_review"])
             self.assertFalse(selected_wallets[0]["ai_has_conflict"])
             self.assertEqual(
@@ -1051,6 +1612,7 @@ class PipelineSmokeTests(unittest.TestCase):
             self.assertEqual(analysis_summary["finder_ai_summary"]["selected_wallets"], 1)
             self.assertEqual(analysis_summary["finder_ai_summary"]["generated"], 1)
             self.assertEqual(analysis_summary["finder_ai_summary"]["cached"], 0)
+            self.assertEqual(analysis_summary["finder_ai_summary"]["fallback"], 0)
             self.assertEqual(analysis_summary["finder_ai_summary"]["failed"], 0)
             self.assertEqual(analysis_summary["finder_ai_summary"]["skipped"], 0)
             self.assertEqual(
@@ -1157,7 +1719,6 @@ class PipelineSmokeTests(unittest.TestCase):
                     "activity",
                     "positions",
                     "closed_positions",
-                    "trades",
                 ],
             )
 

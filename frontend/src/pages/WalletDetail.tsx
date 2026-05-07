@@ -322,8 +322,15 @@ function EvidenceSummaryStrip({
   finderAi?: FinderAiResult;
 }) {
   const matched = rows.filter((row) => row.matched);
+  const aiPreview = String(finderAi?.aiBriefShort || finderAi?.strategyFocus || '').trim();
   const latestReason = String(
-    finderAi?.aiBriefNote || finderAi?.sourceExcerpt || summary.headline || matched[0]?.reason || rows[0]?.reason || '后端尚未返回标签证据摘要。',
+    aiPreview ||
+      finderAi?.aiBriefNote ||
+      finderAi?.sourceExcerpt ||
+      summary.headline ||
+      matched[0]?.reason ||
+      rows[0]?.reason ||
+      '后端尚未返回标签证据摘要。',
   );
   const aiState = resolveFinderAiDisplayState(finderAi);
   const summaryItems = [
@@ -349,7 +356,7 @@ function EvidenceSummaryStrip({
     <section className="rounded-md border border-slate-200 bg-white p-5 shadow-sm">
       <div className="grid gap-4 md:grid-cols-[1.4fr_repeat(4,minmax(0,1fr))]">
         <div>
-          <h2 className="text-base font-semibold text-slate-900">研判摘要</h2>
+          <h2 className="text-base font-semibold text-slate-900">{aiPreview ? 'AI 研判摘要' : '研判摘要'}</h2>
           <p className="mt-1 line-clamp-3 text-sm leading-6 text-slate-600">{latestReason}</p>
         </div>
         {summaryItems.map((item) => (
@@ -371,6 +378,7 @@ function FinderAiPanel({finderAi}: {finderAi?: FinderAiResult}) {
     Boolean(
       String(finderAi.aiBriefNote || '').trim() ||
         String(finderAi.aiDeepNote || '').trim() ||
+        String(finderAi.aiBriefShort || '').trim() ||
         String(finderAi.strategyFocus || '').trim() ||
         (finderAi.primarySignals || []).length ||
         (finderAi.keyMetrics || []).length,
@@ -381,9 +389,12 @@ function FinderAiPanel({finderAi}: {finderAi?: FinderAiResult}) {
   const primarySignals = (finderAi?.primarySignals || []).filter((item) => item?.label || item?.reason).slice(0, 4);
   const labels = (finderAi?.labels || []).filter((item) => item?.value).slice(0, 6);
   const keyMetrics = (finderAi?.keyMetrics || []).filter((item) => item?.label && item?.value != null).slice(0, 6);
+  const briefShort = String(finderAi?.aiBriefShort || '').trim();
+  const strategyFocus = String(finderAi?.strategyFocus || '').trim();
   const briefNote = String(finderAi?.aiBriefNote || '').trim();
   const deepNote = String(finderAi?.aiDeepNote || '').trim();
   const sourceExcerpt = String(finderAi?.sourceExcerpt || '').trim();
+  const leadingConclusion = briefShort || strategyFocus || briefNote;
 
   return (
     <section className="rounded-md border border-slate-200 bg-white p-6 shadow-sm">
@@ -402,15 +413,18 @@ function FinderAiPanel({finderAi}: {finderAi?: FinderAiResult}) {
             </span>
           </div>
           <div className="mt-3 text-sm leading-6 text-slate-500">{aiState.note}</div>
-          <div className="mt-4 rounded-md border border-blue-100 bg-blue-50/70 px-4 py-3 text-sm leading-6 text-slate-700">
-            <span className="font-medium text-slate-900">这是 AI 研判结果。</span>
-            <span className="ml-1">文案基于下方结构化信号、关键指标和证据摘录生成；即使 AI 未写出自然语言解读，结构化证据底座仍然有效。</span>
+          <div className="mt-4 border-l-4 border-blue-500 bg-blue-50/70 px-4 py-3">
+            <div className="text-xs font-medium uppercase tracking-wide text-blue-700">结论</div>
+            <div className="mt-1 text-base font-semibold leading-7 text-slate-950">{leadingConclusion || '结构化证据已就绪，等待生成自然语言研判。'}</div>
+            {strategyFocus && strategyFocus !== leadingConclusion ? (
+              <div className="mt-2 text-sm leading-6 text-slate-600">策略结论：{strategyFocus}</div>
+            ) : null}
           </div>
         </div>
         <div className="grid gap-3 text-sm text-slate-600 sm:grid-cols-2 lg:min-w-[250px] lg:grid-cols-1">
           <MetaRow label="研判状态" value={aiState.label} />
           <MetaRow label="模型" value={finderAiModelName(finderAi?.providerMeta?.model)} />
-          <MetaRow label="证据底座" value={finderAiEvidenceLevelLabel(finderAi?.evidenceLevel)} />
+          <MetaRow label="证据等级" value={finderAiEvidenceLevelLabel(finderAi?.evidenceLevel)} />
           <MetaRow label="生成时间" value={formatDateTime(finderAi?.providerMeta?.generatedAt || null)} />
           <MetaRow label="来源" value={finderAiProviderLabel(finderAi)} />
         </div>
@@ -418,16 +432,16 @@ function FinderAiPanel({finderAi}: {finderAi?: FinderAiResult}) {
 
       <div className="grid gap-6 pt-5 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,0.9fr)]">
         <div className="space-y-5">
-          {finderAi?.strategyFocus ? (
+          {briefShort && briefShort !== leadingConclusion ? (
             <div>
-              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">策略焦点</div>
-              <div className="mt-2 text-sm font-semibold leading-6 text-slate-900">{finderAi.strategyFocus}</div>
+              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">短摘</div>
+              <div className="mt-2 text-sm font-semibold leading-6 text-slate-900">{briefShort}</div>
             </div>
           ) : null}
 
           {briefNote ? (
             <div>
-              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">AI 短摘</div>
+              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">摘要说明</div>
               <p className="mt-2 text-[15px] leading-7 text-slate-700">{briefNote}</p>
             </div>
           ) : null}
@@ -443,7 +457,7 @@ function FinderAiPanel({finderAi}: {finderAi?: FinderAiResult}) {
 
           {sourceExcerpt ? (
             <div>
-              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">结构化证据摘录</div>
+              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">证据摘录</div>
               <p className="mt-2 text-sm leading-6 text-slate-600">{sourceExcerpt}</p>
             </div>
           ) : null}
@@ -762,7 +776,7 @@ function finderAiModelName(model?: string): string {
 function finderAiEvidenceLevelLabel(value?: string): string {
   const labels: Record<string, string> = {
     insufficient: '证据不足',
-    structured_only: '结构化证据已齐备',
+    structured_only: '结构化证据',
     medium: '证据较完整',
     high: '证据较强',
   };
@@ -771,30 +785,24 @@ function finderAiEvidenceLevelLabel(value?: string): string {
 
 function resolveFinderAiDisplayState(finderAi?: FinderAiResult): {label: string; tone: string; note: string} {
   const status = String(finderAi?.briefGeneration?.status || '').trim().toLowerCase();
-  if (status === 'cached') {
-    return {
-      label: '已载入缓存解读',
-      tone: 'border-blue-200 bg-blue-50 text-blue-700',
-      note: '当前展示的是已缓存的 AI 解读，仍然基于这次任务的结构化证据底座组织。',
-    };
-  }
-  if (status === 'generated' || String(finderAi?.aiBriefNote || '').trim()) {
-    return {
-      label: '已生成 AI 解读',
-      tone: 'border-blue-200 bg-blue-50 text-blue-700',
-      note: '当前已经生成自然语言研判，可直接结合下方结构化信号与证据摘录一起阅读。',
-    };
-  }
+  const reason = String(finderAi?.briefGeneration?.reason || '').trim().toLowerCase();
   if (status === 'failed') {
     return {
       label: 'AI 生成未完成',
       tone: 'border-red-200 bg-red-50 text-red-700',
-      note: '这次没有成功产出自然语言解读，但下方结构化证据底座仍可正常用于判断。',
+      note: '这次没有成功产出自然语言解读，但下方结构化证据仍可正常用于判断。',
     };
   }
-  if (finderAi?.needsReview || status === 'needs_review') {
+  if (status === 'needs_review' && reason === 'analysis_audit_incomplete') {
     return {
-      label: '建议人工复核',
+      label: '审计未补齐',
+      tone: 'border-amber-200 bg-amber-50 text-amber-700',
+      note: '这个钱包已经有结构化信号，但交易、活动或仓位流水抓取没有完整收尾，所以系统先不调用 AI 生成深度解读，避免把不完整样本说得太满。',
+    };
+  }
+  if (finderAi?.needsReview || status === 'needs_review' || finderAi?.hasConflict) {
+    return {
+      label: finderAi?.hasConflict ? '信号存在冲突' : '建议人工复核',
       tone: 'border-amber-200 bg-amber-50 text-amber-700',
       note: '结构化信号已经具备，但当前更适合先由人复核，再决定是否采纳这条 AI 研判。',
     };
@@ -806,11 +814,25 @@ function resolveFinderAiDisplayState(finderAi?: FinderAiResult): {label: string;
       note: '当前结构化证据还不够稳定，所以系统没有强行生成“像 AI 的一段话”。',
     };
   }
-  if (finderAi?.hasConflict) {
+  if (status === 'cached') {
     return {
-      label: '信号存在冲突',
-      tone: 'border-amber-200 bg-amber-50 text-amber-700',
-      note: '不同信号之间存在分歧，建议重点对照下方证据摘录和标签证据表。',
+      label: '已载入缓存解读',
+      tone: 'border-blue-200 bg-blue-50 text-blue-700',
+      note: '当前展示的是已缓存的 AI 解读，仍然基于这次任务的结构化证据组织。',
+    };
+  }
+  if (status === 'fallback') {
+    return {
+      label: '本地兜底解读',
+      tone: 'border-slate-200 bg-slate-50 text-slate-600',
+      note: '当前展示的是基于结构化证据改写出的本地兜底解读，用来避免空泛标签和英文模板。',
+    };
+  }
+  if (status === 'generated' || String(finderAi?.aiBriefNote || finderAi?.aiDeepNote || finderAi?.aiBriefShort || '').trim()) {
+    return {
+      label: '已生成 AI 解读',
+      tone: 'border-blue-200 bg-blue-50 text-blue-700',
+      note: '当前已经生成自然语言研判，可直接结合下方结构化信号与证据摘录一起阅读。',
     };
   }
   if (status === 'ready') {

@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import json
 import statistics
+import urllib.parse
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Lock
 from typing import Any, Callable, Mapping
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
-from .client import PolymarketClient, resolve_api_key
+from . import cloud_archive as cloud_archive_module
+from . import history_ledger as history_ledger_module
+from . import history_registry as history_registry_module
+from .client import PolymarketClient, PolymarketRequestError, resolve_api_key
 from .config import SMART_WALLET_LIBRARY_REFRESH_MODE
 from .finder_ai_contract import build_finder_ai_contract, enrich_finder_ai_generation_context
 from .finder_ai_generation import generate_finder_ai_brief
+from . import history_provider as history_provider_module
 from .labels import CORE_LABEL_KEYS, build_strategy_notes, evaluate_label_evaluations, evaluate_labels
 from .metrics import (
     DEFAULT_REGION_FIELDS,
@@ -48,7 +52,34 @@ POSITIONS_CONVERTED_TOPIC0 = "0xb03d19dddbc72a87e735ff0ea3b57bef133ebe44e1894284
 OPERATION_KEYS = ("convert", "split", "redeem", "swap")
 HISTORY_REGISTRY_DIRNAME = "_wallet_registry"
 HISTORY_ALREADY_FETCHED_REASON = "历史已抓取过，已默认排除"
-HISTORY_REGISTRY_LOCK = Lock()
+RECOVERABLE_PAGINATION_STOP_REASONS = {
+    "terminal_http_400",
+    "terminal_http_429",
+    "terminal_http_5xx",
+    "terminal_transport_error",
+    "max_offset_reached",
+}
+TIME_PARTITION_MAX_DEPTH = 32
+TIME_PARTITION_BACKFILL_SECONDS = 86_400
+SCREENING_WINDOW_END_TOLERANCE_SECONDS = 300
+DEFAULT_HISTORY_PROVIDER_SOURCE = "public_goldsky"
+DEFAULT_HISTORY_PROVIDER_ORDERBOOK_URL = (
+    "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/"
+    "subgraphs/orderbook-subgraph/0.0.1/gn"
+)
+DEFAULT_HISTORY_PROVIDER_ACTIVITY_URL = (
+    "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/"
+    "subgraphs/activity-subgraph/0.0.4/gn"
+)
+DEFAULT_HISTORY_PROVIDER_POSITIONS_URL = (
+    "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/"
+    "subgraphs/positions-subgraph/0.0.7/gn"
+)
+DEFAULT_HISTORY_PROVIDER_PAGE_SIZE = 200
+DEFAULT_HISTORY_PROVIDER_MAX_PAGES = 30
+DEFAULT_HISTORY_PROVIDER_TOKEN_LOOKUP_CHUNK_SIZE = 100
+DEFAULT_HISTORY_PROVIDER_ASSET_DECIMALS = 6
+DEFAULT_HISTORY_PROVIDER_USDC_ASSET_ID = "0"
 
 
 @dataclass
@@ -65,9 +96,13 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     runtime = config.setdefault("runtime", {})
     runtime["run_id"] = str(runtime.get("run_id") or output_dir.name).strip()
+    runtime["artifacts_root"] = str(output_dir.parent.resolve())
     wallets_dir = output_dir / "wallets"
     wallets_dir.mkdir(parents=True, exist_ok=True)
-    history_registry_dir = wallet_history_registry_dir(output_dir)
+    history_registry_dir = history_registry_module.create_history_registry(
+        output_dir.parent,
+        config=config,
+    )
     history_run_id = resolve_history_run_id(config, output_dir)
 
     write_json(output_dir / "resolved_config.json", config)
@@ -103,6 +138,7 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     screening_records: list[dict[str, Any]] = []
     selected_wallets: list[dict[str, Any]] = []
     wallet_results: list[dict[str, Any]] = []
+    seen_candidate_wallets: set[str] = set()
     leaderboard_entries = [
         entry for entry in leaderboard if str(entry.get("proxyWallet", "")).strip()
     ]
@@ -110,6 +146,7 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
         leaderboard_entries,
         config,
         history_registry_dir=history_registry_dir,
+        seen_wallets=seen_candidate_wallets,
     )
     screening_records.extend(prefiltered_records)
     progress(
@@ -161,6 +198,7 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
                 extra_entries,
                 config,
                 history_registry_dir=history_registry_dir,
+                seen_wallets=seen_candidate_wallets,
             )
             candidate_entries.extend(extra_candidates)
             screening_records.extend(extra_prefiltered)
@@ -195,7 +233,11 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
         ):
             wallet = result["wallet"]
             if result.get("error"):
-                errors.append({"wallet": wallet, "error": result["error"]})
+                error_payload = result["error"]
+                if isinstance(error_payload, Mapping):
+                    errors.append(dict(error_payload))
+                else:
+                    errors.append({"wallet": wallet, "error": str(error_payload)})
                 continue
             if result.get("screening"):
                 screening_records.append(result["screening"])
@@ -244,11 +286,25 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
         ),
         encoding="utf-8",
     )
+    cloud_archive_status = {"status": "disabled", "document_count": 0}
+    try:
+        cloud_archive_status = cloud_archive_module.archive_run_outputs(
+            output_dir,
+            run_id=history_run_id,
+            config=config,
+        )
+    except Exception as exc:
+        cloud_archive_status = {
+            "status": "failed",
+            "error": str(exc),
+            "document_count": 0,
+        }
     return {
         "report_path": str(report_path),
         "analysis_summary_path": str(analysis_summary_path),
         "selected_wallet_count": len(selected_wallets),
         "errors": errors,
+        "cloud_archive": cloud_archive_status,
     }
 
 
@@ -300,18 +356,21 @@ def fetch_weather_events(client: PolymarketClient, config: dict[str, Any]) -> li
     tag_slug = weather.get("tag_slug")
 
     if weather.get("use_keyset", True):
-        return fetch_weather_events_keyset(
-            client=client,
-            page_size=int(weather["page_size"]),
-            max_events=int(weather.get("max_events", weather["page_size"])),
-            order=str(weather.get("order", "createdAt")),
-            ascending=bool(weather.get("ascending", False)),
-            tag_id=tag_id,
-            tag_slug=tag_slug,
-            active=active,
-            closed=closed,
-            archived=archived,
-        )
+        try:
+            return fetch_weather_events_keyset(
+                client=client,
+                page_size=int(weather["page_size"]),
+                max_events=int(weather.get("max_events", weather["page_size"])),
+                order=str(weather.get("order", "createdAt")),
+                ascending=bool(weather.get("ascending", False)),
+                tag_id=tag_id,
+                tag_slug=tag_slug,
+                active=active,
+                closed=closed,
+                archived=archived,
+            )
+        except Exception:
+            pass
 
     return paginate(
         page_size=int(weather["page_size"]),
@@ -372,43 +431,100 @@ def fetch_wallet_snapshot(
     wallet: str,
     config: dict[str, Any],
     *,
+    snapshot_scope: str = "full",
     prefetched_trades: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     pagination = config["pagination"]
     page_size = int(pagination["page_size"])
     max_offset = int(pagination["max_offset"])
-    size_threshold = float(config["analysis"].get("position_size_threshold", 0.1))
+    position_size_threshold = float(config["analysis"].get("position_size_threshold", 0.1))
+    screening_mode = screening_snapshot_mode(config) if snapshot_scope == "screening" else ""
+    ledger_store = history_ledger_store(config)
+    window_bounds = (
+        screening_trade_window_bounds(config)
+        if screening_mode == "screening_window"
+        else None
+    )
 
-    activity_page = paginate_with_status(
-        page_size=page_size,
-        max_offset=max_offset,
-        fetch_page=lambda limit, offset: client.fetch_activity_page(
-            user=wallet,
-            limit=limit,
-            offset=offset,
-        ),
-    )
-    positions_page = paginate_with_status(
-        page_size=page_size,
-        max_offset=max_offset,
-        fetch_page=lambda limit, offset: client.fetch_positions_page(
-            user=wallet,
-            limit=limit,
-            offset=offset,
-            size_threshold=size_threshold,
-        ),
-    )
-    closed_positions_page = paginate_with_status(
-        page_size=page_size,
-        max_offset=max_offset,
-        fetch_page=lambda limit, offset: client.fetch_closed_positions_page(
-            user=wallet,
-            limit=limit,
-            offset=offset,
-        ),
-    )
+    if screening_mode == "recent_activity":
+        activity_page = fetch_recent_activity_screening_page(
+            client=client,
+            wallet=wallet,
+            page_size=page_size,
+        )
+    elif window_bounds is None:
+        activity_page = fetch_collection_page_with_recovery(
+            page_size=page_size,
+            max_offset=max_offset,
+            section_name="activity",
+            fetch_aggregate_page=lambda limit, offset: client.fetch_activity_page(
+                user=wallet,
+                limit=limit,
+                offset=offset,
+            ),
+            fetch_partition_page=lambda limit, offset, start, end: client.fetch_activity_page(
+                user=wallet,
+                limit=limit,
+                offset=offset,
+                start=start,
+                end=end,
+            ),
+        )
+    else:
+        window_start_ts, window_end_ts = window_bounds
+        try:
+            activity_page = fetch_time_window_collection_page(
+                page_size=page_size,
+                max_offset=max_offset,
+                section_name="activity",
+                start_ts=window_start_ts,
+                end_ts=window_end_ts,
+                fetch_partition_page=lambda limit, offset, start, end: client.fetch_activity_page(
+                    user=wallet,
+                    limit=limit,
+                    offset=offset,
+                    start=start,
+                    end=end,
+                ),
+            )
+        except Exception as exc:
+            activity_page = failed_collection_page(
+                section_name="activity",
+                stop_reason=f"request_error:{type(exc).__name__}",
+                history_scope="screening_window",
+                collection_mode="screening_window_failed",
+                range_start=window_start_ts,
+                range_end=window_end_ts,
+            )
+    if snapshot_scope == "screening":
+        positions_page = deferred_collection_page("positions")
+        accounting_snapshot = None
+        closed_positions_page = deferred_collection_page("closed_positions")
+    else:
+        positions_page, accounting_snapshot = fetch_positions_page_with_accounting_fallback(
+            client=client,
+            wallet=wallet,
+            config=config,
+            page_size=page_size,
+            max_offset=max_offset,
+        )
+        closed_positions_page = paginate_with_status(
+            page_size=page_size,
+            max_offset=max_offset,
+            fetch_page=lambda limit, offset: client.fetch_closed_positions_page(
+                user=wallet,
+                limit=limit,
+                offset=offset,
+            ),
+        )
 
     if prefetched_trades is not None:
+        if screening_mode == "recent_activity":
+            prefetched_scope = "recent_activity"
+        elif window_bounds is not None:
+            prefetched_scope = "screening_window"
+        else:
+            prefetched_scope = "aggregate"
         trades_page = {
             "records": list(prefetched_trades),
             "complete": True,
@@ -417,17 +533,135 @@ def fetch_wallet_snapshot(
             "record_count": len(prefetched_trades),
             "last_offset": 0,
             "next_offset": len(prefetched_trades),
+            "collection_mode": "prefetched",
+            "source_section": "trades",
+            "history_scope": prefetched_scope,
         }
+        if window_bounds is not None:
+            trades_page["range_start"] = window_bounds[0]
+            trades_page["range_end"] = window_bounds[1]
     else:
-        trades_page = paginate_with_status(
-            page_size=page_size,
-            max_offset=max_offset,
-            fetch_page=lambda limit, offset: client.fetch_trades_page(
-                user=wallet,
-                limit=limit,
-                offset=offset,
-            ),
+        trades_page = (
+            project_recent_trades_page_from_activity(activity_page)
+            if screening_mode == "recent_activity"
+            else project_trades_page_from_activity(activity_page)
         )
+        if trades_page is None:
+            if window_bounds is None:
+                if screening_mode == "recent_activity":
+                    trades_page = failed_collection_page(
+                        section_name="trades",
+                        stop_reason="activity_projection_incomplete",
+                        history_scope="recent_activity",
+                        collection_mode="recent_activity_projection_failed",
+                    )
+                else:
+                    trades_page = fetch_collection_page_with_recovery(
+                        page_size=page_size,
+                        max_offset=max_offset,
+                        section_name="trades",
+                        fetch_aggregate_page=lambda limit, offset: client.fetch_trades_page(
+                            user=wallet,
+                            limit=limit,
+                            offset=offset,
+                        ),
+                        fetch_partition_page=lambda limit, offset, start, end: client.fetch_activity_page(
+                            user=wallet,
+                            limit=limit,
+                            offset=offset,
+                            activity_type="TRADE",
+                            start=start,
+                            end=end,
+                        ),
+                    )
+            else:
+                try:
+                    trades_page = fetch_time_window_collection_page(
+                        page_size=page_size,
+                        max_offset=max_offset,
+                        section_name="trades",
+                        start_ts=window_bounds[0],
+                        end_ts=window_bounds[1],
+                        fetch_partition_page=lambda limit, offset, start, end: client.fetch_activity_page(
+                            user=wallet,
+                            limit=limit,
+                            offset=offset,
+                            activity_type="TRADE",
+                            start=start,
+                            end=end,
+                        ),
+                    )
+                except Exception as exc:
+                    trades_page = failed_collection_page(
+                        section_name="trades",
+                        stop_reason=f"request_error:{type(exc).__name__}",
+                        history_scope="screening_window",
+                        collection_mode="screening_window_failed",
+                        range_start=window_bounds[0],
+                        range_end=window_bounds[1],
+                    )
+
+    history_provider = None
+    history_ledger_fallback = None
+    operation_ledger_fallback = None
+    if should_fetch_screening_history_provider_trades(
+        config=config,
+        snapshot_scope=snapshot_scope,
+        trades_page=trades_page,
+    ):
+        try:
+            history_provider = fetch_screening_history_provider_bundle(
+                client=client,
+                wallet=wallet,
+                config=config,
+                screening_mode=screening_mode,
+                window_bounds=window_bounds,
+            )
+        except Exception:
+            history_provider = None
+        else:
+            trades_page = merge_trades_page_with_history_provider(
+                trades_page=trades_page,
+                history_provider=history_provider,
+            )
+    elif snapshot_scope == "full":
+        history_provider_plan = history_provider_fetch_plan(
+            config=config,
+            snapshot_scope=snapshot_scope,
+            trades_page=trades_page,
+            activity_page=activity_page,
+        )
+        if history_provider_plan["enabled"]:
+            try:
+                history_provider = fetch_history_provider_bundle(
+                    client=client,
+                    wallet=wallet,
+                    config=config,
+                    need_trade_history=bool(history_provider_plan["need_trade_history"]),
+                    need_operations=bool(history_provider_plan["need_operations"]),
+                )
+            except Exception:
+                history_provider = None
+            else:
+                if history_provider_plan["need_trade_history"]:
+                    trades_page = merge_trades_page_with_history_provider(
+                        trades_page=trades_page,
+                        history_provider=history_provider,
+                    )
+
+    if not bool(trades_page.get("complete", False)):
+        history_ledger_fallback = load_history_ledger_trade_fallback(
+            ledger_store=ledger_store,
+            wallet=wallet,
+            snapshot_scope=snapshot_scope,
+            screening_mode=screening_mode,
+            window_bounds=window_bounds,
+        )
+        if history_ledger_fallback is not None:
+            trades_page = merge_trades_page_with_history_ledger(
+                trades_page=trades_page,
+                history_ledger_fallback=history_ledger_fallback,
+            )
 
     activity = activity_page["records"]
     positions = positions_page["records"]
@@ -438,36 +672,1281 @@ def fetch_wallet_snapshot(
         for record in activity
         if str(record.get("type", "")).upper() in {"REWARD", "YIELD"}
     ]
-    chain_validation = fetch_optional_chain_validation(client, wallet, config)
+    chain_validation = (
+        empty_chain_validation(
+            status="deferred",
+            reason="deferred until full history hydration",
+        )
+        if snapshot_scope == "screening"
+        else fetch_optional_chain_validation(client, wallet, config)
+    )
     collection_status = {
         "activity": activity_page,
         "trades": trades_page,
         "positions": {
             **positions_page,
-            "size_threshold": size_threshold,
+            "analysis_size_threshold": position_size_threshold,
+            "size_threshold": None,
         },
         "closed_positions": closed_positions_page,
     }
+    if history_provider is not None:
+        collection_status["history_provider"] = dict(history_provider.get("status") or {})
+    if history_ledger_fallback is not None:
+        collection_status["history_ledger"] = dict(history_ledger_fallback.get("status_payload") or {})
+    provider_operation_records = (
+        list(history_provider.get("operation_records", []))
+        if isinstance(history_provider, Mapping)
+        else []
+    )
+    if snapshot_scope == "full" and not operation_history_coverage_complete(collection_status):
+        operation_ledger_fallback = load_history_ledger_operation_fallback(
+            ledger_store=ledger_store,
+            wallet=wallet,
+            snapshot_scope=snapshot_scope,
+        )
+        if operation_ledger_fallback is not None:
+            provider_operation_records = dedupe_collection_records(
+                [
+                    *(
+                        dict(record)
+                        for record in provider_operation_records
+                        if isinstance(record, Mapping)
+                    ),
+                    *(
+                        dict(record)
+                        for record in operation_ledger_fallback.get("records", [])
+                        if isinstance(record, Mapping)
+                    ),
+                ]
+            )
+            collection_status["history_ledger_operations"] = dict(
+                operation_ledger_fallback.get("status_payload") or {}
+            )
+    if accounting_snapshot is not None:
+        collection_status["accounting_snapshot"] = {
+            "complete": True,
+            "stop_reason": "accounting_snapshot_loaded",
+            "collection_mode": "accounting_snapshot",
+            "source_section": "accounting_snapshot",
+            "record_count": sum(
+                int(count)
+                for count in (accounting_snapshot.get("record_counts") or {}).values()
+                if isinstance(count, int)
+            ),
+        }
     operation_audit = build_operation_audit(
         wallet=wallet,
         trades=trades,
         activity=activity,
         closed_positions=closed_positions,
+        provider_operations=provider_operation_records,
         chain_validation=chain_validation,
         collection_status=collection_status,
     )
 
-    return {
+    snapshot = {
         "wallet": wallet,
         "activity": activity,
         "trades": trades,
         "rewards": rewards,
         "positions": positions,
         "closed_positions": closed_positions,
+        "equity": (accounting_snapshot or {}).get("equity", []),
+        "accounting_snapshot": accounting_snapshot,
+        "history_provider": history_provider or {},
+        "history_ledger_operations": operation_ledger_fallback or {},
         "chain_validation": chain_validation,
         "collection_status": collection_status,
         "operation_audit": operation_audit,
+        "snapshot_scope": snapshot_scope,
     }
+    try:
+        snapshot["history_ledger"] = ledger_store.persist_wallet_snapshot(
+            snapshot,
+            wallet=wallet,
+            run_id=str((config.get("runtime", {}) or {}).get("run_id") or ""),
+            snapshot_scope=snapshot_scope,
+        )
+    except Exception as exc:
+        snapshot["history_ledger"] = {
+            "status": "failed",
+            "backend": str((config.get("history_ledger", {}) or {}).get("backend") or "local"),
+            "wallet": wallet,
+            "snapshot_scope": snapshot_scope,
+            "error": str(exc),
+        }
+    return snapshot
+
+
+def deferred_collection_page(section_name: str) -> dict[str, Any]:
+    return {
+        "records": [],
+        "complete": False,
+        "stop_reason": "deferred_until_full_history_hydration",
+        "page_count": 0,
+        "record_count": 0,
+        "last_offset": 0,
+        "next_offset": 0,
+        "collection_mode": "deferred",
+        "source_section": section_name,
+        "history_scope": "deferred",
+    }
+
+
+def fetch_recent_activity_screening_page(
+    *,
+    client: PolymarketClient,
+    wallet: str,
+    page_size: int,
+) -> dict[str, Any]:
+    try:
+        records = client.fetch_activity_page(
+            user=wallet,
+            limit=page_size,
+            offset=0,
+        )
+    except Exception as exc:
+        return failed_collection_page(
+            section_name="activity",
+            stop_reason=f"request_error:{type(exc).__name__}",
+            history_scope="recent_activity",
+            collection_mode="recent_activity_failed",
+        )
+    return {
+        "records": list(records),
+        "complete": True,
+        "stop_reason": "recent_activity_page",
+        "page_count": 1 if records else 0,
+        "record_count": len(records),
+        "last_offset": 0,
+        "next_offset": len(records),
+        "collection_mode": "recent_activity_page",
+        "source_section": "activity",
+        "history_scope": "recent_activity",
+        "partitioned": False,
+        "partition_attempted": False,
+    }
+
+
+def failed_collection_page(
+    *,
+    section_name: str,
+    stop_reason: str,
+    history_scope: str,
+    collection_mode: str,
+    range_start: int | None = None,
+    range_end: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "records": [],
+        "complete": False,
+        "stop_reason": stop_reason,
+        "page_count": 0,
+        "record_count": 0,
+        "last_offset": 0,
+        "next_offset": 0,
+        "collection_mode": collection_mode,
+        "source_section": section_name,
+        "history_scope": history_scope,
+        "range_start": range_start,
+        "range_end": range_end,
+        "partitioned": False,
+        "partition_attempted": False,
+    }
+
+
+def history_ledger_store(config: Mapping[str, Any]) -> history_ledger_module.HistoryLedgerStore:
+    runtime = config.get("runtime", {}) if isinstance(config, Mapping) else {}
+    artifacts_root_value = str((runtime if isinstance(runtime, Mapping) else {}).get("artifacts_root") or "").strip()
+    return history_ledger_module.create_history_ledger_store(
+        Path(artifacts_root_value) if artifacts_root_value else None,
+        config=config,
+    )
+
+
+def requested_trade_history_scope(snapshot_scope: str, screening_mode: str) -> str:
+    if snapshot_scope == "screening":
+        if screening_mode == "recent_activity":
+            return "recent_activity"
+        return "screening_window"
+    return "full_history"
+
+
+def load_history_ledger_trade_fallback(
+    *,
+    ledger_store: history_ledger_module.HistoryLedgerStore,
+    wallet: str,
+    snapshot_scope: str,
+    screening_mode: str,
+    window_bounds: tuple[int, int] | None,
+    limit: int | None = None,
+) -> dict[str, Any] | None:
+    fallback = ledger_store.load_complete_trade_fallback(
+        wallet=wallet,
+        history_scope=requested_trade_history_scope(snapshot_scope, screening_mode),
+        snapshot_scope=snapshot_scope,
+        range_start=window_bounds[0] if window_bounds is not None else None,
+        range_end=window_bounds[1] if window_bounds is not None else None,
+        limit=limit,
+    )
+    if str(fallback.get("status") or "") != "loaded":
+        return None
+    return fallback
+
+
+def load_history_ledger_operation_fallback(
+    *,
+    ledger_store: history_ledger_module.HistoryLedgerStore,
+    wallet: str,
+    snapshot_scope: str,
+) -> dict[str, Any] | None:
+    fallback = ledger_store.load_complete_operation_fallback(
+        wallet=wallet,
+        history_scope="full_history",
+        snapshot_scope=snapshot_scope,
+    )
+    if str(fallback.get("status") or "") != "loaded":
+        return None
+    if not list(fallback.get("records", [])):
+        return None
+    return fallback
+
+
+def operation_history_coverage_complete(collection_status: Mapping[str, Any]) -> bool:
+    activity_status = (
+        collection_status.get("activity", {})
+        if isinstance(collection_status.get("activity", {}), Mapping)
+        else {}
+    )
+    provider_status = (
+        collection_status.get("history_provider", {})
+        if isinstance(collection_status.get("history_provider", {}), Mapping)
+        else {}
+    )
+    ledger_operations_status = (
+        collection_status.get("history_ledger_operations", {})
+        if isinstance(collection_status.get("history_ledger_operations", {}), Mapping)
+        else {}
+    )
+    return bool(
+        activity_status.get("complete", True)
+        or provider_status.get("operations_complete", False)
+        or ledger_operations_status.get("operations_complete", False)
+    )
+
+
+def merge_trades_page_with_history_ledger(
+    *,
+    trades_page: Mapping[str, Any],
+    history_ledger_fallback: Mapping[str, Any],
+) -> dict[str, Any]:
+    ledger_records = [
+        dict(record)
+        for record in history_ledger_fallback.get("records", [])
+        if isinstance(record, Mapping)
+    ]
+    if not ledger_records:
+        return dict(trades_page)
+    status = (
+        history_ledger_fallback.get("status_payload", {})
+        if isinstance(history_ledger_fallback.get("status_payload", {}), Mapping)
+        else {}
+    )
+    ledger_complete = bool(history_ledger_fallback.get("complete", False))
+    ledger_history_scope = str(
+        (status if isinstance(status, Mapping) else {}).get("history_scope")
+        or history_ledger_fallback.get("history_scope")
+        or ""
+    )
+    merged_records = dedupe_collection_records(
+        [
+            *(
+                dict(record)
+                for record in trades_page.get("records", [])
+                if isinstance(record, Mapping)
+            ),
+            *ledger_records,
+        ]
+    )
+    return {
+        **dict(trades_page),
+        "records": merged_records,
+        "complete": bool(trades_page.get("complete", False)) or ledger_complete,
+        "stop_reason": (
+            "history_ledger_trade_history_complete"
+            if ledger_complete
+            else str(trades_page.get("stop_reason") or "")
+        ),
+        "record_count": len(merged_records),
+        "collection_mode": (
+            "history_ledger_merge"
+            if list(trades_page.get("records", []))
+            else "history_ledger"
+        ),
+        "source_section": "trades",
+        "history_scope": (
+            ledger_history_scope
+            if ledger_complete and ledger_history_scope
+            else str(trades_page.get("history_scope") or "aggregate")
+        ),
+        "ledger_used": True,
+        "ledger_backend": str(history_ledger_fallback.get("backend") or ""),
+        "ledger_trade_count": int(history_ledger_fallback.get("record_count", 0) or 0),
+        "range_start": (
+            (status if isinstance(status, Mapping) else {}).get("range_start")
+            if ledger_complete and ledger_history_scope == "screening_window"
+            else trades_page.get("range_start")
+        ),
+        "range_end": (
+            (status if isinstance(status, Mapping) else {}).get("range_end")
+            if ledger_complete and ledger_history_scope == "screening_window"
+            else trades_page.get("range_end")
+        ),
+    }
+
+
+def fetch_positions_page_with_accounting_fallback(
+    *,
+    client: PolymarketClient,
+    wallet: str,
+    config: dict[str, Any],
+    page_size: int,
+    max_offset: int,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    try:
+        positions_page = paginate_with_status(
+            page_size=page_size,
+            max_offset=max_offset,
+            fetch_page=lambda limit, offset: client.fetch_positions_page(
+                user=wallet,
+                limit=limit,
+                offset=offset,
+            ),
+        )
+    except RuntimeError as exc:
+        accounting_snapshot = fetch_accounting_snapshot_fallback(
+            client=client,
+            wallet=wallet,
+            config=config,
+        )
+        if accounting_snapshot is None:
+            raise exc
+        return (
+            build_positions_page_from_accounting_snapshot(
+                accounting_snapshot,
+                fallback_from=classify_initial_collection_stop_reason(exc)
+                or type(exc).__name__,
+            ),
+            accounting_snapshot,
+        )
+    if (
+        positions_page["complete"]
+        or positions_page["stop_reason"] not in RECOVERABLE_PAGINATION_STOP_REASONS
+    ):
+        return positions_page, None
+
+    accounting_snapshot = fetch_accounting_snapshot_fallback(
+        client=client,
+        wallet=wallet,
+        config=config,
+    )
+    if accounting_snapshot is None:
+        return positions_page, None
+    return (
+        build_positions_page_from_accounting_snapshot(
+            accounting_snapshot,
+            fallback_from=str(positions_page.get("stop_reason") or ""),
+        ),
+        accounting_snapshot,
+    )
+
+
+def fetch_accounting_snapshot_fallback(
+    *,
+    client: PolymarketClient,
+    wallet: str,
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not bool(config.get("analysis", {}).get("accounting_snapshot_fallback", True)):
+        return None
+    fetch_snapshot = getattr(client, "fetch_accounting_snapshot", None)
+    if not callable(fetch_snapshot):
+        return None
+    try:
+        snapshot = fetch_snapshot(user=wallet)
+    except Exception:
+        return None
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def build_positions_page_from_accounting_snapshot(
+    accounting_snapshot: Mapping[str, Any],
+    *,
+    fallback_from: str,
+) -> dict[str, Any]:
+    positions = [
+        {
+            **position,
+            "_source": "accounting_snapshot",
+            "_source_endpoint": "/v1/accounting/snapshot",
+        }
+        for position in accounting_snapshot.get("positions", [])
+        if isinstance(position, Mapping)
+    ]
+    return {
+        "records": positions,
+        "complete": True,
+        "stop_reason": "accounting_snapshot_fallback",
+        "page_count": 0,
+        "record_count": len(positions),
+        "last_offset": 0,
+        "next_offset": 0,
+        "collection_mode": "accounting_snapshot",
+        "source_section": "positions",
+        "source_endpoint": "/v1/accounting/snapshot",
+        "fallback_from": fallback_from,
+    }
+
+
+def history_provider_settings(config: Mapping[str, Any]) -> dict[str, Any]:
+    return history_provider_module.history_provider_settings(config)
+
+
+def history_provider_fetch_plan(
+    *,
+    config: Mapping[str, Any],
+    snapshot_scope: str,
+    trades_page: Mapping[str, Any],
+    activity_page: Mapping[str, Any],
+) -> dict[str, bool]:
+    return history_provider_module.history_provider_fetch_plan(
+        config=config,
+        snapshot_scope=snapshot_scope,
+        trades_page=trades_page,
+        activity_page=activity_page,
+    )
+
+
+def should_fetch_screening_history_provider_trades(
+    *,
+    config: Mapping[str, Any],
+    snapshot_scope: str,
+    trades_page: Mapping[str, Any],
+) -> bool:
+    return history_provider_module.should_fetch_screening_history_provider_trades(
+        config=config,
+        snapshot_scope=snapshot_scope,
+        trades_page=trades_page,
+    )
+
+
+def should_fetch_trade_probe_history_provider(config: Mapping[str, Any]) -> bool:
+    return history_provider_module.should_fetch_trade_probe_history_provider(config)
+
+
+def fetch_history_provider_bundle(
+    *,
+    client: PolymarketClient,
+    wallet: str,
+    config: Mapping[str, Any],
+    need_trade_history: bool = True,
+    need_operations: bool = True,
+) -> dict[str, Any]:
+    settings = history_provider_settings(config)
+    return history_provider_module.build_full_history_bundle(
+        settings=settings,
+        wallet=wallet,
+        need_trade_history=need_trade_history,
+        need_operations=need_operations,
+        fetch_order_fills=lambda **kwargs: fetch_graph_order_fills(client=client, **kwargs),
+        fetch_activity_operations=lambda **kwargs: fetch_graph_activity_operations(
+            client=client,
+            **kwargs,
+        ),
+        fetch_token_condition_lookup=lambda **kwargs: fetch_graph_token_condition_lookup(
+            client=client,
+            **kwargs,
+        ),
+        graph_order_fill_asset_id=graph_order_fill_asset_id,
+        convert_order_fills_to_trade_records=convert_graph_order_fills_to_trade_records,
+    )
+
+
+def fetch_screening_history_provider_bundle(
+    *,
+    client: PolymarketClient,
+    wallet: str,
+    config: Mapping[str, Any],
+    screening_mode: str,
+    window_bounds: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    settings = history_provider_settings(config)
+    page_size = min(
+        int(config.get("pagination", {}).get("page_size", settings["page_size"])),
+        int(settings["page_size"]),
+    )
+    now_epoch = int(resolve_analysis_now(dict(config)).timestamp())
+    return history_provider_module.build_screening_trade_bundle(
+        settings=settings,
+        wallet=wallet,
+        screening_mode=screening_mode,
+        window_bounds=window_bounds,
+        page_size=page_size,
+        now_epoch=now_epoch,
+        fetch_order_fills=lambda **kwargs: fetch_graph_order_fills(client=client, **kwargs),
+        fetch_token_condition_lookup=lambda **kwargs: fetch_graph_token_condition_lookup(
+            client=client,
+            **kwargs,
+        ),
+        graph_order_fill_asset_id=graph_order_fill_asset_id,
+        convert_order_fills_to_trade_records=convert_graph_order_fills_to_trade_records,
+    )
+
+
+def fetch_trade_probe_history_provider_records(
+    *,
+    client: PolymarketClient,
+    wallet: str,
+    config: Mapping[str, Any],
+    probe_limit: int,
+    window_bounds: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    settings = history_provider_settings(config)
+    return history_provider_module.build_trade_probe_records(
+        settings=settings,
+        wallet=wallet,
+        probe_limit=probe_limit,
+        window_bounds=window_bounds,
+        fetch_order_fills=lambda **kwargs: fetch_graph_order_fills(client=client, **kwargs),
+        fetch_token_condition_lookup=lambda **kwargs: fetch_graph_token_condition_lookup(
+            client=client,
+            **kwargs,
+        ),
+        graph_order_fill_asset_id=graph_order_fill_asset_id,
+        convert_order_fills_to_trade_records=convert_graph_order_fills_to_trade_records,
+    )
+
+
+def merge_trades_page_with_history_provider(
+    *,
+    trades_page: Mapping[str, Any],
+    history_provider: Mapping[str, Any],
+) -> dict[str, Any]:
+    return history_provider_module.merge_trades_page_with_history_provider(
+        trades_page=trades_page,
+        history_provider=history_provider,
+        dedupe_records=dedupe_collection_records,
+    )
+
+
+def fetch_graph_order_fills(
+    *,
+    client: PolymarketClient,
+    wallet: str,
+    settings: Mapping[str, Any],
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    page_size_override: int | None = None,
+    max_pages_override: int | None = None,
+) -> dict[str, Any]:
+    endpoint_url = str(settings.get("orderbook_url") or "")
+    page_size = int(page_size_override or settings.get("page_size", DEFAULT_HISTORY_PROVIDER_PAGE_SIZE))
+    max_pages = int(
+        max_pages_override or settings.get("max_pages_per_stream", DEFAULT_HISTORY_PROVIDER_MAX_PAGES)
+    )
+    max_offset = max(0, (max_pages - 1) * page_size)
+
+    def fetch_page(limit: int, offset: int, start: int | None, end: int | None) -> list[dict[str, Any]]:
+        if start is None and end is None:
+            query = """
+query WalletOrderFills($wallet: String!, $first: Int!, $skip: Int!) {
+  maker: orderFilledEvents(
+    first: $first
+    skip: $skip
+    orderBy: timestamp
+    orderDirection: desc
+    where: { maker: $wallet }
+  ) {
+    id
+    transactionHash
+    timestamp
+    maker
+    taker
+    makerAssetId
+    takerAssetId
+    makerAmountFilled
+    takerAmountFilled
+    fee
+  }
+  taker: orderFilledEvents(
+    first: $first
+    skip: $skip
+    orderBy: timestamp
+    orderDirection: desc
+    where: { taker: $wallet }
+  ) {
+    id
+    transactionHash
+    timestamp
+    maker
+    taker
+    makerAssetId
+    takerAssetId
+    makerAmountFilled
+    takerAmountFilled
+    fee
+  }
+}
+""".strip()
+        else:
+            query = """
+query WalletOrderFillsWindow(
+  $wallet: String!,
+  $first: Int!,
+  $skip: Int!,
+  $start: BigInt!,
+  $end: BigInt!
+) {
+  maker: orderFilledEvents(
+    first: $first
+    skip: $skip
+    orderBy: timestamp
+    orderDirection: desc
+    where: { maker: $wallet, timestamp_gte: $start, timestamp_lte: $end }
+  ) {
+    id
+    transactionHash
+    timestamp
+    maker
+    taker
+    makerAssetId
+    takerAssetId
+    makerAmountFilled
+    takerAmountFilled
+    fee
+  }
+  taker: orderFilledEvents(
+    first: $first
+    skip: $skip
+    orderBy: timestamp
+    orderDirection: desc
+    where: { taker: $wallet, timestamp_gte: $start, timestamp_lte: $end }
+  ) {
+    id
+    transactionHash
+    timestamp
+    maker
+    taker
+    makerAssetId
+    takerAssetId
+    makerAmountFilled
+    takerAmountFilled
+    fee
+  }
+}
+""".strip()
+        variables: dict[str, Any] = {
+            "wallet": normalize_address(wallet),
+            "first": limit,
+            "skip": offset,
+        }
+        if start is not None or end is not None:
+            variables["start"] = str(start or 0)
+            variables["end"] = str(end or current_partition_end_epoch())
+        payload = client.fetch_graphql(
+            endpoint_url=endpoint_url,
+            query=query,
+            variables=variables,
+        )
+        data = payload.get("data", {}) if isinstance(payload, Mapping) else {}
+        errors = payload.get("errors", []) if isinstance(payload, Mapping) else []
+        if errors:
+            raise RuntimeError("graphql_errors_present")
+        maker_records = [
+            {**dict(record), "_wallet_role": "maker"}
+            for record in data.get("maker", [])
+            if isinstance(record, Mapping)
+        ] if isinstance(data, Mapping) else []
+        taker_records = [
+            {**dict(record), "_wallet_role": "taker"}
+            for record in data.get("taker", [])
+            if isinstance(record, Mapping)
+        ] if isinstance(data, Mapping) else []
+        return dedupe_graph_history_records([*maker_records, *taker_records])
+
+    page = paginate_time_partitioned(
+        page_size=page_size,
+        max_offset=max_offset,
+        fetch_page=fetch_page,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
+    return {
+        **page,
+        "collection_mode": "graphql_history_provider",
+        "source_section": "order_fills",
+        "history_scope": "full_history",
+        "endpoint_url": endpoint_url,
+        "range_start": start_ts if start_ts is not None else page.get("range_start"),
+        "range_end": end_ts if end_ts is not None else page.get("range_end"),
+    }
+
+
+def skipped_provider_collection_page(section_name: str) -> dict[str, Any]:
+    return {
+        "records": [],
+        "complete": True,
+        "stop_reason": "not_requested",
+        "page_count": 0,
+        "record_count": 0,
+        "last_offset": 0,
+        "next_offset": 0,
+        "collection_mode": "skipped",
+        "source_section": section_name,
+        "history_scope": "full_history",
+    }
+
+
+def fetch_graph_token_condition_lookup(
+    *,
+    client: PolymarketClient,
+    token_ids: list[str],
+    settings: Mapping[str, Any],
+) -> dict[str, Any]:
+    endpoint_url = str(settings.get("positions_url") or "")
+    chunk_size = int(
+        settings.get("token_lookup_chunk_size", DEFAULT_HISTORY_PROVIDER_TOKEN_LOOKUP_CHUNK_SIZE)
+    )
+    normalized_token_ids = [token_id for token_id in token_ids if str(token_id).strip()]
+    if not normalized_token_ids:
+        return {
+            "records": [],
+            "complete": True,
+            "stop_reason": "no_token_ids",
+            "page_count": 0,
+            "record_count": 0,
+            "last_offset": 0,
+            "next_offset": 0,
+            "collection_mode": "graphql_token_lookup",
+            "source_section": "token_conditions",
+            "history_scope": "full_history",
+            "endpoint_url": endpoint_url,
+        }
+    query = """
+query TokenIdConditions($ids: [String!], $first: Int!) {
+  tokenIdConditions(first: $first, where: { id_in: $ids }) {
+    id
+    complement
+    outcomeIndex
+    condition {
+      id
+    }
+  }
+}
+""".strip()
+    records: list[dict[str, Any]] = []
+    page_count = 0
+    complete = True
+    stop_reason = "all_chunks_loaded"
+    for offset in range(0, len(normalized_token_ids), chunk_size):
+        chunk = normalized_token_ids[offset : offset + chunk_size]
+        try:
+            payload = client.fetch_graphql(
+                endpoint_url=endpoint_url,
+                query=query,
+                variables={
+                    "ids": chunk,
+                    "first": len(chunk),
+                },
+            )
+        except Exception as exc:
+            complete = False
+            stop_reason = f"request_error:{type(exc).__name__}"
+            break
+        page_count += 1
+        data = payload.get("data", {}) if isinstance(payload, Mapping) else {}
+        errors = payload.get("errors", []) if isinstance(payload, Mapping) else []
+        if isinstance(data, Mapping):
+            records.extend(
+                dict(record)
+                for record in data.get("tokenIdConditions", [])
+                if isinstance(record, Mapping)
+            )
+        if errors:
+            complete = False
+            stop_reason = "graphql_errors_present"
+            break
+    deduped = dedupe_graph_history_records(records)
+    return {
+        "records": deduped,
+        "complete": complete,
+        "stop_reason": stop_reason,
+        "page_count": page_count,
+        "record_count": len(deduped),
+        "last_offset": max(0, (page_count - 1) * chunk_size),
+        "next_offset": page_count * chunk_size,
+        "collection_mode": "graphql_token_lookup",
+        "source_section": "token_conditions",
+        "history_scope": "full_history",
+        "endpoint_url": endpoint_url,
+    }
+
+
+def fetch_graph_activity_operations(
+    *,
+    client: PolymarketClient,
+    wallet: str,
+    settings: Mapping[str, Any],
+) -> dict[str, Any]:
+    endpoint_url = str(settings.get("activity_url") or "")
+    stream_specs = (
+        {
+            "name": "splits",
+            "query": """
+query WalletSplits(
+  $wallet: String!,
+  $first: Int!,
+  $skip: Int!,
+  $start: BigInt!,
+  $end: BigInt!
+) {
+  splits(
+    first: $first
+    skip: $skip
+    orderBy: timestamp
+    orderDirection: desc
+    where: { stakeholder: $wallet, timestamp_gte: $start, timestamp_lte: $end }
+  ) {
+    id
+    timestamp
+    stakeholder
+    amount
+    condition {
+      id
+    }
+  }
+}
+""".strip(),
+            "operation_type": "SPLIT",
+        },
+        {
+            "name": "merges",
+            "query": """
+query WalletMerges(
+  $wallet: String!,
+  $first: Int!,
+  $skip: Int!,
+  $start: BigInt!,
+  $end: BigInt!
+) {
+  merges(
+    first: $first
+    skip: $skip
+    orderBy: timestamp
+    orderDirection: desc
+    where: { stakeholder: $wallet, timestamp_gte: $start, timestamp_lte: $end }
+  ) {
+    id
+    timestamp
+    stakeholder
+    amount
+    condition {
+      id
+    }
+  }
+}
+""".strip(),
+            "operation_type": "MERGE",
+        },
+        {
+            "name": "redemptions",
+            "query": """
+query WalletRedemptions(
+  $wallet: String!,
+  $first: Int!,
+  $skip: Int!,
+  $start: BigInt!,
+  $end: BigInt!
+) {
+  redemptions(
+    first: $first
+    skip: $skip
+    orderBy: timestamp
+    orderDirection: desc
+    where: { redeemer: $wallet, timestamp_gte: $start, timestamp_lte: $end }
+  ) {
+    id
+    timestamp
+    redeemer
+    payout
+    indexSets
+    condition {
+      id
+    }
+  }
+}
+""".strip(),
+            "operation_type": "REDEEM",
+        },
+        {
+            "name": "negRiskConversions",
+            "query": """
+query WalletNegRiskConversions(
+  $wallet: String!,
+  $first: Int!,
+  $skip: Int!,
+  $start: BigInt!,
+  $end: BigInt!
+) {
+  negRiskConversions(
+    first: $first
+    skip: $skip
+    orderBy: timestamp
+    orderDirection: desc
+    where: { stakeholder: $wallet, timestamp_gte: $start, timestamp_lte: $end }
+  ) {
+    id
+    timestamp
+    stakeholder
+    amount
+    indexSet
+    questionCount
+    negRiskMarketId
+  }
+}
+""".strip(),
+            "operation_type": "CONVERT",
+        },
+    )
+    records: list[dict[str, Any]] = []
+    page_count = 0
+    complete = True
+    stop_reason = "all_streams_loaded"
+    for spec in stream_specs:
+        stream_page = fetch_graph_activity_stream(
+            client=client,
+            wallet=wallet,
+            endpoint_url=endpoint_url,
+            query=str(spec["query"]),
+            root_field=str(spec["name"]),
+            page_size=int(settings.get("page_size", DEFAULT_HISTORY_PROVIDER_PAGE_SIZE)),
+            max_pages=int(
+                settings.get("max_pages_per_stream", DEFAULT_HISTORY_PROVIDER_MAX_PAGES)
+            ),
+        )
+        page_count += int(stream_page.get("page_count", 0))
+        records.extend(
+            convert_graph_activity_records(
+                raw_records=stream_page.get("records", []),
+                operation_type=str(spec["operation_type"]),
+                settings=settings,
+            )
+        )
+        if not bool(stream_page.get("complete", False)):
+            complete = False
+            if stop_reason == "all_streams_loaded":
+                stop_reason = f"{spec['name']}:{stream_page.get('stop_reason') or 'incomplete'}"
+    deduped = dedupe_graph_history_records(records)
+    return {
+        "records": deduped,
+        "complete": complete,
+        "stop_reason": stop_reason,
+        "page_count": page_count,
+        "record_count": len(deduped),
+        "last_offset": 0,
+        "next_offset": 0,
+        "collection_mode": "graphql_activity_provider",
+        "source_section": "activity_operations",
+        "history_scope": "full_history",
+        "endpoint_url": endpoint_url,
+    }
+
+
+def fetch_graph_activity_stream(
+    *,
+    client: PolymarketClient,
+    wallet: str,
+    endpoint_url: str,
+    query: str,
+    root_field: str,
+    page_size: int,
+    max_pages: int,
+) -> dict[str, Any]:
+    max_offset = max(0, (max_pages - 1) * page_size)
+
+    def fetch_page(limit: int, offset: int, start: int, end: int) -> list[dict[str, Any]]:
+        payload = client.fetch_graphql(
+            endpoint_url=endpoint_url,
+            query=query,
+            variables={
+                "wallet": normalize_address(wallet),
+                "first": limit,
+                "skip": offset,
+                "start": str(start),
+                "end": str(end),
+            },
+        )
+        data = payload.get("data", {}) if isinstance(payload, Mapping) else {}
+        errors = payload.get("errors", []) if isinstance(payload, Mapping) else []
+        if errors:
+            raise RuntimeError("graphql_errors_present")
+        return (
+            [
+                dict(record)
+                for record in data.get(root_field, [])
+                if isinstance(record, Mapping)
+            ]
+            if isinstance(data, Mapping)
+            else []
+        )
+
+    try:
+        page = paginate_time_partitioned(
+            page_size=page_size,
+            max_offset=max_offset,
+            fetch_page=fetch_page,
+        )
+    except Exception as exc:
+        page = {
+            "records": [],
+            "complete": False,
+            "stop_reason": f"request_error:{type(exc).__name__}",
+            "page_count": 0,
+            "record_count": 0,
+            "last_offset": 0,
+            "next_offset": 0,
+            "partitioned": False,
+            "partition_count": 0,
+        }
+    deduped = dedupe_graph_history_records(page.get("records", []))
+    return {
+        **page,
+        "records": deduped,
+        "record_count": len(deduped),
+        "collection_mode": "graphql_activity_stream",
+        "source_section": root_field,
+        "history_scope": "full_history",
+        "endpoint_url": endpoint_url,
+    }
+
+
+def convert_graph_activity_records(
+    *,
+    raw_records: Any,
+    operation_type: str,
+    settings: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for raw_record in raw_records if isinstance(raw_records, list) else []:
+        if not isinstance(raw_record, Mapping):
+            continue
+        condition_id = graph_condition_id(raw_record)
+        amount = scale_graph_amount(
+            raw_record.get("amount"),
+            decimals=int(settings.get("asset_decimals", DEFAULT_HISTORY_PROVIDER_ASSET_DECIMALS)),
+        )
+        payout = scale_graph_amount(
+            raw_record.get("payout"),
+            decimals=int(settings.get("asset_decimals", DEFAULT_HISTORY_PROVIDER_ASSET_DECIMALS)),
+        )
+        value = payout if payout > 0 else amount
+        title = condition_id or str(raw_record.get("negRiskMarketId") or "")
+        records.append(
+            {
+                "id": str(raw_record.get("id") or ""),
+                "type": operation_type,
+                "timestamp": int(to_float(raw_record.get("timestamp"))),
+                "transactionHash": str(raw_record.get("transactionHash") or raw_record.get("id") or ""),
+                "conditionId": condition_id,
+                "amount": amount,
+                "payout": payout,
+                "value": value,
+                "title": title,
+                "description": graph_activity_operation_description(
+                    operation_type=operation_type,
+                    condition_id=condition_id,
+                    raw_record=raw_record,
+                ),
+                "negRiskMarketId": str(raw_record.get("negRiskMarketId") or ""),
+                "_audit_source": "history_provider.activity",
+                "_verification": "provider",
+            }
+        )
+    return dedupe_graph_history_records(records)
+
+
+def graph_condition_id(record: Mapping[str, Any]) -> str:
+    condition = record.get("condition", {}) if isinstance(record.get("condition"), Mapping) else {}
+    return str(
+        condition.get("id")
+        or record.get("conditionId")
+        or record.get("condition_id")
+        or ""
+    ).strip()
+
+
+def graph_activity_operation_description(
+    *,
+    operation_type: str,
+    condition_id: str,
+    raw_record: Mapping[str, Any],
+) -> str:
+    market_ref = condition_id or str(raw_record.get("negRiskMarketId") or "").strip() or "unknown"
+    return f"{operation_type.lower()} {market_ref}".strip()
+
+
+def convert_graph_order_fills_to_trade_records(
+    *,
+    wallet: str,
+    fills: Any,
+    token_lookup_page: Mapping[str, Any],
+    settings: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    lookup = graph_token_condition_lookup_map(token_lookup_page)
+    trades = [
+        trade
+        for trade in (
+            convert_graph_order_fill_to_trade_record(
+                wallet=wallet,
+                fill=record,
+                token_lookup=lookup,
+                settings=settings,
+            )
+            for record in (fills if isinstance(fills, list) else [])
+        )
+        if trade is not None
+    ]
+    return dedupe_collection_records(trades)
+
+
+def convert_graph_order_fill_to_trade_record(
+    *,
+    wallet: str,
+    fill: Any,
+    token_lookup: Mapping[str, Mapping[str, Any]],
+    settings: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if not isinstance(fill, Mapping):
+        return None
+    wallet_address = normalize_address(wallet)
+    maker = normalize_address(fill.get("maker"))
+    taker = normalize_address(fill.get("taker"))
+    maker_asset_id = str(fill.get("makerAssetId") or "").strip()
+    taker_asset_id = str(fill.get("takerAssetId") or "").strip()
+    asset_decimals = int(settings.get("asset_decimals", DEFAULT_HISTORY_PROVIDER_ASSET_DECIMALS))
+    usdc_asset_id = str(settings.get("usdc_asset_id") or DEFAULT_HISTORY_PROVIDER_USDC_ASSET_ID)
+    maker_amount = scale_graph_amount(fill.get("makerAmountFilled"), decimals=asset_decimals)
+    taker_amount = scale_graph_amount(fill.get("takerAmountFilled"), decimals=asset_decimals)
+
+    side = ""
+    asset = ""
+    size = 0.0
+    usdc_size = 0.0
+    if maker == wallet_address:
+        if maker_asset_id == usdc_asset_id and taker_asset_id != usdc_asset_id:
+            side = "BUY"
+            asset = taker_asset_id
+            size = taker_amount
+            usdc_size = maker_amount
+        elif taker_asset_id == usdc_asset_id and maker_asset_id != usdc_asset_id:
+            side = "SELL"
+            asset = maker_asset_id
+            size = maker_amount
+            usdc_size = taker_amount
+    elif taker == wallet_address:
+        if maker_asset_id == usdc_asset_id and taker_asset_id != usdc_asset_id:
+            side = "SELL"
+            asset = taker_asset_id
+            size = taker_amount
+            usdc_size = maker_amount
+        elif taker_asset_id == usdc_asset_id and maker_asset_id != usdc_asset_id:
+            side = "BUY"
+            asset = maker_asset_id
+            size = maker_amount
+            usdc_size = taker_amount
+    if not side or not asset or size <= 0 or usdc_size <= 0:
+        return None
+
+    token_meta = token_lookup.get(asset, {})
+    condition = token_meta.get("conditionId") if isinstance(token_meta, Mapping) else ""
+    price = ratio(usdc_size, size)
+    return {
+        "id": str(fill.get("id") or ""),
+        "type": "TRADE",
+        "timestamp": int(to_float(fill.get("timestamp"))),
+        "transactionHash": str(fill.get("transactionHash") or fill.get("id") or ""),
+        "side": side,
+        "asset": asset,
+        "conditionId": str(condition or ""),
+        "size": size,
+        "usdcSize": usdc_size,
+        "price": price,
+        "fee": scale_graph_amount(fill.get("fee"), decimals=asset_decimals),
+        "_source": "history_provider",
+        "_source_provider": str(settings.get("source") or DEFAULT_HISTORY_PROVIDER_SOURCE),
+        "_audit_source": "history_provider.orderbook",
+        "_verification": "provider",
+    }
+
+
+def graph_order_fill_asset_id(fill: Mapping[str, Any], *, settings: Mapping[str, Any]) -> str:
+    maker_asset_id = str(fill.get("makerAssetId") or "").strip()
+    taker_asset_id = str(fill.get("takerAssetId") or "").strip()
+    usdc_asset_id = str(settings.get("usdc_asset_id") or DEFAULT_HISTORY_PROVIDER_USDC_ASSET_ID)
+    if maker_asset_id == usdc_asset_id and taker_asset_id != usdc_asset_id:
+        return taker_asset_id
+    if taker_asset_id == usdc_asset_id and maker_asset_id != usdc_asset_id:
+        return maker_asset_id
+    return ""
+
+
+def graph_token_condition_lookup_map(
+    token_lookup_page: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    for record in token_lookup_page.get("records", []) if isinstance(token_lookup_page, Mapping) else []:
+        if not isinstance(record, Mapping):
+            continue
+        token_id = str(record.get("id") or "").strip()
+        condition = record.get("condition", {}) if isinstance(record.get("condition"), Mapping) else {}
+        if not token_id:
+            continue
+        lookup[token_id] = {
+            "conditionId": str(condition.get("id") or ""),
+            "complement": bool(record.get("complement", False)),
+            "outcomeIndex": decode_int(record.get("outcomeIndex")),
+        }
+    return lookup
+
+
+def dedupe_graph_history_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        record_id = str(record.get("id") or "").strip()
+        if record_id:
+            deduped[record_id] = dict(record)
+    if deduped:
+        values = deduped.values()
+    else:
+        values = (dict(record) for record in records if isinstance(record, Mapping))
+    return sorted(
+        values,
+        key=lambda record: (
+            to_float(record.get("timestamp")),
+            str(record.get("transactionHash") or record.get("id") or ""),
+        ),
+        reverse=True,
+    )
+
+
+def scale_graph_amount(value: Any, *, decimals: int) -> float:
+    raw = decode_int(value)
+    if raw <= 0:
+        return 0.0
+    return raw / (10**decimals)
 
 
 def fetch_optional_chain_validation(
@@ -884,7 +2363,7 @@ def decode_int(value: Any) -> int:
 
 
 def wallet_history_registry_dir(output_dir: Path) -> Path:
-    return output_dir.parent / HISTORY_REGISTRY_DIRNAME
+    return history_registry_module.wallet_history_registry_dir(output_dir.parent)
 
 
 def is_smart_wallet_library_mode(config: Mapping[str, Any]) -> bool:
@@ -915,6 +2394,8 @@ def resolve_history_run_id(config: dict[str, Any], output_dir: Path) -> str:
 
 
 def wallet_history_record_path(history_registry_dir: Path | None, wallet: str) -> Path | None:
+    if isinstance(history_registry_dir, history_registry_module.HistoryRegistry):
+        return history_registry_dir.record_path(wallet)
     normalized_wallet = normalize_address(wallet)
     if history_registry_dir is None or not normalized_wallet:
         return None
@@ -922,6 +2403,8 @@ def wallet_history_record_path(history_registry_dir: Path | None, wallet: str) -
 
 
 def wallet_is_in_history_registry(history_registry_dir: Path | None, wallet: str) -> bool:
+    if isinstance(history_registry_dir, history_registry_module.HistoryRegistry):
+        return history_registry_dir.contains(wallet)
     record_path = wallet_history_record_path(history_registry_dir, wallet)
     return bool(record_path and record_path.exists())
 
@@ -942,34 +2425,40 @@ def write_wallet_history_record(
     run_id: str,
     status: str,
 ) -> dict[str, Any] | None:
+    if isinstance(history_registry_dir, history_registry_module.HistoryRegistry):
+        return history_registry_dir.upsert(
+            wallet=wallet,
+            leaderboard_entry=leaderboard_entry,
+            run_id=run_id,
+            status=status,
+        )
     record_path = wallet_history_record_path(history_registry_dir, wallet)
     normalized_wallet = normalize_address(wallet)
     if record_path is None or not normalized_wallet:
         return None
 
+    existing = read_json_file(record_path) if record_path.exists() else {}
     timestamp = datetime.now(UTC).isoformat(timespec="seconds")
-    with HISTORY_REGISTRY_LOCK:
-        existing = read_json_file(record_path) if record_path.exists() else {}
-        last_run_id = str(existing.get("last_run_id") or "").strip()
-        run_count = decode_int(existing.get("run_count"))
-        if last_run_id != run_id:
-            run_count += 1
+    last_run_id = str(existing.get("last_run_id") or "").strip()
+    run_count = decode_int(existing.get("run_count"))
+    if last_run_id != run_id:
+        run_count += 1
 
-        record = {
-            "wallet_address": normalized_wallet,
-            "user_name": str(
-                leaderboard_entry.get("userName") or existing.get("user_name") or ""
-            ),
-            "x_username": str(
-                leaderboard_entry.get("xUsername") or existing.get("x_username") or ""
-            ),
-            "first_seen_at": str(existing.get("first_seen_at") or timestamp),
-            "last_seen_at": timestamp,
-            "run_count": run_count,
-            "last_run_id": run_id,
-            "last_status": status,
-        }
-        write_json(record_path, record)
+    record = {
+        "wallet_address": normalized_wallet,
+        "user_name": str(
+            leaderboard_entry.get("userName") or existing.get("user_name") or ""
+        ),
+        "x_username": str(
+            leaderboard_entry.get("xUsername") or existing.get("x_username") or ""
+        ),
+        "first_seen_at": str(existing.get("first_seen_at") or timestamp),
+        "last_seen_at": timestamp,
+        "run_count": run_count,
+        "last_run_id": run_id,
+        "last_status": status,
+    }
+    write_json(record_path, record)
     return record
 
 
@@ -977,11 +2466,24 @@ def split_leaderboard_prefilter_candidates(
     leaderboard_entries: list[dict[str, Any]],
     config: dict[str, Any],
     history_registry_dir: Path | None = None,
+    seen_wallets: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     candidates: list[dict[str, Any]] = []
     screening_records: list[dict[str, Any]] = []
+    dedupe_set = seen_wallets if seen_wallets is not None else set()
     for entry in leaderboard_entries:
         wallet = normalize_address(entry.get("proxyWallet", ""))
+        if wallet in dedupe_set:
+            screening_records.append(
+                prefilter_screening_record(
+                    wallet,
+                    entry,
+                    reasons=["duplicate wallet in leaderboard"],
+                    stage="leaderboard",
+                )
+            )
+            continue
+        dedupe_set.add(wallet)
         screening = build_leaderboard_prefilter_record(
             wallet,
             entry,
@@ -1015,6 +2517,51 @@ def screening_trade_window_start(
     if time_period == "WEEK":
         return (now or resolve_analysis_now(config)) - timedelta(days=7)
     return None
+
+
+def screening_trade_window_bounds(
+    config: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> tuple[int, int] | None:
+    current = (now or resolve_analysis_now(config)).astimezone(UTC)
+    window_start = screening_trade_window_start(config, now=current)
+    if window_start is None:
+        return None
+    return max(0, int(window_start.timestamp())), int(current.timestamp())
+
+
+def should_collect_screening_window_first(config: Mapping[str, Any]) -> bool:
+    if is_smart_wallet_library_mode(config):
+        return bool(
+            config.get("analysis", {}).get("smart_wallet_screening_window_first", False)
+        )
+    return bool(config.get("analysis", {}).get("screening_window_first", True))
+
+
+def screening_snapshot_mode(config: Mapping[str, Any]) -> str:
+    analysis_settings = config.get("analysis", {})
+    if is_smart_wallet_library_mode(config):
+        if bool(analysis_settings.get("smart_wallet_screening_snapshot_enabled", True)):
+            return "recent_activity"
+        return ""
+    if not bool(analysis_settings.get("screening_snapshot_enabled", True)):
+        return ""
+    if should_collect_screening_window_first(config) and screening_trade_window_bounds(
+        dict(config)
+    ) is not None:
+        return "screening_window"
+    return ""
+
+
+def should_use_screening_snapshot(config: Mapping[str, Any]) -> bool:
+    return bool(screening_snapshot_mode(config))
+
+
+def should_hydrate_selected_wallet_full_history(config: Mapping[str, Any]) -> bool:
+    if screening_snapshot_mode(config) != "screening_window":
+        return False
+    return bool(config.get("analysis", {}).get("hydrate_selected_wallet_full_history", True))
 
 
 def trades_in_screening_window(
@@ -1125,12 +2672,6 @@ def probe_wallet_trade_window(
     if wallet in include_wallets:
         return {"prefetched_trades": None, "trade_probe_fetched": False}
 
-    # When trade-count screening follows the leaderboard period, the first-page
-    # probe can no longer safely stand in for lifetime trade history. Fall back
-    # to the full snapshot so day/week filters stay accurate.
-    if screening_trade_window_start(config) is not None:
-        return {"prefetched_trades": None, "trade_probe_fetched": False}
-
     min_traded_count = int(filter_config.get("min_traded_count", 0) or 0)
     raw_max_traded_count = filter_config.get("max_traded_count")
     if raw_max_traded_count in (None, "") and min_traded_count <= 0:
@@ -1139,7 +2680,53 @@ def probe_wallet_trade_window(
     page_size = max(1, int(config["pagination"]["page_size"]))
     max_traded_count = None if raw_max_traded_count in (None, "") else int(raw_max_traded_count)
     probe_limit = page_size if max_traded_count is None else min(page_size, max_traded_count + 1)
-    trades = client.fetch_trades_page(user=wallet, limit=probe_limit, offset=0)
+    window_bounds = screening_trade_window_bounds(config)
+    ledger_store = history_ledger_store(config)
+    probe_complete = False
+    live_probe_failed = False
+    try:
+        if window_bounds is None:
+            trades = client.fetch_trades_page(user=wallet, limit=probe_limit, offset=0)
+        else:
+            trades = client.fetch_activity_page(
+                user=wallet,
+                limit=probe_limit,
+                offset=0,
+                activity_type="TRADE",
+                start=window_bounds[0],
+                end=window_bounds[1],
+            )
+        probe_complete = probe_limit < page_size or len(trades) < probe_limit
+    except (PolymarketRequestError, HTTPError, URLError, TimeoutError, RuntimeError):
+        live_probe_failed = True
+        if not should_fetch_trade_probe_history_provider(config):
+            return {"prefetched_trades": None, "trade_probe_fetched": False}
+        try:
+            provider_probe = fetch_trade_probe_history_provider_records(
+                client=client,
+                wallet=wallet,
+                config=config,
+                probe_limit=probe_limit,
+                window_bounds=window_bounds,
+            )
+        except Exception:
+            provider_probe = {}
+        trades = list(provider_probe.get("records", []))
+        probe_complete = bool(provider_probe.get("complete", False))
+    if not probe_complete:
+        ledger_probe = load_history_ledger_trade_fallback(
+            ledger_store=ledger_store,
+            wallet=wallet,
+            snapshot_scope="screening" if window_bounds is not None else "full",
+            screening_mode="screening_window" if window_bounds is not None else "",
+            window_bounds=window_bounds,
+            limit=probe_limit,
+        )
+        if ledger_probe is not None:
+            trades = list(ledger_probe.get("records", []))
+            probe_complete = bool(ledger_probe.get("complete", False))
+    if live_probe_failed and not probe_complete and not list(locals().get("trades", [])):
+        return {"prefetched_trades": None, "trade_probe_fetched": False}
     trade_count = len(trades)
 
     if max_traded_count is not None and trade_count > max_traded_count:
@@ -1154,8 +2741,7 @@ def probe_wallet_trade_window(
             "trade_probe_fetched": True,
         }
 
-    is_complete = probe_limit < page_size or trade_count < probe_limit
-    if is_complete and trade_count < min_traded_count:
+    if probe_complete and trade_count < min_traded_count:
         return {
             "screening": prefilter_screening_record(
                 wallet,
@@ -1168,7 +2754,7 @@ def probe_wallet_trade_window(
         }
 
     return {
-        "prefetched_trades": trades if is_complete else None,
+        "prefetched_trades": trades if probe_complete else None,
         "trade_probe_fetched": True,
     }
 
@@ -1250,6 +2836,7 @@ def analyze_leaderboard_entry(
     wallet = normalize_address(leaderboard_entry.get("proxyWallet", ""))
     trade_probe_fetched = False
     snapshot_fetched = False
+    screening_snapshot_used = False
     try:
         trade_probe = probe_wallet_trade_window(client, wallet, leaderboard_entry, config)
         trade_probe_fetched = bool(trade_probe.get("trade_probe_fetched"))
@@ -1264,10 +2851,12 @@ def analyze_leaderboard_entry(
                 )
             return {"wallet": wallet, "screening": trade_probe["screening"]}
 
+        screening_snapshot_used = should_use_screening_snapshot(config)
         snapshot = fetch_wallet_snapshot(
             client,
             wallet,
             config,
+            snapshot_scope="screening" if screening_snapshot_used else "full",
             prefetched_trades=trade_probe.get("prefetched_trades"),
         )
         snapshot_fetched = True
@@ -1278,6 +2867,47 @@ def analyze_leaderboard_entry(
             weather_index=weather_index,
             config=config,
         )
+        if (
+            screening_snapshot_used
+            and wallet_result["screening"]["selected"]
+            and should_hydrate_selected_wallet_full_history(config)
+        ):
+            try:
+                full_snapshot = fetch_wallet_snapshot(
+                    client,
+                    wallet,
+                    config,
+                    snapshot_scope="full",
+                )
+                wallet_result = analyze_wallet(
+                    wallet=wallet,
+                    leaderboard_entry=leaderboard_entry,
+                    snapshot=full_snapshot,
+                    weather_index=weather_index,
+                    config=config,
+                )
+                wallet_result["deep_hydration"] = {
+                    "status": "completed",
+                    "snapshot_scope": "full",
+                }
+            except Exception as hydration_exc:
+                wallet_result["deep_hydration"] = {
+                    "status": "failed",
+                    "reason": str(hydration_exc),
+                    "error": build_analysis_error_record(wallet, hydration_exc),
+                }
+        elif screening_snapshot_used:
+            wallet_result["deep_hydration"] = (
+                {
+                    "status": "skipped",
+                    "reason": "full_hydration_not_required",
+                }
+                if wallet_result["screening"]["selected"]
+                else {
+                    "status": "skipped",
+                    "reason": "screened_out",
+                }
+            )
         if trade_probe_fetched or snapshot_fetched:
             write_wallet_history_record(
                 history_registry_dir=history_registry_dir,
@@ -1288,6 +2918,29 @@ def analyze_leaderboard_entry(
             )
         return {"wallet": wallet, "wallet_result": wallet_result}
     except Exception as exc:
+        archived_wallet_result = cloud_archive_module.load_latest_wallet_analysis(
+            wallet,
+            config=config,
+        )
+        if isinstance(archived_wallet_result, Mapping):
+            wallet_result = dict(archived_wallet_result)
+            cloud_fallback = dict(wallet_result.get("cloud_fallback") or {})
+            cloud_fallback.update(
+                {
+                    "status": "used_due_to_analysis_error",
+                    "reason": str(exc),
+                    "error_type": type(exc).__name__,
+                }
+            )
+            wallet_result["cloud_fallback"] = cloud_fallback
+            write_wallet_history_record(
+                history_registry_dir=history_registry_dir,
+                wallet=wallet,
+                leaderboard_entry=leaderboard_entry,
+                run_id=history_run_id,
+                status="cloud_fallback_used",
+            )
+            return {"wallet": wallet, "wallet_result": wallet_result}
         if trade_probe_fetched or snapshot_fetched:
             write_wallet_history_record(
                 history_registry_dir=history_registry_dir,
@@ -1296,7 +2949,47 @@ def analyze_leaderboard_entry(
                 run_id=history_run_id,
                 status="analysis_error",
             )
-        return {"wallet": wallet, "error": str(exc)}
+        return {"wallet": wallet, "error": build_analysis_error_record(wallet, exc)}
+
+
+def build_analysis_error_record(wallet: str, exc: Exception) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "wallet": wallet,
+        "error": str(exc),
+        "type": type(exc).__name__,
+    }
+    if isinstance(exc, PolymarketRequestError):
+        payload["endpoint"] = exc.path
+        payload["url"] = exc.url
+        payload["status_code"] = exc.status_code
+        payload["reason"] = exc.reason
+        payload["retryable"] = exc.retryable
+        payload["attempts"] = exc.attempts
+        offset = query_param_int(exc.params, "offset")
+        if offset is not None:
+            payload["offset"] = offset
+        limit = query_param_int(exc.params, "limit")
+        if limit is not None:
+            payload["limit"] = limit
+        section = str(exc.path or "").strip("/").split("/", 1)[0]
+        if section:
+            payload["section"] = section
+        return payload
+
+    cause = exc.__cause__
+    if isinstance(cause, HTTPError):
+        payload["status_code"] = cause.code
+        payload["reason"] = str(getattr(cause, "reason", "") or getattr(cause, "msg", "")).strip()
+        parsed = urllib.parse.urlparse(cause.url)
+        payload["endpoint"] = parsed.path
+        offset = query_param_int(urllib.parse.parse_qs(parsed.query), "offset")
+        if offset is not None:
+            payload["offset"] = offset
+    elif isinstance(cause, URLError):
+        payload["reason"] = str(cause.reason).strip()
+    elif isinstance(cause, TimeoutError):
+        payload["reason"] = str(cause).strip()
+    return payload
 
 
 def analyze_wallet(
@@ -1385,6 +3078,8 @@ def analyze_wallet(
         "final_settlement_profit": metrics["final_settlement_profit"],
         "unified_profit": metrics["unified_profit"],
         "audit_complete": metrics["snapshot_complete"],
+        "screening_evidence_complete": metrics.get("screening_evidence_complete"),
+        "history_scope": metrics.get("history_scope"),
         "labels": [label["display_name"] for label in labels],
         "selected": screening["selected"],
         "reasons": screening["reasons"],
@@ -1555,11 +3250,18 @@ def sync_selection_record_finder_ai_fields(
 ) -> dict[str, Any]:
     result = dict(selection_record) if isinstance(selection_record, Mapping) else {}
     payload = dict(finder_ai) if isinstance(finder_ai, Mapping) else {}
+    brief_generation = (
+        payload.get("briefGeneration")
+        if isinstance(payload.get("briefGeneration"), Mapping)
+        else {}
+    )
     result["ai_strategy_focus"] = str(payload.get("strategyFocus") or "").strip()
     result["ai_brief_short"] = str(payload.get("aiBriefShort") or "").strip()
     result["ai_needs_review"] = bool(payload.get("needsReview"))
     result["ai_has_conflict"] = bool(payload.get("hasConflict"))
     result["ai_evidence_level"] = str(payload.get("evidenceLevel") or "").strip()
+    result["ai_generation_status"] = str(brief_generation.get("status") or "").strip()
+    result["ai_generation_reason"] = str(brief_generation.get("reason") or "").strip()
     return result
 
 
@@ -1823,6 +3525,11 @@ def compute_metrics(
         trades=trades,
         activity=activity,
         closed_positions=closed_positions,
+        provider_operations=(
+            (snapshot.get("history_provider") or {}).get("operation_records", [])
+            if isinstance(snapshot.get("history_provider"), Mapping)
+            else []
+        ),
         chain_validation=chain_validation,
         collection_status=collection_status,
     )
@@ -1831,7 +3538,18 @@ def compute_metrics(
         settlement_records=closed_positions,
     )
     snapshot_complete = bool(operation_audit.get("complete", True))
+    if (
+        collection_status_has_history_scope(collection_status, "screening_window")
+        or collection_status_has_history_scope(collection_status, "recent_activity")
+    ):
+        snapshot_complete = False
     now = resolve_analysis_now(config)
+    screening_evidence_status = summarize_screening_evidence_status(
+        collection_status,
+        config,
+        now=now,
+        snapshot_complete=snapshot_complete,
+    )
     screening_trades = trades_in_screening_window(trades, config, now=now)
     screening_trade_notionals = [record_notional(record) for record in screening_trades]
     screening_total_trade_notional = sum(screening_trade_notionals)
@@ -2108,6 +3826,9 @@ def compute_metrics(
         "hidden_new_wallet_matched": wallet_age_summary["matched_hidden_new_wallet"],
         "snapshot_collection_status": collection_status,
         "snapshot_complete": snapshot_complete,
+        "screening_evidence_complete": bool(screening_evidence_status.get("complete")),
+        "screening_evidence_status": screening_evidence_status,
+        "history_scope": str(screening_evidence_status.get("history_scope") or ""),
         "operation_audit": operation_audit,
         "audit_profit_summary": audit_profit_summary,
         "trade_liquidity_profit": audit_profit_summary["trade_liquidity_profit"],
@@ -2259,6 +3980,7 @@ def build_finder_ai_run_summary(wallet_results: list[dict[str, Any]]) -> dict[st
         "eligible": 0,
         "generated": 0,
         "cached": 0,
+        "fallback": 0,
         "failed": 0,
         "skipped": 0,
         "needs_review": 0,
@@ -2287,6 +4009,8 @@ def build_finder_ai_run_summary(wallet_results: list[dict[str, Any]]) -> dict[st
             summary["generated"] += 1
         elif status == "cached":
             summary["cached"] += 1
+        elif status == "fallback":
+            summary["fallback"] += 1
         elif status == "failed":
             summary["failed"] += 1
         else:
@@ -2323,12 +4047,14 @@ def build_operation_audit(
     trades: list[dict[str, Any]],
     activity: list[dict[str, Any]],
     closed_positions: list[dict[str, Any]],
+    provider_operations: list[dict[str, Any]] | None = None,
     chain_validation: dict[str, Any],
     collection_status: Mapping[str, Any],
 ) -> dict[str, Any]:
     trade_records = normalize_trade_audit_records(trades)
     settlement_records = normalize_closed_position_audit_records(closed_positions)
     activity_records = normalize_activity_operation_records(activity)
+    provider_activity_records = normalize_activity_operation_records(provider_operations or [])
     chain_records = normalize_chain_operation_records(chain_validation)
     profit_summary = summarize_audit_profit(
         liquidity_records=trades,
@@ -2341,18 +4067,21 @@ def build_operation_audit(
             chain_bucket=chain_operations.get(key, {}) if isinstance(chain_operations, Mapping) else {},
             records=[
                 record
-                for record in [*activity_records, *settlement_records]
+                for record in [*activity_records, *provider_activity_records, *settlement_records]
                 if str(record.get("operation", "")).lower() == key
             ],
         )
         for key in OPERATION_KEYS
     }
-    records = [*trade_records, *settlement_records, *activity_records, *chain_records]
+    records = [
+        *trade_records,
+        *settlement_records,
+        *activity_records,
+        *provider_activity_records,
+        *chain_records,
+    ]
     records.sort(key=audit_record_sort_key, reverse=True)
-    complete = all(
-        bool((status if isinstance(status, Mapping) else {}).get("complete", True))
-        for status in collection_status.values()
-    )
+    complete = operation_audit_collection_complete(collection_status)
     complete = complete and bool(chain_validation.get("logs_complete", True))
     complete = complete and bool(chain_validation.get("transaction_history_complete", True))
     return {
@@ -2366,6 +4095,43 @@ def build_operation_audit(
     }
 
 
+def operation_audit_collection_complete(collection_status: Mapping[str, Any]) -> bool:
+    activity_status = (
+        collection_status.get("activity", {})
+        if isinstance(collection_status.get("activity", {}), Mapping)
+        else {}
+    )
+    trades_status = (
+        collection_status.get("trades", {})
+        if isinstance(collection_status.get("trades", {}), Mapping)
+        else {}
+    )
+    provider_status = (
+        collection_status.get("history_provider", {})
+        if isinstance(collection_status.get("history_provider", {}), Mapping)
+        else {}
+    )
+    ledger_operations_status = (
+        collection_status.get("history_ledger_operations", {})
+        if isinstance(collection_status.get("history_ledger_operations", {}), Mapping)
+        else {}
+    )
+    activity_complete = bool(activity_status.get("complete", True)) or bool(
+        provider_status.get("operations_complete", False)
+    ) or bool(
+        ledger_operations_status.get("operations_complete", False)
+    )
+    trades_complete = bool(trades_status.get("complete", True)) or bool(
+        provider_status.get("trades_complete", False)
+    )
+    other_complete = all(
+        bool((status if isinstance(status, Mapping) else {}).get("complete", True))
+        for key, status in collection_status.items()
+        if key not in {"activity", "trades", "history_provider"}
+    )
+    return activity_complete and trades_complete and other_complete
+
+
 def normalize_trade_audit_records(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for trade in trades:
@@ -2377,8 +4143,8 @@ def normalize_trade_audit_records(trades: list[dict[str, Any]]) -> list[dict[str
             {
                 "operation": "trade",
                 "audit_bucket": "trade_liquidity",
-                "verification": "app",
-                "source": "trades",
+                "verification": str(trade.get("_verification") or "app"),
+                "source": str(trade.get("_audit_source") or "trades"),
                 "timestamp": timestamp,
                 "date": trade_dt.date().isoformat() if trade_dt else "",
                 "transaction_hash": first_non_empty_value(
@@ -2446,11 +4212,15 @@ def normalize_activity_operation_records(activity: list[dict[str, Any]]) -> list
         )
         parsed = parse_metric_datetime(raw_timestamp)
         amount = record_notional(record)
+        if amount <= 0:
+            amount = to_float(
+                first_non_empty_value(record, ("amount", "payout", "value", "notional"))
+            )
         row = {
             "operation": operation,
             "audit_bucket": "trade_liquidity" if operation == "swap" else "final_settlement",
-            "verification": "app",
-            "source": "activity",
+            "verification": str(record.get("_verification") or "app"),
+            "source": str(record.get("_audit_source") or "activity"),
             "timestamp": parsed.timestamp() if parsed else 0.0,
             "date": parsed.date().isoformat() if parsed else "",
             "transaction_hash": first_non_empty_value(
@@ -2489,7 +4259,15 @@ def infer_activity_operation(record: Mapping[str, Any]) -> str:
         str(
             first_non_empty_value(
                 record,
-                ("type", "activityType", "activity_type", "description", "title", "verb"),
+                (
+                    "operation",
+                    "type",
+                    "activityType",
+                    "activity_type",
+                    "description",
+                    "title",
+                    "verb",
+                ),
             )
             or ""
         ).lower().replace("_", " ").replace("-", " ").split()
@@ -2679,6 +4457,79 @@ def split_position_average_cost_summary(
     }
 
 
+def collection_status_covers_window(
+    status: Any,
+    *,
+    start_ts: int,
+    end_ts: int,
+) -> bool:
+    if not isinstance(status, Mapping) or not bool(status.get("complete", True)):
+        return False
+    scope = str(status.get("history_scope") or "aggregate").strip().lower()
+    if scope in {"aggregate", "full_history", "lifetime"} and status.get("range_start") in (None, ""):
+        return True
+    try:
+        range_start = int(status.get("range_start"))
+        range_end = int(status.get("range_end"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        range_start <= start_ts
+        and range_end + SCREENING_WINDOW_END_TOLERANCE_SECONDS >= end_ts
+    )
+
+
+def summarize_screening_evidence_status(
+    collection_status: Mapping[str, Any],
+    config: dict[str, Any],
+    *,
+    now: datetime,
+    snapshot_complete: bool,
+) -> dict[str, Any]:
+    if collection_status_has_history_scope(collection_status, "recent_activity"):
+        trades_status = collection_status.get("trades", {})
+        return {
+            "complete": bool((trades_status if isinstance(trades_status, Mapping) else {}).get("complete", False)),
+            "history_scope": "recent_activity",
+            "reason": "recent_activity_complete",
+            "trade_source": str((trades_status if isinstance(trades_status, Mapping) else {}).get("collection_mode") or ""),
+        }
+    window_bounds = screening_trade_window_bounds(config, now=now)
+    if window_bounds is None:
+        return {
+            "complete": snapshot_complete,
+            "history_scope": "full_history",
+            "reason": "full_history_required",
+        }
+
+    start_ts, end_ts = window_bounds
+    trades_status = collection_status.get("trades", {})
+    complete = collection_status_covers_window(
+        trades_status,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
+    return {
+        "complete": complete,
+        "history_scope": "screening_window",
+        "range_start": start_ts,
+        "range_end": end_ts,
+        "reason": "screening_window_complete" if complete else "screening_window_incomplete",
+        "trade_source": str((trades_status if isinstance(trades_status, Mapping) else {}).get("collection_mode") or ""),
+    }
+
+
+def collection_status_has_history_scope(
+    collection_status: Mapping[str, Any],
+    scope: str,
+) -> bool:
+    for key in ("activity", "trades"):
+        status = collection_status.get(key, {})
+        if isinstance(status, Mapping) and str(status.get("history_scope") or "").lower() == scope:
+            return True
+    return False
+
+
 def build_screening_record(
     wallet: str,
     leaderboard_entry: dict[str, Any],
@@ -2687,6 +4538,10 @@ def build_screening_record(
 ) -> dict[str, Any]:
     filter_config = config["wallet_filter"]
     normalized_wallet = normalize_address(wallet)
+    snapshot_complete = bool(metrics.get("snapshot_complete", True))
+    screening_evidence_complete = bool(
+        metrics.get("screening_evidence_complete", snapshot_complete)
+    )
     screening_trade_count = int(metrics.get("screening_trade_count", metrics["trade_count"]) or 0)
     screening_weather_trade_count = int(
         metrics.get("screening_weather_trade_count", metrics["weather_trade_count"]) or 0
@@ -2714,6 +4569,16 @@ def build_screening_record(
             reasons.append("wallet in exclude list")
         elif normalized_wallet in include_wallets:
             reasons.append("wallet in include list")
+            if not snapshot_complete and not screening_evidence_complete:
+                selected = False
+                reasons.append("failed:snapshot_complete")
+            elif not snapshot_complete:
+                reasons.append("partial_snapshot:screening_evidence_complete")
+        elif not snapshot_complete and not screening_evidence_complete:
+            selected = False
+            reasons.append("failed:snapshot_complete")
+        elif not snapshot_complete:
+            reasons.append("partial_snapshot:screening_evidence_complete")
         elif activity_filter_mode == "normal_active":
             if str(metrics.get("activity_level") or "").strip().lower() == "normal_active":
                 reasons.append("activity_level==normal_active")
@@ -2748,6 +4613,14 @@ def build_screening_record(
         reasons.append("wallet in exclude list")
     elif normalized_wallet in include_wallets:
         reasons.append("wallet in include list")
+        if not snapshot_complete and not screening_evidence_complete:
+            selected = False
+            reasons.append("failed:snapshot_complete")
+        elif not snapshot_complete:
+            reasons.append("partial_snapshot:screening_window_complete")
+    elif not snapshot_complete and not screening_evidence_complete:
+        selected = False
+        reasons.append("failed:snapshot_complete")
     else:
         checks = [
             (
@@ -2839,6 +4712,8 @@ def build_screening_record(
             selected = False
             reasons.extend(f"failed:{label}" for label in failed)
         else:
+            if not snapshot_complete:
+                reasons.append("partial_snapshot:screening_window_complete")
             reasons.append("passed all numeric filters")
 
     return {
@@ -3201,6 +5076,506 @@ def paginate(
     )["records"]
 
 
+def fetch_collection_page_with_recovery(
+    *,
+    page_size: int,
+    max_offset: int,
+    section_name: str,
+    fetch_aggregate_page: Callable[[int, int], list[dict[str, Any]]],
+    fetch_partition_page: Callable[[int, int, int, int], list[dict[str, Any]]],
+) -> dict[str, Any]:
+    try:
+        aggregate_page = paginate_with_status(
+            page_size=page_size,
+            max_offset=max_offset,
+            fetch_page=fetch_aggregate_page,
+        )
+    except RuntimeError as exc:
+        initial_stop_reason = classify_initial_collection_stop_reason(exc)
+        if initial_stop_reason is None:
+            raise
+        partitioned_page = paginate_time_partitioned(
+            page_size=page_size,
+            max_offset=max_offset,
+            fetch_page=fetch_partition_page,
+        )
+        if partitioned_page["record_count"] <= 0 and not bool(partitioned_page.get("complete", False)):
+            raise exc
+        return {
+            **partitioned_page,
+            "collection_mode": "partition_recovery",
+            "source_section": section_name,
+            "partitioned": True,
+            "partition_attempted": True,
+            "partition_stop_reason": str(partitioned_page.get("stop_reason") or ""),
+            "recovered_from": initial_stop_reason,
+            "initial_request_failed": True,
+            "initial_request_error": str(exc),
+        }
+    if aggregate_page["complete"] or aggregate_page["stop_reason"] not in RECOVERABLE_PAGINATION_STOP_REASONS:
+        aggregate_page["collection_mode"] = "aggregate"
+        aggregate_page["source_section"] = section_name
+        aggregate_page["partitioned"] = False
+        return aggregate_page
+
+    partitioned_page = build_partition_recovery_page(
+        aggregate_page=aggregate_page,
+        page_size=page_size,
+        max_offset=max_offset,
+        fetch_page=fetch_partition_page,
+    )
+    if partitioned_page["record_count"] <= 0:
+        aggregate_page["collection_mode"] = "aggregate"
+        aggregate_page["source_section"] = section_name
+        aggregate_page["partitioned"] = False
+        aggregate_page["partition_attempted"] = True
+        aggregate_page["partition_stop_reason"] = str(partitioned_page.get("stop_reason") or "")
+        return aggregate_page
+
+    merged_records = dedupe_collection_records(
+        [*aggregate_page["records"], *partitioned_page["records"]]
+    )
+    complete = bool(partitioned_page["complete"])
+    return {
+        **aggregate_page,
+        "records": merged_records,
+        "complete": complete,
+        "stop_reason": (
+            "partitioned_complete"
+            if complete
+            else str(
+                partitioned_page.get("stop_reason")
+                or aggregate_page.get("stop_reason")
+                or "partition_incomplete"
+            )
+        ),
+        "page_count": int(aggregate_page.get("page_count", 0))
+        + int(partitioned_page.get("page_count", 0)),
+        "record_count": len(merged_records),
+        "last_offset": int(
+            partitioned_page.get("last_offset", aggregate_page.get("last_offset", 0))
+        ),
+        "next_offset": int(
+            partitioned_page.get("next_offset", aggregate_page.get("next_offset", 0))
+        ),
+        "collection_mode": "partition_recovery",
+        "source_section": section_name,
+        "partitioned": True,
+        "partition_attempted": True,
+        "partition_count": int(partitioned_page.get("partition_count", 0)),
+        "partition_stop_reason": str(partitioned_page.get("stop_reason") or ""),
+        "recovered_from": str(aggregate_page.get("stop_reason") or ""),
+    }
+
+
+def fetch_time_window_collection_page(
+    *,
+    page_size: int,
+    max_offset: int,
+    section_name: str,
+    start_ts: int,
+    end_ts: int,
+    fetch_partition_page: Callable[[int, int, int, int], list[dict[str, Any]]],
+) -> dict[str, Any]:
+    page = paginate_time_partitioned(
+        page_size=page_size,
+        max_offset=max_offset,
+        fetch_page=fetch_partition_page,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
+    return {
+        **page,
+        "collection_mode": "screening_window",
+        "source_section": section_name,
+        "history_scope": "screening_window",
+        "partition_attempted": bool(int(page.get("partition_count", 0) or 0) > 1)
+        or str(page.get("stop_reason") or "") == "partitioned_complete",
+        "partition_stop_reason": str(page.get("stop_reason") or ""),
+    }
+
+
+def paginate_time_partitioned(
+    *,
+    page_size: int,
+    max_offset: int,
+    fetch_page: Callable[[int, int, int, int], list[dict[str, Any]]],
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    depth: int = 0,
+) -> dict[str, Any]:
+    if start_ts is None:
+        start_ts = 0
+    if end_ts is None:
+        end_ts = current_partition_end_epoch()
+    if start_ts > end_ts:
+        return {
+            "records": [],
+            "complete": True,
+            "stop_reason": "empty_range",
+            "page_count": 0,
+            "record_count": 0,
+            "last_offset": 0,
+            "next_offset": 0,
+            "partitioned": True,
+            "partition_count": 0,
+            "range_start": start_ts,
+            "range_end": end_ts,
+            "partition_depth": depth,
+        }
+
+    page = paginate_with_status(
+        page_size=page_size,
+        max_offset=max_offset,
+        fetch_page=lambda limit, offset: fetch_page(limit, offset, start_ts, end_ts),
+    )
+    page["range_start"] = start_ts
+    page["range_end"] = end_ts
+    page["partition_depth"] = depth
+    if page["complete"] or page["record_count"] <= 0 or depth >= TIME_PARTITION_MAX_DEPTH:
+        page["partitioned"] = True
+        page["partition_count"] = 1 if page["record_count"] > 0 else 0
+        return page
+
+    if page["stop_reason"] not in RECOVERABLE_PAGINATION_STOP_REASONS or start_ts >= end_ts:
+        page["partitioned"] = True
+        page["partition_count"] = 1
+        return page
+
+    midpoint = start_ts + ((end_ts - start_ts) // 2)
+    if midpoint < start_ts or midpoint >= end_ts:
+        page["partitioned"] = True
+        page["partition_count"] = 1
+        return page
+
+    lower = paginate_time_partitioned(
+        page_size=page_size,
+        max_offset=max_offset,
+        fetch_page=fetch_page,
+        start_ts=start_ts,
+        end_ts=midpoint,
+        depth=depth + 1,
+    )
+    upper = paginate_time_partitioned(
+        page_size=page_size,
+        max_offset=max_offset,
+        fetch_page=fetch_page,
+        start_ts=midpoint + 1,
+        end_ts=end_ts,
+        depth=depth + 1,
+    )
+    records = dedupe_collection_records([*lower["records"], *upper["records"]])
+    complete = bool(lower["complete"]) and bool(upper["complete"])
+    return {
+        "records": records,
+        "complete": complete,
+        "stop_reason": "partitioned_complete" if complete else "partition_incomplete",
+        "page_count": int(lower.get("page_count", 0)) + int(upper.get("page_count", 0)),
+        "record_count": len(records),
+        "last_offset": 0,
+        "next_offset": 0,
+        "partitioned": True,
+        "partition_count": int(lower.get("partition_count", 0))
+        + int(upper.get("partition_count", 0)),
+        "range_start": start_ts,
+        "range_end": end_ts,
+        "partition_depth": depth,
+    }
+
+
+def build_partition_recovery_page(
+    *,
+    aggregate_page: Mapping[str, Any],
+    page_size: int,
+    max_offset: int,
+    fetch_page: Callable[[int, int, int, int], list[dict[str, Any]]],
+) -> dict[str, Any]:
+    oldest_seen = oldest_collection_timestamp(aggregate_page.get("records", []))
+    if oldest_seen <= 0:
+        return paginate_time_partitioned(
+            page_size=page_size,
+            max_offset=max_offset,
+            fetch_page=fetch_page,
+        )
+
+    boundary_page = paginate_time_partitioned(
+        page_size=page_size,
+        max_offset=max_offset,
+        fetch_page=fetch_page,
+        start_ts=oldest_seen,
+        end_ts=oldest_seen,
+    )
+    tail_page = paginate_time_tail_recovery(
+        page_size=page_size,
+        max_offset=max_offset,
+        fetch_page=fetch_page,
+        start_ts=0,
+        end_ts=max(0, oldest_seen - 1),
+    )
+    return merge_partition_pages([boundary_page, tail_page])
+
+
+def merge_partition_pages(pages: list[dict[str, Any]]) -> dict[str, Any]:
+    records = dedupe_collection_records(
+        [
+            record
+            for page in pages
+            for record in (page.get("records", []) if isinstance(page.get("records", []), list) else [])
+        ]
+    )
+    complete = all(bool(page.get("complete", True)) for page in pages)
+    stop_reason = "partitioned_complete" if complete else "partition_incomplete"
+    return {
+        "records": records,
+        "complete": complete,
+        "stop_reason": stop_reason,
+        "page_count": sum(int(page.get("page_count", 0)) for page in pages),
+        "record_count": len(records),
+        "last_offset": 0,
+        "next_offset": 0,
+        "partitioned": True,
+        "partition_count": sum(int(page.get("partition_count", 0)) for page in pages),
+        "range_start": min(int(page.get("range_start", 0)) for page in pages) if pages else 0,
+        "range_end": max(int(page.get("range_end", 0)) for page in pages) if pages else 0,
+        "partition_depth": max(int(page.get("partition_depth", 0)) for page in pages) if pages else 0,
+    }
+
+
+def paginate_time_tail_recovery(
+    *,
+    page_size: int,
+    max_offset: int,
+    fetch_page: Callable[[int, int, int, int], list[dict[str, Any]]],
+    start_ts: int,
+    end_ts: int,
+) -> dict[str, Any]:
+    if start_ts > end_ts:
+        return {
+            "records": [],
+            "complete": True,
+            "stop_reason": "empty_range",
+            "page_count": 0,
+            "record_count": 0,
+            "last_offset": 0,
+            "next_offset": 0,
+            "partitioned": True,
+            "partition_count": 0,
+            "range_start": start_ts,
+            "range_end": end_ts,
+            "partition_depth": 0,
+        }
+
+    current_end = end_ts
+    page_count = 0
+    partition_count = 0
+    collected: list[dict[str, Any]] = []
+    stop_reason = "empty_page"
+    complete = True
+
+    while current_end >= start_ts:
+        page = paginate_with_status(
+            page_size=page_size,
+            max_offset=max_offset,
+            fetch_page=lambda limit, offset: fetch_page(limit, offset, start_ts, current_end),
+        )
+        page_count += int(page.get("page_count", 0))
+        partition_count += 1
+        if page["record_count"] <= 0:
+            stop_reason = str(page.get("stop_reason") or "empty_page")
+            break
+
+        if page["complete"]:
+            collected.extend(page["records"])
+            stop_reason = str(page.get("stop_reason") or "partitioned_complete")
+            break
+
+        if page["stop_reason"] not in RECOVERABLE_PAGINATION_STOP_REASONS:
+            complete = False
+            stop_reason = str(page.get("stop_reason") or "partition_incomplete")
+            collected.extend(page["records"])
+            break
+
+        boundary_ts = oldest_collection_timestamp(page["records"])
+        if boundary_ts <= 0:
+            complete = False
+            stop_reason = "missing_boundary_timestamp"
+            collected.extend(page["records"])
+            break
+
+        boundary_page = paginate_time_partitioned(
+            page_size=page_size,
+            max_offset=max_offset,
+            fetch_page=fetch_page,
+            start_ts=boundary_ts,
+            end_ts=boundary_ts,
+        )
+        page_count += int(boundary_page.get("page_count", 0))
+        partition_count += int(boundary_page.get("partition_count", 0))
+        collected.extend(records_after_timestamp(page["records"], boundary_ts))
+        collected.extend(boundary_page["records"])
+        if not boundary_page["complete"]:
+            complete = False
+            stop_reason = str(boundary_page.get("stop_reason") or "boundary_incomplete")
+            break
+        current_end = boundary_ts - 1
+        stop_reason = "partitioned_complete"
+
+    records = dedupe_collection_records(collected)
+    return {
+        "records": records,
+        "complete": complete,
+        "stop_reason": stop_reason if complete else stop_reason or "partition_incomplete",
+        "page_count": page_count,
+        "record_count": len(records),
+        "last_offset": 0,
+        "next_offset": 0,
+        "partitioned": True,
+        "partition_count": partition_count,
+        "range_start": start_ts,
+        "range_end": end_ts,
+        "partition_depth": 0,
+    }
+
+
+def current_partition_end_epoch() -> int:
+    return int(datetime.now(tz=UTC).timestamp()) + TIME_PARTITION_BACKFILL_SECONDS
+
+
+def project_trades_page_from_activity(activity_page: Mapping[str, Any]) -> dict[str, Any] | None:
+    if not bool(activity_page.get("complete", False)):
+        return None
+
+    trade_records = [
+        dict(record)
+        for record in (activity_page.get("records", []) if isinstance(activity_page.get("records", []), list) else [])
+        if isinstance(record, Mapping) and str(record.get("type", "")).upper() == "TRADE"
+    ]
+    return {
+        "records": trade_records,
+        "complete": True,
+        "stop_reason": "projected_from_activity",
+        "page_count": 0,
+        "record_count": len(trade_records),
+        "last_offset": 0,
+        "next_offset": 0,
+        "collection_mode": "activity_projection",
+        "source_section": "trades",
+        "projection_source": "activity",
+        "projection_source_mode": str(activity_page.get("collection_mode") or ""),
+        "history_scope": str(activity_page.get("history_scope") or "aggregate"),
+        "range_start": activity_page.get("range_start"),
+        "range_end": activity_page.get("range_end"),
+        "partitioned": bool(activity_page.get("partitioned", False)),
+        "partition_attempted": bool(activity_page.get("partition_attempted", False)),
+        "partition_count": int(activity_page.get("partition_count", 0) or 0),
+        "partition_stop_reason": str(activity_page.get("partition_stop_reason") or ""),
+        "recovered_from": str(
+            activity_page.get("recovered_from") or activity_page.get("stop_reason") or ""
+        ),
+    }
+
+
+def project_recent_trades_page_from_activity(
+    activity_page: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if not bool(activity_page.get("complete", False)):
+        return None
+    trade_records = [
+        dict(record)
+        for record in (activity_page.get("records", []) if isinstance(activity_page.get("records", []), list) else [])
+        if isinstance(record, Mapping) and str(record.get("type", "")).upper() == "TRADE"
+    ]
+    return {
+        "records": trade_records,
+        "complete": True,
+        "stop_reason": "projected_recent_activity_page",
+        "page_count": 0,
+        "record_count": len(trade_records),
+        "last_offset": 0,
+        "next_offset": 0,
+        "collection_mode": "recent_activity_projection",
+        "source_section": "trades",
+        "projection_source": "activity",
+        "projection_source_mode": str(activity_page.get("collection_mode") or ""),
+        "history_scope": "recent_activity",
+        "partitioned": False,
+        "partition_attempted": False,
+    }
+
+
+def dedupe_collection_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: dict[tuple[str, ...], dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        deduped[collection_record_identity_key(record)] = dict(record)
+    return sorted(
+        deduped.values(),
+        key=lambda record: (
+            collection_record_timestamp(record),
+            str(first_non_empty_value(record, ("transactionHash", "txHash", "hash", "id")) or ""),
+        ),
+        reverse=True,
+    )
+
+
+def collection_record_identity_key(record: Mapping[str, Any]) -> tuple[str, ...]:
+    timestamp = collection_record_timestamp(record)
+    transaction_hash = str(first_non_empty_value(record, ("transactionHash", "txHash", "hash", "id")) or "")
+    kind = str(first_non_empty_value(record, ("type", "activityType", "activity_type", "side")) or "").upper()
+    market = str(first_non_empty_value(record, ("asset", "conditionId", "eventSlug", "slug", "title")) or "")
+    side = str(first_non_empty_value(record, ("side",)) or "").upper()
+    size = to_float(
+        first_non_empty_value(record, ("size", "shares", "totalBought")) or record.get("size")
+    )
+    price = to_float(
+        first_non_empty_value(record, ("price", "avgPrice", "costBasis", "cost_basis"))
+        or record.get("price")
+    )
+    notional = to_float(
+        first_non_empty_value(record, ("usdcSize", "amount", "notional", "value"))
+        or record.get("usdcSize")
+    )
+    return (
+        transaction_hash,
+        kind,
+        market,
+        side,
+        f"{timestamp:.0f}",
+        f"{size:.8f}",
+        f"{price:.8f}",
+        f"{notional:.8f}",
+    )
+
+
+def collection_record_timestamp(record: Mapping[str, Any]) -> float:
+    raw_timestamp = first_non_empty_value(
+        record,
+        ("timestamp", "createdAt", "created_at", "timeStamp", "time"),
+    )
+    parsed = parse_metric_datetime(raw_timestamp)
+    if parsed is not None:
+        return parsed.timestamp()
+    return to_float(raw_timestamp)
+
+
+def oldest_collection_timestamp(records: Any) -> int:
+    timestamps = [
+        int(collection_record_timestamp(record))
+        for record in (records if isinstance(records, list) else [])
+        if isinstance(record, Mapping) and collection_record_timestamp(record) > 0
+    ]
+    return min(timestamps) if timestamps else 0
+
+
+def records_after_timestamp(records: Any, threshold_ts: int) -> list[dict[str, Any]]:
+    return [
+        dict(record)
+        for record in (records if isinstance(records, list) else [])
+        if isinstance(record, Mapping) and collection_record_timestamp(record) > threshold_ts
+    ]
+
+
 def paginate_with_status(
     *,
     page_size: int,
@@ -3217,8 +5592,9 @@ def paginate_with_status(
             page = fetch_page(page_size, offset)
         except RuntimeError as exc:
             complete = False
-            if is_terminal_pagination_error(exc, offset):
-                stop_reason = "terminal_http_400"
+            recovered_stop_reason = classify_terminal_pagination_stop_reason(exc, offset)
+            if recovered_stop_reason:
+                stop_reason = recovered_stop_reason
                 break
             raise
         page_count += 1
@@ -3247,11 +5623,67 @@ def paginate_with_status(
     }
 
 
-def is_terminal_pagination_error(exc: RuntimeError, offset: int) -> bool:
+def classify_terminal_pagination_stop_reason(exc: RuntimeError, offset: int) -> str | None:
     if offset <= 0:
-        return False
+        return None
+    if isinstance(exc, PolymarketRequestError):
+        if exc.status_code == 400:
+            return "terminal_http_400"
+        if exc.status_code == 429:
+            return "terminal_http_429"
+        if exc.status_code is not None and exc.status_code >= 500:
+            return "terminal_http_5xx"
+        if exc.retryable:
+            return "terminal_transport_error"
+        return None
     cause = exc.__cause__
-    return isinstance(cause, HTTPError) and cause.code == 400
+    if isinstance(cause, HTTPError):
+        if cause.code == 400:
+            return "terminal_http_400"
+        if cause.code == 429:
+            return "terminal_http_429"
+        if cause.code >= 500:
+            return "terminal_http_5xx"
+        return None
+    if isinstance(cause, (TimeoutError, URLError)):
+        return "terminal_transport_error"
+    return None
+
+
+def classify_initial_collection_stop_reason(exc: RuntimeError) -> str | None:
+    if isinstance(exc, PolymarketRequestError):
+        if exc.status_code == 429:
+            return "initial_http_429"
+        if exc.status_code is not None and exc.status_code >= 500:
+            return "initial_http_5xx"
+        if exc.retryable:
+            return "initial_transport_error"
+        return None
+    cause = exc.__cause__
+    if isinstance(cause, HTTPError):
+        if cause.code == 429:
+            return "initial_http_429"
+        if cause.code >= 500:
+            return "initial_http_5xx"
+        return None
+    if isinstance(cause, (TimeoutError, URLError)):
+        return "initial_transport_error"
+    return None
+
+
+def query_param_int(params: Any, key: str) -> int | None:
+    if isinstance(params, Mapping):
+        raw_value = params.get(key)
+    else:
+        return None
+    if isinstance(raw_value, list):
+        if not raw_value:
+            return None
+        raw_value = raw_value[0]
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return None
 
 
 def top_records(

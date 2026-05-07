@@ -1,6 +1,6 @@
 import {useEffect, useMemo, useState, type ReactNode} from 'react';
 import {AlertTriangle, ArrowUpRight, CheckCircle2, ChevronRight, RefreshCcw, Sparkles, X} from 'lucide-react';
-import {type FinderAiRunSummary, type WalletRow, formatDateTime, formatNumber, shortAddress} from '../lib/api';
+import {finderAiGenerationReasonLabel, type FinderAiRunSummary, type WalletRow, formatDateTime, formatNumber, shortAddress} from '../lib/api';
 import {cn} from '../lib/utils';
 
 export type FinderAiPreviewItem = {
@@ -9,6 +9,8 @@ export type FinderAiPreviewItem = {
   xUsername?: string;
   brief?: string;
   strategyFocus?: string;
+  generationStatus?: string;
+  generationReason?: string;
   evidenceLevel?: string;
   needsReview?: boolean;
   hasConflict?: boolean;
@@ -25,6 +27,8 @@ export function toFinderAiPreviewItem(wallet: WalletRow): FinderAiPreviewItem {
     xUsername: normalizedHandle(wallet.x_username),
     brief: textValue(wallet.ai_brief_short),
     strategyFocus: textValue(wallet.ai_strategy_focus),
+    generationStatus: textValue(wallet.ai_generation_status),
+    generationReason: textValue(wallet.ai_generation_reason),
     evidenceLevel: textValue(wallet.ai_evidence_level),
     needsReview: Boolean(wallet.ai_needs_review),
     hasConflict: Boolean(wallet.ai_has_conflict),
@@ -82,8 +86,14 @@ export function FinderAiRunSummaryStrip({
   const headline = buildHeadline(stats);
   const note = buildNote(stats);
   const coverageCaption =
-    stats.available > 0 ? `新生成 ${stats.generated} · 缓存 ${stats.cached}` : '当前还没有可展示的 AI 摘要';
+    stats.available > 0 ? `新生成 ${stats.generated} · 缓存 ${stats.cached} · 兜底 ${stats.fallback}` : '当前还没有可展示的 AI 摘要';
   const activePreview = availablePreviewItems.find((item) => item.wallet === activeWallet) || availablePreviewItems[0];
+  const reviewCaption =
+    stats.hasConflict > 0
+      ? `冲突信号 ${formatNumber(stats.hasConflict)} · 其余优先检查抓取/审计完整性`
+      : stats.needsReview > 0
+        ? '常见原因：抓取或审计未补齐'
+        : '建议人工再看一眼';
 
   return (
     <>
@@ -137,9 +147,9 @@ export function FinderAiRunSummaryStrip({
             icon={<Sparkles className="h-3.5 w-3.5" />}
           />
           <MetricCell
-            label="缓存命中"
-            value={formatNumber(stats.cached)}
-            caption="沿用已有摘要结果"
+            label="缓存/兜底"
+            value={formatNumber(stats.cached + stats.fallback)}
+            caption={`缓存 ${formatNumber(stats.cached)} · 兜底 ${formatNumber(stats.fallback)}`}
             tone="slate"
             compact={compact}
             icon={<RefreshCcw className="h-3.5 w-3.5" />}
@@ -147,7 +157,7 @@ export function FinderAiRunSummaryStrip({
           <MetricCell
             label="需复核"
             value={formatNumber(stats.needsReview)}
-            caption={stats.hasConflict > 0 ? `冲突信号 ${formatNumber(stats.hasConflict)}` : '建议人工再看一眼'}
+            caption={reviewCaption}
             tone={stats.needsReview > 0 || stats.hasConflict > 0 ? 'amber' : 'slate'}
             compact={compact}
             icon={<AlertTriangle className="h-3.5 w-3.5" />}
@@ -187,6 +197,8 @@ function FinderAiPreviewDialog({
   const identity = preferredPreviewIdentity(activeItem);
   const status = previewStatus(activeItem);
   const evidence = evidenceLevelLabel(activeItem?.evidenceLevel);
+  const reason = previewReasonText(activeItem);
+  const reasonTone = previewReasonTone(activeItem);
 
   const openWalletDetail = () => {
     if (!activeItem?.wallet || !onOpenWallet) return;
@@ -230,6 +242,7 @@ function FinderAiPreviewDialog({
                 const selected = item.wallet === activeItem?.wallet;
                 const itemIdentity = preferredPreviewIdentity(item);
                 const itemStatus = previewStatus(item);
+                const itemReason = previewReasonText(item);
                 return (
                   <button
                     key={item.wallet}
@@ -268,6 +281,9 @@ function FinderAiPreviewDialog({
                     <div className="mt-2 line-clamp-2 text-xs leading-5 text-slate-500">
                       {textValue(item.brief) || textValue(item.strategyFocus) || '当前没有可展示的摘要内容。'}
                     </div>
+                    {itemReason ? (
+                      <div className="mt-2 line-clamp-1 text-[11px] font-medium text-amber-700">{itemReason}</div>
+                    ) : null}
                   </button>
                 );
               })}
@@ -296,6 +312,16 @@ function FinderAiPreviewDialog({
                   ) : null}
                 </div>
               </div>
+
+              {reason ? (
+                <div className={cn('mt-4 flex items-start gap-2 rounded-md border px-3 py-2 text-xs leading-5', reasonTone)}>
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <div>
+                    <div className="font-medium">当前状态原因</div>
+                    <div className="mt-0.5">{reason}</div>
+                  </div>
+                </div>
+              ) : null}
 
               {onOpenWallet ? (
                 <button
@@ -371,12 +397,13 @@ function normalizeSummary(summary?: FinderAiRunSummary) {
   const finderAiPresent = numberValue(summary?.finder_ai_present ?? selectedWallets);
   const generated = numberValue(summary?.generated);
   const cached = numberValue(summary?.cached);
+  const fallback = numberValue(summary?.fallback);
   const failed = numberValue(summary?.failed);
   const skipped = numberValue(summary?.skipped);
   const eligible = numberValue(summary?.eligible);
   const needsReview = numberValue(summary?.needs_review);
   const hasConflict = numberValue(summary?.has_conflict);
-  const available = generated + cached;
+  const available = generated + cached + fallback;
 
   return {
     selectedWallets,
@@ -384,6 +411,7 @@ function normalizeSummary(summary?: FinderAiRunSummary) {
     available,
     generated,
     cached,
+    fallback,
     failed,
     skipped,
     eligible,
@@ -413,7 +441,7 @@ function buildNote(summary: ReturnType<typeof normalizeSummary>): string {
     parts.push(`${summary.skipped} 个因证据或门控条件未生成`);
   }
   if (summary.needsReview > 0) {
-    parts.push(`${summary.needsReview} 个建议复核`);
+    parts.push(`${summary.needsReview} 个因审计未补齐待复核`);
   }
   if (summary.hasConflict > 0) {
     parts.push(`${summary.hasConflict} 个存在冲突信号`);
@@ -422,10 +450,17 @@ function buildNote(summary: ReturnType<typeof normalizeSummary>): string {
     return `未完成项不会影响本次筛选结果，结构化证据仍可正常查看。${parts.length ? ` 其中${parts.join('，')}。` : ''}`.trim();
   }
   if (parts.length > 0) {
-    return `仅对证据充足的钱包生成 AI 摘要；未生成项仍保留结构化结果。其中${parts.join('，')}。`;
+    const reviewHint = summary.needsReview > 0 || summary.hasConflict > 0 ? '“需复核”通常意味着抓取或审计未补齐，或信号之间有冲突，并不代表 AI 服务异常。' : '';
+    return `仅对证据充足的钱包生成 AI 摘要；未生成项仍保留结构化结果。其中${parts.join('，')}。${reviewHint}`.trim();
   }
   if (summary.cached > 0 && summary.generated > 0) {
     return '本次结果同时使用了新生成与缓存摘要，优先保证处理效率和展示连续性。';
+  }
+  if (summary.fallback > 0 && summary.generated + summary.cached > 0) {
+    return '本次有一部分摘要来自本地兜底改写，用来保证列表和详情页都有可读的分析结论。';
+  }
+  if (summary.fallback > 0) {
+    return '本次摘要由本地兜底逻辑生成，仍然只使用结构化证据，不会凭空补事实。';
   }
   if (summary.cached > 0) {
     return '本次摘要主要来自缓存结果，已沿用当前任务的结构化分析口径。';
@@ -437,19 +472,54 @@ function buildNote(summary: ReturnType<typeof normalizeSummary>): string {
 }
 
 function previewStatus(item?: FinderAiPreviewItem): {label: string; tone: string} {
+  const generationStatus = textValue(item?.generationStatus).toLowerCase();
+  const generationReason = textValue(item?.generationReason).toLowerCase();
+  if (item?.needsReview || item?.hasConflict) {
+    if (generationReason === 'analysis_audit_incomplete') {
+      return {label: '审计未补齐', tone: 'border-amber-200 bg-amber-50 text-amber-700'};
+    }
+    if (generationReason === 'signal_conflict' || item?.hasConflict) {
+      return {label: '信号冲突', tone: 'border-amber-200 bg-amber-50 text-amber-700'};
+    }
+    return {label: '建议复核', tone: 'border-amber-200 bg-amber-50 text-amber-700'};
+  }
+  if (generationStatus === 'cached') {
+    return {label: '缓存摘要', tone: 'border-blue-200 bg-blue-50 text-blue-700'};
+  }
   if (textValue(item?.brief)) {
-    if (item?.needsReview || item?.hasConflict) {
-      return {label: '需复核', tone: 'border-amber-200 bg-amber-50 text-amber-700'};
+    if (generationStatus === 'fallback') {
+      return {label: '本地兜底', tone: 'border-slate-200 bg-slate-50 text-slate-700'};
     }
     return {label: '已生成', tone: 'border-blue-200 bg-blue-50 text-blue-700'};
-  }
-  if (item?.needsReview || item?.hasConflict) {
-    return {label: '需复核', tone: 'border-amber-200 bg-amber-50 text-amber-700'};
   }
   if (textValue(item?.strategyFocus)) {
     return {label: '已提炼', tone: 'border-slate-200 bg-slate-50 text-slate-700'};
   }
   return {label: '待生成', tone: 'border-slate-200 bg-slate-50 text-slate-600'};
+}
+
+function previewReasonText(item?: FinderAiPreviewItem): string | undefined {
+  const status = textValue(item?.generationStatus).toLowerCase();
+  const reason = finderAiGenerationReasonLabel(item?.generationReason, {
+    status: item?.generationStatus,
+    needsReview: item?.needsReview,
+    hasConflict: item?.hasConflict,
+  });
+  if (!reason) return undefined;
+  if (item?.needsReview || item?.hasConflict) return reason;
+  if (['failed', 'insufficient', 'fallback', 'cached'].includes(status)) return reason;
+  return undefined;
+}
+
+function previewReasonTone(item?: FinderAiPreviewItem): string {
+  const status = textValue(item?.generationStatus).toLowerCase();
+  if (item?.needsReview || item?.hasConflict || status === 'needs_review') {
+    return 'border-amber-200 bg-amber-50 text-amber-700';
+  }
+  if (status === 'failed') {
+    return 'border-red-200 bg-red-50 text-red-700';
+  }
+  return 'border-slate-200 bg-slate-50 text-slate-700';
 }
 
 function preferredPreviewIdentity(item?: FinderAiPreviewItem): string {

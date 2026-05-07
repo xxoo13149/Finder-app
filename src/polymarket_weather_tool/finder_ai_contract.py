@@ -10,7 +10,7 @@ FINDER_AI_PROVIDER = "deepseek"
 FINDER_AI_MODEL = "deepseek-v4-flash"
 FINDER_AI_GENERATION_SCOPE = "brief"
 FINDER_AI_SCHEMA_VERSION = "finder-ai-v1"
-FINDER_AI_PROMPT_VERSION = "finder-weather-brief-v1"
+FINDER_AI_PROMPT_VERSION = "finder-weather-brief-v3"
 
 
 def text_value(value: Any) -> str:
@@ -262,6 +262,7 @@ def build_finder_ai_generation_layers(
     summary = safe_mapping(structured_materials.get("summary"))
     signals = safe_mapping(structured_materials.get("signals"))
     records = safe_mapping(structured_materials.get("records"))
+    metrics = safe_mapping(wallet_result.get("metrics"))
     selection_record = safe_mapping(wallet_result.get("selection_record"))
     primary_signals = safe_list(payload.get("primarySignals"))[:5]
     labels = safe_list(payload.get("labels"))[:5]
@@ -302,6 +303,26 @@ def build_finder_ai_generation_layers(
             "final_settlement_profit",
             "unified_profit",
         ),
+    )
+    behavior_snapshot.update(
+        compact_mapping(
+            metrics,
+            (
+                "trade_liquidity_profit_multiple",
+                "final_settlement_profit_multiple",
+                "unified_profit_multiple",
+                "reward_total_usdc",
+                "reward_activity_count",
+                "holding_duration_coverage",
+                "median_holding_hours",
+                "time_to_end_coverage",
+                "median_time_to_end_hours",
+                "largest_event_notional_ratio",
+                "current_open_value",
+                "closed_realized_pnl",
+                "snapshot_complete",
+            ),
+        )
     )
 
     return {

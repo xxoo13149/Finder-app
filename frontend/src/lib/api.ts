@@ -48,6 +48,7 @@ export type FinderAiRunSummary = {
   eligible?: number;
   generated?: number;
   cached?: number;
+  fallback?: number;
   failed?: number;
   skipped?: number;
   needs_review?: number;
@@ -74,6 +75,8 @@ export type WalletRow = {
   x_username?: string;
   ai_strategy_focus?: string;
   ai_brief_short?: string;
+  ai_generation_status?: string;
+  ai_generation_reason?: string;
   ai_needs_review?: boolean;
   ai_has_conflict?: boolean;
   ai_evidence_level?: string;
@@ -200,6 +203,7 @@ export type FinderAiBriefGeneration = {
   enabled?: boolean;
   status?: string;
   reason?: string;
+  lastError?: string;
 };
 
 export type FinderAiResult = {
@@ -938,4 +942,38 @@ export function formatShortDateTime(value?: string | null): string {
     hour: '2-digit',
     minute: '2-digit',
   });
+}
+
+export function finderAiGenerationReasonLabel(
+  reason?: string,
+  options: {
+    status?: string;
+    needsReview?: boolean;
+    hasConflict?: boolean;
+  } = {},
+): string | undefined {
+  const key = String(reason || '').trim().toLowerCase();
+  const status = String(options.status || '').trim().toLowerCase();
+
+  const labels: Record<string, string> = {
+    analysis_audit_incomplete: '抓取不完整，已建议人工复核',
+    signal_conflict: '信号存在冲突，已建议人工复核',
+    evidence_below_gate: '证据不足，暂不生成 AI 文案',
+    missing_normalized_address: '地址信息不完整，暂不生成 AI 文案',
+    ready_for_brief: '结构化证据已就绪，等待生成 AI 文案',
+    generated: '已完成本次 AI 生成',
+    cache_hit: '当前展示的是缓存摘要',
+    local_fallback: '未调用外部模型，已切换到本地兜底摘要',
+    local_existing: '沿用现有摘要并补齐短摘',
+    provider_error: '模型调用失败，已保留结构化证据',
+  };
+
+  if (labels[key]) return labels[key];
+  if (options.hasConflict) return '信号存在冲突，已建议人工复核';
+  if (options.needsReview || status === 'needs_review') return '当前样本已建议人工复核';
+  if (status === 'insufficient') return '证据不足，暂不生成 AI 文案';
+  if (status === 'ready') return '结构化证据已就绪，等待生成 AI 文案';
+  if (status === 'fallback') return '未调用外部模型，已切换到本地兜底摘要';
+  if (status === 'failed') return '模型调用失败，已保留结构化证据';
+  return undefined;
 }

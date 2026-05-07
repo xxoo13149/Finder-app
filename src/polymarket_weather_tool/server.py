@@ -21,6 +21,8 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 from urllib.parse import parse_qs, unquote, urlparse
 
+from . import cloud_archive as cloud_archive_module
+from . import history_ledger as history_ledger_module
 from .config import (
     DEFAULT_CONFIG_PATH,
     SMART_WALLET_LIBRARY_REFRESH_MODE,
@@ -30,7 +32,7 @@ from .config import (
 )
 from .env import load_project_env
 from .finder_ai_contract import compact_finder_ai_result
-from .history_registry import list_wallet_history_records
+from .history_registry import create_history_registry, list_wallet_history_records
 from .labels import CORE_LABEL_KEYS
 from .smart_wallet_library import (
     SMART_WALLET_IMPORT_ROWS_FILENAME,
@@ -125,6 +127,60 @@ def read_json_file(path: Path, fallback: Any = None) -> Any:
 def write_json_file(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_server_default_config(state: ServerState) -> dict[str, Any]:
+    try:
+        config_path = ensure_under(state.root, state.root / DEFAULT_CONFIG_PATH)
+    except ValueError:
+        return {}
+    try:
+        payload = load_config(config_path)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+def read_run_resolved_config(output_dir: Path) -> dict[str, Any]:
+    payload = read_json_file(output_dir / "resolved_config.json", {})
+    return dict(payload) if isinstance(payload, Mapping) else {}
+
+
+def history_registry_store(state: ServerState):
+    return create_history_registry(state.artifacts_root, config=load_server_default_config(state))
+
+
+def history_ledger_store(state: ServerState) -> history_ledger_module.HistoryLedgerStore:
+    return history_ledger_module.create_history_ledger_store(
+        state.artifacts_root,
+        config=load_server_default_config(state),
+    )
+
+
+def cloud_archive_store(
+    state: ServerState | None = None,
+    config: Mapping[str, Any] | None = None,
+) -> cloud_archive_module.CloudArchiveStore:
+    resolved_config = config
+    if resolved_config is None and state is not None:
+        resolved_config = load_server_default_config(state)
+    return cloud_archive_module.create_cloud_archive_store(resolved_config)
+
+
+def summarize_run_archive_manifest(output_dir: Path) -> dict[str, Any]:
+    manifest = cloud_archive_module.read_run_archive_manifest(output_dir)
+    if not manifest:
+        return {
+            "archive_status": "missing",
+            "archived_document_count": 0,
+            "archived_at": "",
+        }
+    return {
+        "archive_status": str(manifest.get("status") or "unknown"),
+        "archived_document_count": int(manifest.get("document_count") or 0),
+        "archived_at": str(manifest.get("archived_at") or ""),
+        "archive_backend": str(manifest.get("backend") or ""),
+        "archive_configured": bool(manifest.get("configured", False)),
+    }
 
 
 def wallet_payload_has_core_label(payload: Any) -> bool:
@@ -1105,7 +1161,7 @@ def build_wallet_registry_items(state: ServerState) -> list[dict[str, Any]]:
                 root=state.root,
                 path=record_path,
                 item_type="wallet_registry_entry",
-                note="历史已抓取钱包名册条目，删除后该钱包可再次进入后续抓取流程。",
+                note="Previously fetched wallet registry entry. Delete it to allow this wallet to enter future collection flows again.",
                 extra={
                     "wallet_address": wallet_address,
                     "user_name": user_name,
@@ -1115,6 +1171,58 @@ def build_wallet_registry_items(state: ServerState) -> list[dict[str, Any]]:
                     "run_count": int(record.get("run_count") or 0),
                     "last_run_id": str(record.get("last_run_id") or ""),
                     "last_status": str(record.get("last_status") or ""),
+                },
+            )
+        )
+    return sorted(
+        items,
+        key=lambda item: (
+            str(item.get("last_seen_at") or item.get("modified_at") or ""),
+            str(item.get("wallet_address") or ""),
+        ),
+        reverse=True,
+    )
+
+
+def build_wallet_registry_items_cloud_aware(state: ServerState) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    registry = history_registry_store(state)
+    registry_status = {
+        "storage_backend": str(registry.settings.get("backend") or "local"),
+        "cloud_backed": bool(
+            registry.settings.get("backend") == "cloudflare"
+            and registry.settings.get("cloudflare_account_id")
+            and registry.settings.get("cloudflare_d1_database_id")
+            and registry.settings.get("cloudflare_api_token")
+        ),
+    }
+    for record_path, record in list_wallet_history_records(state.artifacts_root):
+        wallet_address = str(record.get("wallet_address") or "").strip().lower()
+        if not wallet_address:
+            continue
+        user_name = str(record.get("user_name") or "").strip()
+        label = user_name or wallet_address
+        note = "Previously fetched wallet registry entry. Delete it to allow this wallet to enter future collection flows again."
+        if registry_status["cloud_backed"]:
+            note = f"{note} Cloudflare backup storage is configured."
+        items.append(
+            build_cleanup_item(
+                item_id=f"wallet_registry:{ensure_under(state.root, record_path).relative_to(state.root).as_posix()}",
+                label=label,
+                root=state.root,
+                path=record_path,
+                item_type="wallet_registry_entry",
+                note=note,
+                extra={
+                    "wallet_address": wallet_address,
+                    "user_name": user_name,
+                    "x_username": str(record.get("x_username") or "").strip(),
+                    "first_seen_at": str(record.get("first_seen_at") or ""),
+                    "last_seen_at": str(record.get("last_seen_at") or ""),
+                    "run_count": int(record.get("run_count") or 0),
+                    "last_run_id": str(record.get("last_run_id") or ""),
+                    "last_status": str(record.get("last_status") or ""),
+                    **registry_status,
                 },
             )
         )
@@ -1148,7 +1256,7 @@ def run_prunable_size_bytes(output_dir: Path) -> int:
 def build_cleanup_sections(state: ServerState) -> list[dict[str, Any]]:
     analysis_items: list[dict[str, Any]] = []
     diagnostic_items: list[dict[str, Any]] = []
-    wallet_registry_items = build_wallet_registry_items(state)
+    wallet_registry_items = build_wallet_registry_items_cloud_aware(state)
     output_items: list[dict[str, Any]] = []
     runtime_items: list[dict[str, Any]] = []
     seen_run_ids: set[str] = set()
@@ -1167,9 +1275,9 @@ def build_cleanup_sections(state: ServerState) -> list[dict[str, Any]]:
         locked = str(record.get("status") or "") in {"queued", "running"}
         prunable_bytes = 0 if is_diagnostic_run_name(run_id) else run_prunable_size_bytes(output_dir)
         note = (
-            "删除后会移除该次完整分析结果、报告、钱包证据与原始附件。"
+            "Deleting this will remove the full analysis output, report, wallet evidence, and source attachments."
             if not is_diagnostic_run_name(run_id)
-            else "开发期测试或诊断产物，通常可安全清理。"
+            else "Development or diagnostic artifacts can usually be cleaned up safely."
         )
         item = build_cleanup_item(
             item_id=f"run:{run_id}",
@@ -1179,10 +1287,11 @@ def build_cleanup_sections(state: ServerState) -> list[dict[str, Any]]:
             item_type="diagnostic_run" if is_diagnostic_run_name(run_id) else "analysis_run",
             note=note,
             locked=locked,
-            locked_reason="运行中的任务暂时不能删除。" if locked else None,
+            locked_reason="Running tasks cannot be deleted yet." if locked else None,
             run_id=run_id,
             status=str(record.get("status") or "artifact"),
         )
+        item.update(summarize_run_archive_manifest(output_dir))
         if prunable_bytes:
             item["detail_prunable_bytes"] = prunable_bytes
         if is_diagnostic_run_name(run_id):
@@ -1195,9 +1304,9 @@ def build_cleanup_sections(state: ServerState) -> list[dict[str, Any]]:
         for child in sorted(output_root.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True):
             if child.name.startswith("."):
                 continue
-            note = "临时输出、截图或开发验证目录。"
+            note = "Temporary output, screenshot, or verification directory."
             if child.suffix == ".log":
-                note = "本地开发或调试日志。"
+                note = "Local development or debug log."
             output_items.append(
                 build_cleanup_item(
                     item_id=f"output:{ensure_under(state.root, child).relative_to(state.root).as_posix()}",
@@ -1221,7 +1330,7 @@ def build_cleanup_sections(state: ServerState) -> list[dict[str, Any]]:
                     root=state.root,
                     path=child,
                     item_type="temp_output",
-                    note="前端测试产物或截图目录。",
+                    note="Frontend test output or screenshot directory.",
                 )
             )
 
@@ -1230,11 +1339,11 @@ def build_cleanup_sections(state: ServerState) -> list[dict[str, Any]]:
         runtime_items.append(
             build_cleanup_item(
                 item_id="runtime:.cache/polymarket-weather-tool",
-                label="Polymarket 接口缓存",
+                label="Polymarket API cache",
                 root=state.root,
                 path=api_cache_path,
                 item_type="runtime_cache",
-                note="缓存的接口响应与派生运行数据。",
+                note="Cached API responses and derived runtime data.",
             )
         )
     for path in collect_runtime_log_paths(state.root):
@@ -1245,7 +1354,7 @@ def build_cleanup_sections(state: ServerState) -> list[dict[str, Any]]:
                 root=state.root,
                 path=path,
                 item_type="runtime_log",
-                note="启动器、API 或本地开发日志输出。",
+                note="Launcher, API, or local development log output.",
             )
         )
     for path in collect_python_cache_paths(state.root):
@@ -1256,39 +1365,39 @@ def build_cleanup_sections(state: ServerState) -> list[dict[str, Any]]:
                 root=state.root,
                 path=path,
                 item_type="python_cache",
-                note="Python 字节码缓存，删除后会自动重建。",
+                note="Python bytecode cache; safe to delete and rebuild automatically.",
             )
         )
 
     sections = [
         {
             "key": "analysis_runs",
-            "label": "历史分析结果",
-            "description": "正式分析产物，可按条删除。",
+            "label": "Historical analysis results",
+            "description": "Final analysis artifacts that can be removed item by item.",
             "items": sorted(analysis_items, key=lambda item: str(item.get("modified_at") or ""), reverse=True),
         },
         {
             "key": "diagnostic_runs",
-            "label": "测试与诊断记录",
-            "description": "开发期冒烟测试、验收和诊断记录，适合集中清理。",
+            "label": "Tests and diagnostics",
+            "description": "Development-time smoke tests, validations, and diagnostic records.",
             "items": sorted(diagnostic_items, key=lambda item: str(item.get("modified_at") or ""), reverse=True),
         },
         {
             "key": "wallet_registry",
-            "label": "历史已抓取钱包名册",
-            "description": "去重后的历史钱包地址与用户名记录，可按钱包条目删除。",
+            "label": "Historical wallet registry",
+            "description": "Deduplicated historical wallet-address records that can be removed per wallet.",
             "items": wallet_registry_items,
         },
         {
             "key": "temp_outputs",
-            "label": "临时输出与截图",
-            "description": "Playwright 截图、开发日志与临时输出目录。",
+            "label": "Temporary output and screenshots",
+            "description": "Playwright screenshots, dev logs, and temporary output directories.",
             "items": sorted(output_items, key=lambda item: str(item.get("modified_at") or ""), reverse=True),
         },
         {
             "key": "runtime_storage",
-            "label": "运行缓存与日志",
-            "description": "接口缓存、运行日志和 Python 编译缓存。",
+            "label": "Runtime cache and logs",
+            "description": "API cache, runtime logs, and Python bytecode cache.",
             "items": sorted(runtime_items, key=lambda item: str(item.get("modified_at") or ""), reverse=True),
         },
     ]
@@ -1322,17 +1431,17 @@ def cleanup_targets_for_item(
 
     if operation == "prune":
         if item_type != "analysis_run":
-            raise ValueError("明细清理仅支持正式分析历史条目")
+            raise ValueError("Detailed pruning only supports formal analysis history items.")
         run_id = str(item.get("run_id") or "")
         if not run_id:
-            raise ValueError("所选条目没有关联正式分析记录")
+            raise ValueError("The selected item is not linked to a formal analysis record.")
         output_dir = ensure_under(state.artifacts_root, state.artifacts_root / run_id)
         targets = run_prunable_paths(output_dir)
         if not targets:
-            raise ValueError("所选分析记录没有可清理的明细附件")
+            raise ValueError("The selected analysis record has no prunable detail attachments.")
         return targets, []
 
-    raise ValueError(f"未知的清理操作：{operation}")
+    raise ValueError(f"Unknown cleanup operation: {operation}")
 
 
 def collect_runtime_log_paths(root: Path) -> list[Path]:
@@ -1405,72 +1514,72 @@ def build_cleanup_action_specs(
     specs: dict[str, dict[str, Any]] = {
         "delete_diagnostic_records": {
             "key": "delete_diagnostic_records",
-            "label": "一键删除测试与诊断记录",
-            "description": "删除冒烟测试记录、验收产物、截图和临时输出。",
-            "warning": "这会移除开发期诊断记录，但不会影响正式分析历史。",
+            "label": "Delete tests and diagnostics",
+            "description": "Remove smoke test records, validation artifacts, screenshots, and temporary output.",
+            "warning": "This removes development-time diagnostic records only and does not affect formal analysis history.",
             "paths": diagnostic_paths,
             "deleted_run_ids": diagnostic_run_ids,
             "target_count": len(diagnostic_paths),
         },
         "delete_temp_outputs": {
             "key": "delete_temp_outputs",
-            "label": "删除临时输出与截图",
-            "description": "删除 output 和前端测试结果目录中的临时产物，但保留根目录结构。",
-            "warning": "只会移除临时输出，不会影响历史分析结果，也不会删除清理根目录。",
+            "label": "Delete temporary output and screenshots",
+            "description": "Remove temporary artifacts under output and frontend test results while keeping directory structure intact.",
+            "warning": "This only removes temporary output and does not affect historical analysis results.",
             "paths": temp_output_paths,
             "deleted_run_ids": [],
             "target_count": len(temp_output_paths),
         },
         "clear_runtime_storage": {
             "key": "clear_runtime_storage",
-            "label": "一键清理运行缓存与日志",
-            "description": "删除接口缓存、运行日志和 Python 的 __pycache__ 编译缓存。",
-            "warning": "不会删除正式分析结果；缓存会在后续运行中自动重建。",
+            "label": "Clear runtime cache and logs",
+            "description": "Remove API cache, runtime logs, and Python bytecode caches.",
+            "warning": "This does not delete formal analysis results; caches will be rebuilt automatically later.",
             "paths": runtime_cache_paths + runtime_log_paths + python_cache_paths,
             "deleted_run_ids": [],
             "target_count": len(runtime_cache_paths) + len(runtime_log_paths) + len(python_cache_paths),
         },
         "clear_api_cache": {
             "key": "clear_api_cache",
-            "label": "清空接口缓存",
-            "description": "删除 Polymarket 接口响应缓存，下次会重新联网抓取。",
-            "warning": "不会删除正式分析结果，但下一次分析速度可能变慢。",
+            "label": "Clear API cache",
+            "description": "Remove cached Polymarket API responses so the next run fetches fresh data.",
+            "warning": "This does not delete analysis results, but the next run may be slower.",
             "paths": runtime_cache_paths,
             "deleted_run_ids": [],
             "target_count": len(runtime_cache_paths),
         },
         "clear_runtime_logs": {
             "key": "clear_runtime_logs",
-            "label": "清空运行日志",
-            "description": "删除启动器、API 和前端开发日志。",
-            "warning": "适合释放低价值日志占用，不影响正式报告。",
+            "label": "Clear runtime logs",
+            "description": "Remove launcher, API, and frontend development logs.",
+            "warning": "This is safe for releasing disk space and does not affect analysis outputs.",
             "paths": runtime_log_paths,
             "deleted_run_ids": [],
             "target_count": len(runtime_log_paths),
         },
         "clear_python_caches": {
             "key": "clear_python_caches",
-            "label": "清空代码缓存",
-            "description": "删除 Python 的 __pycache__ 编译缓存。",
-            "warning": "删除后运行时会自动重建，通常风险很低。",
+            "label": "Clear Python caches",
+            "description": "Remove Python __pycache__ directories.",
+            "warning": "These caches are recreated automatically and are usually low risk to remove.",
             "paths": python_cache_paths,
             "deleted_run_ids": [],
             "target_count": len(python_cache_paths),
         },
         "prune_run_details": {
             "key": "prune_run_details",
-            "label": "清理历史明细附件",
-            "description": "保留 report、summary 和 selected_wallets，删除钱包明细与原始快照。",
-            "warning": "清理后仍能看摘要和报告，但钱包详情页与深度证据会不可用。",
+            "label": "Prune analysis detail attachments",
+            "description": "Keep report, summary, and selected wallets while deleting wallet details and source snapshots.",
+            "warning": "Summaries and reports remain available, but wallet detail pages and deep evidence will be removed.",
             "paths": prunable_targets,
             "deleted_run_ids": [],
             "target_count": prunable_runs,
         },
         "clear_wallet_registry": {
             "key": "clear_wallet_registry",
-            "label": "清空历史钱包名册",
-            "description": "删除历史已抓取钱包名册中的全部钱包条目。",
-            "warning": "清空后，后续分析不会再跳过这些历史钱包，旧钱包可能重新被抓取。",
+            "label": "Clear wallet registry",
+            "description": "Remove all historical wallet registry entries.",
+            "warning": "After this, future analyses may collect those wallets again.",
             "paths": wallet_registry_paths,
             "deleted_run_ids": [],
             "target_count": len(wallet_registry_paths),
@@ -1499,6 +1608,7 @@ def build_cleanup_inventory(state: ServerState) -> dict[str, Any]:
         "generated_at": now_iso(),
         "sections": sections,
         "actions": actions,
+        "cloud_archive": build_cloud_archive_status(state),
     }
 
 
@@ -1549,6 +1659,31 @@ def remove_cleanup_path(state: ServerState, path: Path) -> int:
     return size_bytes
 
 
+def ensure_analysis_run_archived_for_cleanup(state: ServerState, item: Mapping[str, Any]) -> dict[str, Any]:
+    if str(item.get("item_type") or "") != "analysis_run":
+        return {}
+    run_id = str(item.get("run_id") or "").strip()
+    if not run_id:
+        return {}
+    output_dir = ensure_under(state.artifacts_root, state.artifacts_root / run_id)
+    run_config = read_run_resolved_config(output_dir)
+    archive = cloud_archive_store(state, config=run_config)
+    if not archive.enabled or not bool(archive.settings.get("archive_before_cleanup", True)):
+        return {}
+    manifest = cloud_archive_module.read_run_archive_manifest(output_dir)
+    if str(manifest.get("status") or "") == "archived" and int(manifest.get("document_count") or 0) > 0:
+        return manifest
+
+    manifest = cloud_archive_module.archive_run_outputs(
+        output_dir,
+        run_id=run_id,
+        config=run_config,
+    )
+    if str(manifest.get("status") or "") not in {"archived", "disabled"}:
+        raise ValueError(f"Cloud archive prep failed before cleanup: {run_id}")
+    return manifest
+
+
 def perform_cleanup_delete(
     state: ServerState,
     *,
@@ -1558,22 +1693,33 @@ def perform_cleanup_delete(
 ) -> dict[str, Any]:
     operation = str(operation or "delete").strip().lower()
     if operation not in {"delete", "prune"}:
-        raise ValueError(f"未知的清理操作：{operation}")
+        raise ValueError(f"Unknown cleanup operation: {operation}")
 
     sections = build_cleanup_sections(state)
     item_index = build_cleanup_item_index(sections)
+    registry = history_registry_store(state)
     deleted_run_ids: list[str] = []
     target_paths: list[Path] = []
     deleted_item_ids: list[str] = []
     affected_count = 0
+    remote_deleted_count = 0
 
     if item_ids:
         for item_id in item_ids:
             item = item_index.get(item_id)
             if item is None:
-                raise ValueError(f"未知的清理条目：{item_id}")
+                raise ValueError(f"Unknown cleanup item: {item_id}")
             if bool(item.get("locked")):
-                raise ValueError(str(item.get("locked_reason") or "所选条目已锁定，暂时不能清理"))
+                raise ValueError(str(item.get("locked_reason") or "The selected item is locked and cannot be cleaned yet."))
+            if str(item.get("item_type") or "") == "wallet_registry_entry":
+                wallet_address = str(item.get("wallet_address") or "").strip().lower()
+                if wallet_address and registry.delete_wallet(wallet_address):
+                    remote_deleted_count += 1
+                if operation == "delete":
+                    deleted_item_ids.append(item_id)
+                affected_count += 1
+                continue
+            ensure_analysis_run_archived_for_cleanup(state, item)
             item_paths, item_run_ids = cleanup_targets_for_item(
                 state,
                 item,
@@ -1586,16 +1732,31 @@ def perform_cleanup_delete(
             affected_count += 1
     elif action_key:
         if operation != "delete":
-            raise ValueError("快捷清理动作不支持额外的操作模式")
+            raise ValueError("Quick cleanup actions do not support extra operation modes.")
+        if action_key == "clear_wallet_registry":
+            remote_deleted_count += registry.clear()
+            affected_count = remote_deleted_count
+            return {
+                "ok": True,
+                "deleted_count": affected_count,
+                "deleted_bytes": 0,
+                "deleted_item_ids": [],
+                "deleted_run_ids": [],
+                "inventory": build_cleanup_inventory(state),
+            }
         action_specs = build_cleanup_action_specs(state, sections)
         spec = action_specs.get(action_key)
         if spec is None:
-            raise ValueError(f"未知的清理动作：{action_key}")
+            raise ValueError(f"Unknown cleanup action: {action_key}")
+        if action_key == "prune_run_details":
+            for item in item_index.values():
+                if str(item.get("item_type") or "") == "analysis_run" and not bool(item.get("locked")):
+                    ensure_analysis_run_archived_for_cleanup(state, item)
         target_paths.extend(spec["paths"])
         deleted_run_ids.extend(str(run_id) for run_id in spec.get("deleted_run_ids", []))
         affected_count = int(spec.get("target_count") or 0)
     else:
-        raise ValueError("清理请求必须提供 item_ids 或 action_key")
+        raise ValueError("Cleanup requests must provide item_ids or action_key.")
 
     deleted_paths = dedupe_cleanup_paths(target_paths)
     removed_bytes = 0
@@ -1611,11 +1772,63 @@ def perform_cleanup_delete(
 
     return {
         "ok": True,
-        "deleted_count": affected_count if affected_count else len(deleted_paths),
+        "deleted_count": affected_count if affected_count else len(deleted_paths) + remote_deleted_count,
         "deleted_bytes": removed_bytes,
         "deleted_item_ids": deleted_item_ids,
         "deleted_run_ids": sorted({run_id for run_id in deleted_run_ids if run_id}),
         "inventory": build_cleanup_inventory(state),
+    }
+
+
+def build_cloud_archive_status(state: ServerState) -> dict[str, Any]:
+    status = cloud_archive_store(state).status()
+    status["history_registry"] = history_registry_store(state).status()
+    status["history_ledger"] = history_ledger_store(state).status()
+    manifests: list[dict[str, Any]] = []
+    for run_id in artifact_run_ids(state.artifacts_root):
+        output_dir = ensure_under(state.artifacts_root, state.artifacts_root / run_id)
+        if not output_dir.exists():
+            continue
+        summary = summarize_run_archive_manifest(output_dir)
+        manifests.append(
+            {
+                "run_id": run_id,
+                **summary,
+            }
+        )
+    status["runs"] = manifests
+    return status
+
+
+def sync_reusable_history_to_cloud(state: ServerState) -> dict[str, Any]:
+    registry_status = history_registry_store(state).sync_local_to_cloudflare()
+    ledger_status = history_ledger_store(state).sync_local_to_cloudflare()
+    return {
+        "history_registry": registry_status,
+        "history_ledger": ledger_status,
+    }
+
+
+def sync_cloud_archive_run(state: ServerState, run_id: str) -> dict[str, Any]:
+    normalized_run_id = str(run_id or "").strip()
+    if not normalized_run_id:
+        raise ValueError("run_id is required")
+    output_dir = ensure_under(state.artifacts_root, state.artifacts_root / normalized_run_id)
+    if not output_dir.exists():
+        raise ValueError(f"run output does not exist: {normalized_run_id}")
+    run_config = read_run_resolved_config(output_dir)
+    manifest = cloud_archive_module.archive_run_outputs(
+        output_dir,
+        run_id=normalized_run_id,
+        config=run_config,
+    )
+    reusable_history = sync_reusable_history_to_cloud(state)
+    return {
+        "ok": True,
+        "run_id": normalized_run_id,
+        "manifest": manifest,
+        "reusable_history": reusable_history,
+        "cloud_archive": build_cloud_archive_status(state),
     }
 
 
@@ -1696,11 +1909,11 @@ def prepare_smart_wallet_import_for_run(
 
     import_payload = body.get("smart_wallet_import")
     if not isinstance(import_payload, Mapping):
-        raise ValueError("后台地址库回流模式需要提供 smart_wallet_import 导入数据")
+        raise ValueError("Smart wallet library refresh requires smart_wallet_import data.")
 
     rows = normalize_import_wallet_rows(import_payload.get("payload"))
     if not rows:
-        raise ValueError("未从后台地址库 JSON 中解析到有效的钱包地址记录")
+        raise ValueError("No valid wallet records could be parsed from the smart wallet JSON payload.")
 
     source_file_name = str(import_payload.get("file_name") or "smart-wallet-export.json").strip()
     output_dir = ensure_under(state.artifacts_root, Path(run_state.output_dir))
@@ -1816,6 +2029,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             if parts == ["api", "history", "cleanup"]:
                 self.send_json(build_cleanup_inventory(self.app_state))
                 return
+            if parts == ["api", "history", "cloud", "status"]:
+                self.send_json(build_cloud_archive_status(self.app_state))
+                return
             if parts == ["api", "runs"]:
                 self.send_json({"items": self.handle_list_runs()})
                 return
@@ -1877,6 +2093,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                         operation=operation,
                     )
                 )
+                return
+            if parts == ["api", "history", "cloud", "sync"]:
+                run_id = str(body.get("run_id") or "").strip()
+                if run_id:
+                    self.send_json(sync_cloud_archive_run(self.app_state, run_id))
+                else:
+                    self.send_json(
+                        {
+                            "ok": True,
+                            **sync_reusable_history_to_cloud(self.app_state),
+                            "cloud_archive": build_cloud_archive_status(self.app_state),
+                        }
+                    )
                 return
             self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
         except ValueError as exc:

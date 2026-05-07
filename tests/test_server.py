@@ -6,15 +6,19 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from polymarket_weather_tool.history_registry import wallet_history_registry_dir
+from polymarket_weather_tool.history_ledger import history_ledger_table_path
 from polymarket_weather_tool.server import (
     RunState,
     ServerState,
+    build_cloud_archive_status,
     build_smart_pro_import_payload,
     build_cleanup_inventory,
     build_config_for_run,
@@ -22,6 +26,8 @@ from polymarket_weather_tool.server import (
     perform_cleanup_delete,
     read_run_summary,
     smart_pro_config_status,
+    sync_cloud_archive_run,
+    sync_reusable_history_to_cloud,
     sync_run_to_smart_pro,
 )
 from polymarket_weather_tool.config import WEEKLY_HIGH_PROFIT_MODE
@@ -136,6 +142,26 @@ class ServerConfigTests(unittest.TestCase):
             encoding="utf-8",
         )
         return record_path
+
+    def write_run_resolved_config(self, output_dir: Path, payload: dict[str, Any]) -> None:
+        (output_dir / "resolved_config.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def write_cloud_archive_manifest(self, output_dir: Path, payload: dict[str, Any]) -> None:
+        (output_dir / "cloud_archive_manifest.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def write_default_config(self, root: Path, payload: dict[str, Any]) -> None:
+        config_path = root / "configs" / "default_config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     def test_build_config_for_run_applies_numeric_filter_ranges_from_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -333,6 +359,196 @@ class ServerConfigTests(unittest.TestCase):
         self.assertGreater(actions["prune_run_details"]["target_count"], 0)
         self.assertEqual(actions["clear_wallet_registry"]["target_count"], 2)
 
+    def test_build_cleanup_inventory_includes_cloud_archive_manifest_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifacts_root = root / "artifacts"
+            artifacts_root.mkdir(parents=True)
+            output_dir = self.build_artifact_run(root, "polymarket-weather-20260428-010101Z-aaaaaa", with_wallets=True)
+            self.write_cloud_archive_manifest(
+                output_dir,
+                {
+                    "run_id": "polymarket-weather-20260428-010101Z-aaaaaa",
+                    "status": "archived",
+                    "backend": "cloudflare",
+                    "configured": True,
+                    "archived_at": "2026-05-06T12:00:00+00:00",
+                    "document_count": 7,
+                },
+            )
+
+            inventory = build_cleanup_inventory(ServerState(root=root, artifacts_root=artifacts_root))
+
+        sections = {section["key"]: section for section in inventory["sections"]}
+        analysis_item = sections["analysis_runs"]["items"][0]
+        self.assertEqual(analysis_item["archive_status"], "archived")
+        self.assertEqual(analysis_item["archived_document_count"], 7)
+        self.assertEqual(analysis_item["archive_backend"], "cloudflare")
+        self.assertIn("runs", inventory["cloud_archive"])
+        self.assertEqual(inventory["cloud_archive"]["backend"], "cloudflare")
+        self.assertEqual(inventory["cloud_archive"]["runs"][0]["run_id"], "polymarket-weather-20260428-010101Z-aaaaaa")
+        self.assertEqual(inventory["cloud_archive"]["runs"][0]["archive_status"], "archived")
+        self.assertEqual(inventory["cloud_archive"]["runs"][0]["archive_backend"], "cloudflare")
+
+    def test_build_cloud_archive_status_lists_run_manifests(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifacts_root = root / "artifacts"
+            artifacts_root.mkdir(parents=True)
+            output_dir = self.build_artifact_run(root, "polymarket-weather-20260428-010101Z-aaaaaa")
+            self.write_cloud_archive_manifest(
+                output_dir,
+                {
+                    "run_id": "polymarket-weather-20260428-010101Z-aaaaaa",
+                    "status": "archived",
+                    "backend": "cloudflare",
+                    "configured": True,
+                    "archived_at": "2026-05-06T12:00:00+00:00",
+                    "document_count": 3,
+                },
+            )
+
+            status = build_cloud_archive_status(ServerState(root=root, artifacts_root=artifacts_root))
+
+        self.assertIn("runs", status)
+        self.assertIn("history_registry", status)
+        self.assertIn("history_ledger", status)
+        self.assertEqual(status["backend"], "cloudflare")
+        self.assertEqual(len(status["runs"]), 1)
+        self.assertEqual(status["runs"][0]["run_id"], "polymarket-weather-20260428-010101Z-aaaaaa")
+        self.assertEqual(status["runs"][0]["archived_document_count"], 3)
+        self.assertEqual(status["runs"][0]["archive_backend"], "cloudflare")
+
+    def test_sync_reusable_history_to_cloud_pushes_local_registry_and_ledger_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifacts_root = root / "artifacts"
+            artifacts_root.mkdir(parents=True)
+            self.write_default_config(
+                root,
+                {
+                    "history_registry": {
+                        "enabled": True,
+                        "backend": "local",
+                        "cloudflare_account_id": "account-id",
+                        "cloudflare_d1_database_id": "database-id",
+                        "cloudflare_api_token": "api-token",
+                    },
+                    "history_ledger": {
+                        "enabled": True,
+                        "backend": "local",
+                        "cloudflare_account_id": "account-id",
+                        "cloudflare_d1_database_id": "database-id",
+                        "cloudflare_api_token": "api-token",
+                    },
+                },
+            )
+            self.build_wallet_registry_record(
+                root,
+                "0xabc0000000000000000000000000000000000000",
+                user_name="weather-pro",
+            )
+            trade_path = history_ledger_table_path(artifacts_root, "trades")
+            gap_path = history_ledger_table_path(artifacts_root, "gaps")
+            trade_path.parent.mkdir(parents=True, exist_ok=True)
+            trade_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "record_key": "trade-1",
+                            "wallet_address": "0xabc0000000000000000000000000000000000000",
+                            "run_id": "seed-run",
+                            "snapshot_scope": "full",
+                            "history_scope": "full_history",
+                            "event_timestamp": 1777000000,
+                            "payload": {"id": "trade-1"},
+                            "updated_at": "2026-05-06T00:00:00+00:00",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            gap_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "gap_key": "gap-1",
+                            "wallet_address": "0xabc0000000000000000000000000000000000000",
+                            "run_id": "seed-run",
+                            "snapshot_scope": "full",
+                            "section_name": "trades",
+                            "history_scope": "full_history",
+                            "collection_mode": "history_ledger",
+                            "stop_reason": "history_ledger_trade_history_complete",
+                            "complete": True,
+                            "range_start": None,
+                            "range_end": None,
+                            "payload": {},
+                            "updated_at": "2026-05-06T00:00:00+00:00",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "polymarket_weather_tool.history_registry.cloudflare_d1_upsert_rows",
+                side_effect=lambda _config, _table, *, rows, on_conflict: [dict(row) for row in rows],
+            ) as registry_upsert, patch(
+                "polymarket_weather_tool.history_ledger.cloudflare_d1_upsert_rows",
+                side_effect=lambda _config, _table, *, rows, on_conflict: [dict(row) for row in rows],
+            ) as ledger_upsert:
+                result = sync_reusable_history_to_cloud(
+                    ServerState(root=root, artifacts_root=artifacts_root)
+                )
+
+        self.assertEqual(result["history_registry"]["status"], "synced")
+        self.assertEqual(result["history_registry"]["backend"], "cloudflare")
+        self.assertEqual(result["history_registry"]["record_count"], 1)
+        self.assertEqual(result["history_ledger"]["status"], "synced")
+        self.assertEqual(result["history_ledger"]["backend"], "cloudflare")
+        self.assertEqual(result["history_ledger"]["trade_count"], 1)
+        self.assertTrue(
+            any(call.args[1] == "wallet_registry" for call in registry_upsert.call_args_list)
+        )
+        self.assertTrue(
+            any(call.args[1] == "wallet_trade_ledger" for call in ledger_upsert.call_args_list)
+        )
+        self.assertTrue(
+            any(call.args[1] == "wallet_history_gaps" for call in ledger_upsert.call_args_list)
+        )
+
+    def test_sync_cloud_archive_run_writes_manifest_for_existing_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifacts_root = root / "artifacts"
+            artifacts_root.mkdir(parents=True)
+            output_dir = self.build_artifact_run(root, "polymarket-weather-20260428-010101Z-aaaaaa", with_wallets=True)
+            self.write_run_resolved_config(
+                output_dir,
+                {
+                    "cloud_archive": {
+                        "enabled": False,
+                    }
+                },
+            )
+
+            result = sync_cloud_archive_run(
+                ServerState(root=root, artifacts_root=artifacts_root),
+                "polymarket-weather-20260428-010101Z-aaaaaa",
+            )
+
+            manifest = json.loads((output_dir / "cloud_archive_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["run_id"], "polymarket-weather-20260428-010101Z-aaaaaa")
+        self.assertEqual(result["manifest"]["status"], "disabled")
+        self.assertEqual(result["manifest"]["backend"], "cloudflare")
+        self.assertIn("reusable_history", result)
+        self.assertEqual(result["reusable_history"]["history_registry"]["backend"], "cloudflare")
+        self.assertEqual(manifest["status"], "disabled")
+        self.assertEqual(manifest["backend"], "cloudflare")
+
     def test_perform_cleanup_delete_prunes_run_details_but_keeps_summary_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -355,6 +571,40 @@ class ServerConfigTests(unittest.TestCase):
             self.assertFalse((output_dir / "screening_records.json").exists())
             self.assertFalse((output_dir / "weather_events.json").exists())
             self.assertFalse((output_dir / "progress.log").exists())
+
+    def test_perform_cleanup_delete_aborts_when_cloud_archive_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifacts_root = root / "artifacts"
+            artifacts_root.mkdir(parents=True)
+            output_dir = self.build_artifact_run(root, "polymarket-weather-20260428-010101Z-aaaaaa", with_wallets=True)
+            self.write_run_resolved_config(
+                output_dir,
+                {
+                    "cloud_archive": {
+                        "enabled": True,
+                        "backend": "cloudflare",
+                        "archive_before_cleanup": True,
+                        "cloudflare_account_id": "account-id",
+                        "cloudflare_d1_database_id": "database-id",
+                        "cloudflare_api_token": "api-token",
+                    }
+                },
+            )
+            state = ServerState(root=root, artifacts_root=artifacts_root)
+
+            with patch(
+                "polymarket_weather_tool.server.cloud_archive_module.archive_run_outputs",
+                return_value={"status": "failed", "document_count": 0},
+            ):
+                with self.assertRaisesRegex(ValueError, "Cloud archive prep failed"):
+                    perform_cleanup_delete(
+                        state,
+                        item_ids=["run:polymarket-weather-20260428-010101Z-aaaaaa"],
+                    )
+
+            self.assertTrue(output_dir.exists())
+            self.assertTrue((output_dir / "wallets").exists())
 
     def test_perform_cleanup_delete_single_item_returns_refreshed_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -476,7 +726,7 @@ class ServerConfigTests(unittest.TestCase):
             self.build_artifact_run(root, "codex-smoke", with_wallets=True)
             state = ServerState(root=root, artifacts_root=artifacts_root)
 
-            with self.assertRaisesRegex(ValueError, "明细清理仅支持正式分析历史条目"):
+            with self.assertRaisesRegex(ValueError, "Detailed pruning only supports formal analysis history items."):
                 perform_cleanup_delete(
                     state,
                     item_ids=["run:codex-smoke"],
@@ -499,7 +749,7 @@ class ServerConfigTests(unittest.TestCase):
                 progress_log_path=str(queued_dir / "progress.log"),
             )
 
-            with self.assertRaisesRegex(ValueError, "不能删除|locked|运行"):
+            with self.assertRaisesRegex(ValueError, "Running tasks cannot be deleted yet."):
                 perform_cleanup_delete(state, item_ids=["run:codex-smoke-queued"])
 
             result = perform_cleanup_delete(state, action_key="delete_diagnostic_records")
@@ -652,7 +902,7 @@ class ServerConfigTests(unittest.TestCase):
             wallet_detail["finder_ai"]["providerMeta"] = {
                 "provider": "deepseek",
                 "model": "deepseek-v4-flash",
-                "promptVersion": "finder-weather-brief-v1",
+                "promptVersion": "finder-weather-brief-v3",
                 "generatedAt": "2026-05-05T00:00:00+00:00",
                 "inputHash": "sha256:test",
                 "cacheKey": "cache|" + ("m" * 2000),

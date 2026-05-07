@@ -16,6 +16,10 @@ CONFIG_SECTION_KEYS = (
     "pagination",
     "weather",
     "analysis",
+    "history_registry",
+    "history_provider",
+    "history_ledger",
+    "cloud_archive",
     "chain_validation",
     "runtime",
 )
