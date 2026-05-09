@@ -519,7 +519,7 @@ def small_config(cache_dir: Path) -> dict[str, Any]:
                 "display_name": "High win rate",
                 "all": [
                     {"field": "closed_position_count", "op": ">=", "value": 3},
-                    {"field": "closed_position_win_rate", "op": ">=", "value": 0.6},
+                    {"field": "closed_position_sample_win_rate", "op": ">=", "value": 0.6},
                 ],
             },
         ],
@@ -868,6 +868,9 @@ class PipelineSmokeTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["screening_weather_trade_ratio"], 0.75)
         self.assertAlmostEqual(metrics["screening_weather_notional_ratio"], 0.5)
         self.assertAlmostEqual(metrics["closed_position_win_rate"], 2 / 3)
+        self.assertAlmostEqual(metrics["closed_position_sample_win_rate"], 2 / 3)
+        self.assertAlmostEqual(metrics["wallet_win_rate"], 1 / 3)
+        self.assertEqual(metrics["wallet_win_rate_source"], "regional_trade_day_cashflow")
         self.assertAlmostEqual(metrics["median_trade_notional"], 37.5)
         self.assertGreater(metrics["trades_per_active_day"], 0)
         self.assertAlmostEqual(metrics["reward_total_usdc"], 12.34)
@@ -1123,6 +1126,9 @@ class PipelineSmokeTests(unittest.TestCase):
             metrics = wallet_result["metrics"]
             self.assertAlmostEqual(metrics["weather_notional_ratio"], 0.5)
             self.assertAlmostEqual(metrics["closed_position_win_rate"], 2 / 3)
+            self.assertAlmostEqual(metrics["closed_position_sample_win_rate"], 2 / 3)
+            self.assertAlmostEqual(metrics["wallet_win_rate"], 1 / 3)
+            self.assertEqual(metrics["wallet_win_rate_source"], "regional_trade_day_cashflow")
             self.assertAlmostEqual(metrics["median_trade_notional"], 37.5)
             self.assertEqual(
                 wallet_result["selection_record"]["labels"],
@@ -1198,6 +1204,8 @@ class PipelineSmokeTests(unittest.TestCase):
                 wallet_result["finder_ai"]["providerMeta"]["promptVersion"],
                 "finder-weather-brief-v6",
             )
+            prompt_context = wallet_result["finder_ai"]["layeredInput"]
+            self.assertNotIn("closed_position_win_rate", prompt_context["L3"]["behaviorSnapshot"])
             self.assertTrue(
                 str(wallet_result["finder_ai"]["providerMeta"]["inputHash"]).startswith("sha256:")
             )
@@ -1591,8 +1599,10 @@ class PipelineSmokeTests(unittest.TestCase):
             return {
                 "wallet": wallet,
                 "metrics": {
+                    "wallet_win_rate": 0.55,
                     "weather_notional_ratio": 0.5,
                     "closed_position_win_rate": 0.6,
+                    "closed_position_sample_win_rate": 0.6,
                     "closed_profit_multiple": 1.8,
                     "trades_per_active_day": 3.5,
                     "leaderboard_pnl": 120.0,
@@ -1860,8 +1870,10 @@ class PipelineSmokeTests(unittest.TestCase):
                         "metrics": {
                             "leaderboard_pnl": 200,
                             "leaderboard_volume": 2000,
+                            "wallet_win_rate": 0.7,
                             "weather_notional_ratio": 0.8,
                             "closed_position_win_rate": 0.7,
+                            "closed_position_sample_win_rate": 0.7,
                             "closed_profit_multiple": 2.0,
                             "trades_per_active_day": 4,
                             "trade_count": 4,

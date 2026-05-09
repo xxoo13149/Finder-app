@@ -111,7 +111,10 @@ export type WalletRankSummary = {
   x_username?: string;
   pnl?: number;
   closed_profit_multiple?: number;
+  wallet_win_rate?: number;
   closed_position_win_rate?: number;
+  closed_position_sample_win_rate?: number;
+  wallet_win_rate_source?: string;
   trades_per_active_day?: number;
   trade_count?: number;
 };
@@ -134,7 +137,10 @@ export type WalletRow = {
   weather_trade_count?: number;
   weather_trade_ratio?: number;
   weather_notional_ratio?: number;
+  wallet_win_rate?: number;
   closed_position_win_rate?: number;
+  closed_position_sample_win_rate?: number;
+  wallet_win_rate_source?: string;
   closed_profit_multiple?: number;
   median_trade_notional?: number;
   trades_per_active_day?: number;

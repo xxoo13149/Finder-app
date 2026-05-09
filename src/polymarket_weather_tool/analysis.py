@@ -3769,6 +3769,9 @@ def analyze_wallet(
             metrics["weather_notional_ratio"],
         ),
         "closed_position_win_rate": metrics["closed_position_win_rate"],
+        "closed_position_sample_win_rate": metrics["closed_position_sample_win_rate"],
+        "wallet_win_rate": metrics["wallet_win_rate"],
+        "wallet_win_rate_source": metrics["wallet_win_rate_source"],
         "closed_profit_multiple": metrics["closed_profit_multiple"],
         "median_trade_notional": metrics["median_trade_notional"],
         "trades_per_active_day": metrics["trades_per_active_day"],
@@ -4224,6 +4227,47 @@ def build_evidence_summary(
     }
 
 
+def wallet_display_win_rate_summary(
+    *,
+    regional_day_win_rate_summary: Mapping[str, Any],
+    closed_position_win_rate: float,
+    closed_position_count: int,
+    closed_position_win_count: int = 0,
+) -> dict[str, Any]:
+    region_days = max(0, int(to_float(regional_day_win_rate_summary.get("region_day_count"))))
+    raw_regions = regional_day_win_rate_summary.get("regions", [])
+    regions = [item for item in raw_regions if isinstance(item, Mapping)] if isinstance(raw_regions, list) else []
+    if region_days > 0 and regions:
+        positive_days = sum(
+            max(0, int(to_float(item.get("positive_return_days"))))
+            for item in regions
+        )
+        region_day_total = sum(
+            max(0, int(to_float(item.get("total_trade_days"))))
+            for item in regions
+        )
+        denominator = region_day_total or region_days
+        positive_days = min(positive_days, denominator)
+        return {
+            "source": "regional_trade_day_cashflow",
+            "win_rate": ratio(positive_days, denominator),
+            "win_count": positive_days,
+            "resolved_count": denominator,
+            "closed_position_sample_win_rate": closed_position_win_rate,
+            "closed_position_sample_win_count": closed_position_win_count,
+            "closed_position_count": closed_position_count,
+        }
+    return {
+        "source": "closed_position_sample",
+        "win_rate": closed_position_win_rate,
+        "win_count": closed_position_win_count,
+        "resolved_count": closed_position_count,
+        "closed_position_sample_win_rate": closed_position_win_rate,
+        "closed_position_sample_win_count": closed_position_win_count,
+        "closed_position_count": closed_position_count,
+    }
+
+
 def compute_metrics(
     *,
     snapshot: dict[str, Any],
@@ -4325,6 +4369,7 @@ def compute_metrics(
 
     wins = sum(1 for position in closed_positions if to_float(position.get("realizedPnl")) > 0)
     losses = sum(1 for position in closed_positions if to_float(position.get("realizedPnl")) < 0)
+    closed_position_sample_win_rate = ratio(wins, len(closed_positions))
     reward_total_usdc = sum(record_notional(record) for record in rewards)
     closed_realized_pnl = sum(
         to_float(position.get("realizedPnl")) for position in closed_positions
@@ -4383,6 +4428,12 @@ def compute_metrics(
         regional_trades,
         region_fields=metric_region_fields,
         min_trade_count=int(config["analysis"].get("regional_win_rate_min_trade_count", 3)),
+    )
+    display_win_rate_summary = wallet_display_win_rate_summary(
+        regional_day_win_rate_summary=regional_day_win_rate_summary,
+        closed_position_win_rate=closed_position_sample_win_rate,
+        closed_position_count=len(closed_positions),
+        closed_position_win_count=wins,
     )
     low_chip_cost_summary = summarize_low_chip_cost(
         regional_trades,
@@ -4469,7 +4520,11 @@ def compute_metrics(
         "open_position_count": len(positions),
         "open_position_long_dated_ratio": ratio(len(long_dated_positions), len(positions)),
         "closed_position_count": len(closed_positions),
-        "closed_position_win_rate": ratio(wins, len(closed_positions)),
+        "closed_position_win_rate": closed_position_sample_win_rate,
+        "wallet_win_rate": display_win_rate_summary["win_rate"],
+        "wallet_win_rate_source": display_win_rate_summary["source"],
+        "wallet_win_rate_summary": display_win_rate_summary,
+        "closed_position_sample_win_rate": closed_position_sample_win_rate,
         "closed_position_loss_rate": ratio(losses, len(closed_positions)),
         "winning_closed_position_count": wins,
         "losing_closed_position_count": losses,
@@ -4659,8 +4714,23 @@ def build_analysis_summary(
             "weather_notional_ratio": mean(
                 [metrics["weather_notional_ratio"] for metrics in metrics_list]
             ),
+            "wallet_win_rate": mean(
+                [
+                    metrics.get("wallet_win_rate", metrics.get("closed_position_win_rate", 0.0))
+                    for metrics in metrics_list
+                ]
+            ),
             "closed_position_win_rate": mean(
                 [metrics["closed_position_win_rate"] for metrics in metrics_list]
+            ),
+            "closed_position_sample_win_rate": mean(
+                [
+                    metrics.get(
+                        "closed_position_sample_win_rate",
+                        metrics.get("closed_position_win_rate", 0.0),
+                    )
+                    for metrics in metrics_list
+                ]
             ),
             "closed_profit_multiple": mean(
                 [metrics["closed_profit_multiple"] for metrics in metrics_list]
@@ -4679,6 +4749,15 @@ def build_analysis_summary(
                 "pnl": wallet["metrics"]["leaderboard_pnl"],
                 "closed_profit_multiple": wallet["metrics"]["closed_profit_multiple"],
                 "closed_position_win_rate": wallet["metrics"]["closed_position_win_rate"],
+                "closed_position_sample_win_rate": wallet["metrics"].get(
+                    "closed_position_sample_win_rate",
+                    wallet["metrics"]["closed_position_win_rate"],
+                ),
+                "wallet_win_rate": wallet["metrics"].get(
+                    "wallet_win_rate",
+                    wallet["metrics"]["closed_position_win_rate"],
+                ),
+                "wallet_win_rate_source": wallet["metrics"].get("wallet_win_rate_source", ""),
             }
             for wallet in sorted(
                 wallet_results,

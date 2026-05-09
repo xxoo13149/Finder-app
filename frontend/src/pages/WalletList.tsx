@@ -272,7 +272,7 @@ export function WalletList({
               <Header align="right">成交量</Header>
               <Header align="right">交易数</Header>
               <Header align="right">天气占比</Header>
-              <Header align="right">胜率</Header>
+              <Header align="right">正收益率</Header>
               <Header>主地区</Header>
               <Header align="right">最高暴击</Header>
               <Header>最近证据日</Header>
@@ -307,7 +307,7 @@ export function WalletList({
                     <Cell align="right">{formatCurrency(wallet.volume)}</Cell>
                     <Cell align="right">{formatNumber(wallet.trade_count)}</Cell>
                     <Cell align="right">{formatPercent(wallet.weather_notional_ratio)}</Cell>
-                    <Cell align="right">{formatPercent(wallet.closed_position_win_rate)}</Cell>
+                    <Cell align="right">{formatPercent(wallet.wallet_win_rate ?? wallet.closed_position_win_rate)}</Cell>
                     <Cell>{wallet.main_region || wallet.dominant_region || '-'}</Cell>
                     <Cell align="right">{formatMultiple(wallet.highest_burst ?? wallet.max_region_daily_profit_multiple)}</Cell>
                     <Cell>{wallet.recent_evidence_date || wallet.highest_burst_date || '-'}</Cell>

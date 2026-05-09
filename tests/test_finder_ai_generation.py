@@ -119,6 +119,7 @@ def build_payload(*, status: str = "ready", enabled: bool = True) -> dict[str, A
                     "weather_trade_ratio": 0.82,
                     "dominant_region": "Dallas",
                     "closed_position_win_rate": 0.71,
+                    "wallet_win_rate": 0.25,
                     "unified_profit_multiple": 1.46,
                     "snapshot_complete": True,
                     "ignored_noise": "should_not_be_forwarded",
@@ -411,6 +412,7 @@ class FinderAiGenerationTests(unittest.TestCase):
         self.assertEqual(prompt_context["strategyNotes"], ["Focuses on repeated city setups"])
         self.assertEqual(prompt_context["behaviorSnapshot"]["trade_count"], 14)
         self.assertEqual(prompt_context["behaviorSnapshot"]["dominant_region"], "Dallas")
+        self.assertNotIn("closed_position_win_rate", prompt_context["behaviorSnapshot"])
         self.assertNotIn("ignored_noise", prompt_context["behaviorSnapshot"])
         self.assertEqual(prompt_context["coverage"]["auditComplete"], True)
         self.assertEqual(prompt_context["coverage"]["structuredEvidenceCount"], 3)

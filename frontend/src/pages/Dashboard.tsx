@@ -127,7 +127,7 @@ export function Dashboard({
     {title: '排行榜记录', value: formatNumber(summary?.leaderboard_rows_fetched), trend: '最近运行'},
     {title: '已筛选钱包', value: formatNumber(summary?.wallets_screened), trend: '本次分析'},
     {title: '入选钱包', value: formatNumber(summary?.wallets_selected), trend: `${summary?.errors || 0} 个错误`},
-    {title: '平均胜率', value: formatPercent(averages.closed_position_win_rate), trend: '已平仓头寸'},
+    {title: '平均正收益率', value: formatPercent(averages.wallet_win_rate ?? averages.closed_position_win_rate), trend: '交易日正收益'},
   ];
 
   if (loading && !selectedRunId) {
@@ -281,7 +281,6 @@ export function Dashboard({
     </div>
   );
 }
-
 function preferredDashboardWalletName(wallet: WalletRankSummary): string | undefined {
   for (const value of [wallet.user_name, wallet.x_username]) {
     const text = String(value || '').trim();
@@ -294,7 +293,6 @@ function preferredDashboardWalletName(wallet: WalletRankSummary): string | undef
   }
   return undefined;
 }
-
 function PanelMessage({
   title,
   body,

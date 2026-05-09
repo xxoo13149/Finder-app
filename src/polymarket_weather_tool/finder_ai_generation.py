@@ -1361,7 +1361,6 @@ def build_prompt_behavior_snapshot(value: Any) -> dict[str, Any]:
             "weather_trade_count",
             "weather_trade_ratio",
             "weather_notional_ratio",
-            "closed_position_win_rate",
             "closed_profit_multiple",
             "trades_per_active_day",
             "dominant_region",

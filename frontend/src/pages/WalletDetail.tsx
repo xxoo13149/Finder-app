@@ -167,7 +167,7 @@ export function WalletDetail({
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
         <Stat title="总盈亏" value={formatCurrency(numberValue(selection.pnl ?? metrics.leaderboard_pnl))} up />
-        <Stat title="胜率" value={formatPercent(numberValue(selection.closed_position_win_rate ?? metrics.closed_position_win_rate))} up />
+        <Stat title="正收益率" value={formatPercent(numberValue(selection.wallet_win_rate ?? metrics.wallet_win_rate ?? selection.closed_position_win_rate ?? metrics.closed_position_win_rate))} up />
         <Stat title="中位交易额" value={formatCurrency(numberValue(selection.median_trade_notional ?? metrics.median_trade_notional))} />
         <Stat
           title="天气占比"
@@ -567,7 +567,7 @@ function RegionPathTable({profile}: {profile: Record<string, unknown>}) {
               <tr>
                 <th className="py-2 pr-2 text-left text-xs font-medium uppercase text-slate-500">地区</th>
                 <th className="px-2 py-2 text-right text-xs font-medium uppercase text-slate-500">交易数</th>
-                <th className="px-2 py-2 text-right text-xs font-medium uppercase text-slate-500">胜率</th>
+                <th className="px-2 py-2 text-right text-xs font-medium uppercase text-slate-500">正收益日占比</th>
                 <th className="px-2 py-2 text-right text-xs font-medium uppercase text-slate-500">买入</th>
                 <th className="px-2 py-2 text-right text-xs font-medium uppercase text-slate-500">卖出</th>
                 <th className="px-2 py-2 text-right text-xs font-medium uppercase text-slate-500">交易现金流</th>

@@ -84,7 +84,7 @@ export function Reports({
 
   const stats = [
     {label: '入选钱包', value: formatNumber(summary?.wallets_selected ?? wallets.length), caption: `从 ${formatNumber(summary?.wallets_screened)} 个候选中筛出`},
-    {label: '平均胜率', value: formatPercent(averages.closed_position_win_rate), caption: '已平仓头寸口径'},
+    {label: '平均正收益率', value: formatPercent(averages.wallet_win_rate ?? averages.closed_position_win_rate), caption: '交易日正收益'},
     {label: '平均盈利倍数', value: `${formatNumber(averages.closed_profit_multiple, 2)}x`, caption: '入选钱包平均值'},
     {label: '日均交易', value: formatNumber(averages.trades_per_active_day, 1), caption: '活跃交易频率'},
   ];
@@ -281,7 +281,7 @@ export function Reports({
               <tr>
                 <Header>钱包</Header>
                 <Header align="right">盈亏</Header>
-                <Header align="right">胜率</Header>
+                <Header align="right">正收益率</Header>
                 <Header align="right">交易数</Header>
                 <Header>标签</Header>
               </tr>
@@ -310,7 +310,7 @@ export function Reports({
                       </div>
                     </td>
                     <TableCell align="right">{formatCurrency(wallet.pnl)}</TableCell>
-                    <TableCell align="right">{formatPercent(wallet.closed_position_win_rate)}</TableCell>
+                    <TableCell align="right">{formatPercent(wallet.wallet_win_rate ?? wallet.closed_position_win_rate)}</TableCell>
                     <TableCell align="right">{formatNumber(wallet.trade_count)}</TableCell>
                     <td className="min-w-[260px] px-6 py-4">
                       <div className="flex flex-wrap gap-1.5">
@@ -430,7 +430,7 @@ function safeFileName(value: string): string {
 }
 
 function walletsToCsv(wallets: WalletRow[]): string {
-  const headers = ['钱包地址', '用户名', '排名', '盈亏', '成交量', '交易数', '天气占比', '胜率', '标签'];
+  const headers = ['钱包地址', '用户名', '排名', '盈亏', '成交量', '交易数', '天气占比', '正收益率', '标签'];
   const rows = wallets.map((wallet) => [
     wallet.wallet,
     wallet.user_name,
@@ -439,7 +439,7 @@ function walletsToCsv(wallets: WalletRow[]): string {
     wallet.volume,
     wallet.trade_count,
     wallet.weather_notional_ratio,
-    wallet.closed_position_win_rate,
+    wallet.wallet_win_rate ?? wallet.closed_position_win_rate,
     (wallet.labels || []).join(' / '),
   ]);
   return `\ufeff${[headers, ...rows].map((row) => row.map(csvCell).join(',')).join('\n')}`;
