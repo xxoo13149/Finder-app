@@ -3152,6 +3152,108 @@ def wallet_result_system_core_label_keys(wallet_result: Mapping[str, Any]) -> li
     return deduped
 
 
+def matched_label_evaluation_keys(wallet_result: Mapping[str, Any]) -> list[str]:
+    keys: list[str] = []
+    evaluations = wallet_result.get("label_evaluations", [])
+    if not isinstance(evaluations, list):
+        return keys
+    for item in evaluations:
+        if not isinstance(item, Mapping) or not bool(item.get("matched")):
+            continue
+        key = str(item.get("key") or "").strip()
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def wallet_relabel_state(wallet_result: Mapping[str, Any]) -> dict[str, Any]:
+    metrics = (
+        wallet_result.get("metrics")
+        if isinstance(wallet_result.get("metrics"), Mapping)
+        else {}
+    )
+    labels = wallet_result.get("labels") if isinstance(wallet_result.get("labels"), list) else []
+    evaluations = (
+        wallet_result.get("label_evaluations")
+        if isinstance(wallet_result.get("label_evaluations"), list)
+        else []
+    )
+    screening = (
+        wallet_result.get("screening")
+        if isinstance(wallet_result.get("screening"), Mapping)
+        else {}
+    )
+    return {
+        "core_label_keys": wallet_result_system_core_label_keys(wallet_result),
+        "matched_label_keys": matched_label_evaluation_keys(wallet_result),
+        "label_count": len(labels),
+        "label_evaluation_count": len(evaluations),
+        "trade_count": int(metrics.get("trade_count") or 0),
+        "weather_trade_count": int(metrics.get("weather_trade_count") or 0),
+        "history_scope": str(metrics.get("history_scope") or ""),
+        "metrics_history_scope": str(metrics.get("metrics_history_scope") or ""),
+        "snapshot_scope": str(metrics.get("snapshot_scope") or ""),
+        "snapshot_complete": bool(metrics.get("snapshot_complete", False)),
+        "screening": {
+            "selected": bool(screening.get("selected")),
+            "trade_count": int(screening.get("trade_count") or 0),
+            "weather_trade_count": int(screening.get("weather_trade_count") or 0),
+            "reasons": list(screening.get("reasons") or []),
+        },
+    }
+
+
+def list_delta(current: list[str], previous: list[str]) -> list[str]:
+    previous_set = set(previous)
+    return [item for item in current if item not in previous_set]
+
+
+def build_full_history_relabel_record(
+    *,
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> dict[str, Any]:
+    before_state = wallet_relabel_state(before)
+    after_state = wallet_relabel_state(after)
+    before_core = list(before_state.get("core_label_keys") or [])
+    after_core = list(after_state.get("core_label_keys") or [])
+    return {
+        "status": "completed",
+        "source": "full_history_hydration",
+        "pre_hydration": before_state,
+        "post_hydration": after_state,
+        "core_label_keys_before": before_core,
+        "core_label_keys_after": after_core,
+        "added_core_label_keys": list_delta(after_core, before_core),
+        "removed_core_label_keys": list_delta(before_core, after_core),
+        "changed": before_state.get("matched_label_keys") != after_state.get("matched_label_keys"),
+    }
+
+
+def restore_lightweight_screening_context(
+    wallet_result: dict[str, Any],
+    lightweight_wallet_result: Mapping[str, Any],
+) -> None:
+    screening = lightweight_wallet_result.get("screening")
+    if not isinstance(screening, Mapping):
+        return
+    restored_screening = dict(screening)
+    wallet_result["screening"] = restored_screening
+    selection_record = wallet_result.get("selection_record")
+    if not isinstance(selection_record, dict):
+        return
+    for source_key, target_key in (
+        ("trade_count", "trade_count"),
+        ("weather_trade_count", "weather_trade_count"),
+        ("weather_trade_ratio", "weather_trade_ratio"),
+        ("weather_notional_ratio", "weather_notional_ratio"),
+        ("selected", "selected"),
+        ("reasons", "reasons"),
+    ):
+        if source_key in restored_screening:
+            selection_record[target_key] = restored_screening[source_key]
+
+
 def wallet_result_selected(wallet_result: Mapping[str, Any]) -> bool:
     screening = wallet_result.get("screening")
     return bool(isinstance(screening, Mapping) and screening.get("selected"))
@@ -3496,6 +3598,7 @@ def analyze_leaderboard_entry(
                     wallet,
                     config,
                 )
+                lightweight_wallet_result = wallet_result
                 wallet_result = analyze_wallet(
                     wallet=wallet,
                     leaderboard_entry=leaderboard_entry,
@@ -3503,9 +3606,15 @@ def analyze_leaderboard_entry(
                     weather_index=weather_index,
                     config=config,
                 )
+                restore_lightweight_screening_context(wallet_result, lightweight_wallet_result)
+                relabel_record = build_full_history_relabel_record(
+                    before=lightweight_wallet_result,
+                    after=wallet_result,
+                )
                 wallet_result["deep_hydration"] = {
                     "status": "completed",
                     "snapshot_scope": "full",
+                    "relabel": relabel_record,
                 }
             except Exception as hydration_exc:
                 wallet_result["deep_hydration"] = {
@@ -4448,6 +4557,12 @@ def compute_metrics(
         "history_scope": str(screening_evidence_status.get("history_scope") or ""),
         "operation_audit": operation_audit,
         "audit_profit_summary": audit_profit_summary,
+        "snapshot_scope": str(snapshot.get("snapshot_scope") or ""),
+        "metrics_history_scope": (
+            "full_history"
+            if str(snapshot.get("snapshot_scope") or "").strip().lower() == "full"
+            else str(screening_evidence_status.get("history_scope") or "")
+        ),
         "trade_liquidity_profit": audit_profit_summary["trade_liquidity_profit"],
         "trade_liquidity_profit_multiple": audit_profit_summary[
             "trade_liquidity_profit_multiple"

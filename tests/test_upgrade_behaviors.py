@@ -260,6 +260,23 @@ class RetryingFullHydrationClient(ScreeningHydrationClient):
         return super().fetch_activity_page(**kwargs)
 
 
+class FullHydrationRelabelClient(WindowActivityClient):
+    def __init__(
+        self,
+        *,
+        screening_records: list[dict[str, Any]],
+        full_records: list[dict[str, Any]],
+    ) -> None:
+        super().__init__(screening_records)
+        self.full_records = full_records
+
+    def fetch_activity_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+        if kwargs.get("start") is None and kwargs.get("activity_type") in (None, ""):
+            self.calls.append(("activity", kwargs))
+            return list(self.full_records)
+        return super().fetch_activity_page(**kwargs)
+
+
 class GraphHistoryProviderClient(WindowActivityClient):
     def __init__(self, records: list[dict[str, Any]]) -> None:
         super().__init__(records)
@@ -2074,6 +2091,120 @@ class UpgradeBehaviorTests(unittest.TestCase):
             if name == "activity" and kwargs.get("start") is None and kwargs.get("activity_type") in (None, "")
         ]
         self.assertEqual(len(full_activity_calls), 2)
+
+    def test_full_hydration_recomputes_labels_without_mutating_screening_record(self) -> None:
+        current_ts = 1_777_000_000
+        screening_records = [
+            {
+                "type": "TRADE",
+                "id": "screening-nyc",
+                "timestamp": current_ts - 60,
+                "conditionId": "cond-nyc",
+                "side": "BUY",
+                "size": "2",
+                "price": "0.60",
+                "usdcSize": "1.20",
+            },
+            {
+                "type": "TRADE",
+                "id": "screening-nyc-2",
+                "timestamp": current_ts - 30,
+                "conditionId": "cond-nyc",
+                "side": "SELL",
+                "size": "2",
+                "price": "0.70",
+                "usdcSize": "1.40",
+            },
+        ]
+        full_records = [
+            *screening_records,
+            {
+                "type": "TRADE",
+                "id": "full-london",
+                "timestamp": current_ts - 86_400,
+                "conditionId": "cond-london",
+                "side": "BUY",
+                "size": "1",
+                "price": "0.60",
+                "usdcSize": "0.60",
+            },
+            {
+                "type": "TRADE",
+                "id": "full-tokyo",
+                "timestamp": current_ts - 172_800,
+                "conditionId": "cond-tokyo",
+                "side": "BUY",
+                "size": "1",
+                "price": "0.60",
+                "usdcSize": "0.60",
+            },
+        ]
+        client = FullHydrationRelabelClient(
+            screening_records=screening_records,
+            full_records=full_records,
+        )
+        config = {
+            "analysis": {
+                "current_datetime": "2026-04-25T00:00:00+00:00",
+                "position_size_threshold": 0.1,
+                "screening_snapshot_enabled": True,
+                "hydrate_selected_wallet_full_history": True,
+                "top_trades_in_report": 3,
+                "top_positions_in_report": 3,
+                "top_closed_positions_in_report": 3,
+            },
+            "chain_validation": {"enabled": False},
+            "leaderboard": {"time_period": "DAY"},
+            "pagination": {"page_size": 10, "max_offset": 100},
+            "wallet_filter": {
+                "min_pnl": 0,
+                "min_volume": 0,
+                "min_traded_count": 1,
+                "min_weather_trade_ratio": 0,
+                "include_wallets": [],
+                "exclude_wallets": [],
+            },
+        }
+        weather_index = WeatherIndex(
+            set(),
+            set(),
+            {"cond-nyc", "cond-london", "cond-tokyo"},
+            set(),
+            {
+                "cond-nyc": "NYC",
+                "cond-london": "London",
+                "cond-tokyo": "Tokyo",
+            },
+        )
+
+        result = analyze_leaderboard_entry(
+            client=client,  # type: ignore[arg-type]
+            leaderboard_entry={
+                "proxyWallet": "0xabc",
+                "pnl": "20",
+                "vol": "1000",
+                "rank": 1,
+                "userName": "full-relabel",
+            },
+            weather_index=weather_index,
+            config=config,
+        )
+
+        wallet_result = result["wallet_result"]
+        self.assertEqual(wallet_result["deep_hydration"]["status"], "completed")
+        self.assertEqual(wallet_result["metrics"]["snapshot_scope"], "full")
+        self.assertEqual(wallet_result["metrics"]["metrics_history_scope"], "full_history")
+        self.assertEqual(wallet_result["metrics"]["trade_count"], 4)
+        self.assertEqual(wallet_result["screening"]["trade_count"], 2)
+        self.assertEqual(wallet_result["selection_record"]["trade_count"], 2)
+        self.assertTrue(wallet_result["screening"]["selected"])
+        self.assertFalse(any(label.get("system_core") for label in wallet_result["labels"]))
+        relabel = wallet_result["deep_hydration"]["relabel"]
+        self.assertEqual(relabel["status"], "completed")
+        self.assertEqual(relabel["core_label_keys_before"], ["high_frequency_region"])
+        self.assertEqual(relabel["core_label_keys_after"], [])
+        self.assertEqual(relabel["removed_core_label_keys"], ["high_frequency_region"])
+        self.assertTrue(relabel["changed"])
 
     def test_should_hydrate_wallet_result_full_history_requires_selected_and_system_core_label(self) -> None:
         config = {
