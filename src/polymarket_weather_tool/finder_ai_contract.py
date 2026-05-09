@@ -10,7 +10,7 @@ FINDER_AI_PROVIDER = "deepseek"
 FINDER_AI_MODEL = "deepseek-v4-flash"
 FINDER_AI_GENERATION_SCOPE = "brief"
 FINDER_AI_SCHEMA_VERSION = "finder-ai-v1"
-FINDER_AI_PROMPT_VERSION = "finder-weather-brief-v3"
+FINDER_AI_PROMPT_VERSION = "finder-weather-brief-v6"
 
 
 def text_value(value: Any) -> str:

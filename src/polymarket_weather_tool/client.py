@@ -106,7 +106,7 @@ class PolymarketClient:
             1.0,
             float(api_config.get("page_zero_backoff_multiplier", 1.5)),
         )
-        self.user_agent = str(api_config.get("user_agent", "polymarket-weather-tool/0.1.0"))
+        self.user_agent = str(api_config.get("user_agent", "polymarket-weather-tool/0.2.0"))
         self.use_cache = bool(api_config.get("use_cache", True))
         self.cache_ttl = int(api_config.get("cache_ttl_seconds", 1800))
         self.cache_dir = Path(api_config.get("cache_dir", ".cache/polymarket-weather-tool"))

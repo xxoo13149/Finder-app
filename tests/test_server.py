@@ -16,21 +16,33 @@ sys.path.insert(0, str(ROOT / "src"))
 from polymarket_weather_tool.history_registry import wallet_history_registry_dir
 from polymarket_weather_tool.history_ledger import history_ledger_table_path
 from polymarket_weather_tool.server import (
+    DIAGNOSTIC_DETAIL_TOTAL_BYTES_LIMIT,
     RunState,
     ServerState,
+    artifact_run_ids,
+    build_relay_import_payload_from_run,
+    build_resume_config_for_run,
     build_cloud_archive_status,
     build_smart_pro_import_payload,
     build_cleanup_inventory,
     build_config_for_run,
     ensure_cleanup_path_allowed,
+    infer_artifact_status,
+    paginated_selected_wallet_rows,
     perform_cleanup_delete,
+    prepare_import_wallet_source_for_run,
+    public_run_record,
     read_run_summary,
+    run_prunable_paths,
+    resume_existing_run,
+    selected_wallet_rows,
     smart_pro_config_status,
     sync_cloud_archive_run,
     sync_reusable_history_to_cloud,
     sync_run_to_smart_pro,
 )
-from polymarket_weather_tool.config import WEEKLY_HIGH_PROFIT_MODE
+from polymarket_weather_tool.config import RELAY_ANALYSIS_MODE, SMART_WALLET_LIBRARY_REFRESH_MODE, WEEKLY_HIGH_PROFIT_MODE
+from polymarket_weather_tool.smart_wallet_library import normalize_import_wallet_rows, smart_wallet_profile_path
 
 
 class ServerConfigTests(unittest.TestCase):
@@ -163,6 +175,25 @@ class ServerConfigTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_artifact_run_ids_sort_by_run_id_timestamp_not_directory_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifacts_root = root / "artifacts"
+            older = self.build_artifact_run(root, "polymarket-weather-20260507-181221Z-aaaaaa")
+            newer = self.build_artifact_run(root, "polymarket-weather-20260507-183410Z-bbbbbb")
+            os.utime(older, (2_000_000_000, 2_000_000_000))
+            os.utime(newer, (1_000_000_000, 1_000_000_000))
+
+            run_ids = artifact_run_ids(artifacts_root)
+            record = public_run_record(
+                ServerState(root=root, artifacts_root=artifacts_root),
+                "polymarket-weather-20260507-183410Z-bbbbbb",
+                include_files=False,
+            )
+
+        self.assertEqual(run_ids[:2], ["polymarket-weather-20260507-183410Z-bbbbbb", "polymarket-weather-20260507-181221Z-aaaaaa"])
+        self.assertEqual(record["created_at"], "2026-05-07T18:34:10+00:00")
+
     def test_build_config_for_run_applies_numeric_filter_ranges_from_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             state = ServerState(root=ROOT, artifacts_root=Path(temp_dir))
@@ -244,6 +275,95 @@ class ServerConfigTests(unittest.TestCase):
         self.assertEqual(config["runtime"]["run_id"], run_state.run_id)
         self.assertEqual(config["runtime"]["progress_log_path"], run_state.progress_log_path)
 
+    def test_build_config_for_run_keeps_relay_analysis_mode_distinct_from_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = ServerState(root=ROOT, artifacts_root=Path(temp_dir))
+            run_state = RunState(
+                run_id="relay-mode-test",
+                status="queued",
+                output_dir=str(Path(temp_dir) / "relay-mode-test"),
+                created_at="2026-05-09T00:00:00+00:00",
+                progress_log_path=str(Path(temp_dir) / "relay-mode-test" / "progress.log"),
+            )
+
+            config = build_config_for_run(
+                state,
+                {"analysis_mode": RELAY_ANALYSIS_MODE},
+                run_state,
+            )
+
+        self.assertEqual(config["runtime"]["analysis_mode"], RELAY_ANALYSIS_MODE)
+        self.assertEqual(config["runtime"]["analysis_mode_label"], "历史结果接力分析")
+        self.assertEqual(config["wallet_filter"]["activity_filter_mode"], "all")
+        self.assertNotEqual(config["runtime"]["analysis_mode"], SMART_WALLET_LIBRARY_REFRESH_MODE)
+
+    def test_prepare_import_wallet_source_materializes_library_only_for_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifacts_root = root / "artifacts"
+            refresh_wallet = "0x" + "a" * 40
+            relay_wallet = "0x" + "b" * 40
+            state = ServerState(root=root, artifacts_root=artifacts_root)
+
+            refresh_run = RunState(
+                run_id="refresh-run",
+                status="queued",
+                output_dir=str(artifacts_root / "refresh-run"),
+                created_at="2026-05-09T00:00:00+00:00",
+                progress_log_path=str(artifacts_root / "refresh-run" / "progress.log"),
+            )
+            refresh_config = {
+                "runtime": {"analysis_mode": SMART_WALLET_LIBRARY_REFRESH_MODE},
+            }
+            refresh_summary = prepare_import_wallet_source_for_run(
+                state,
+                {
+                    "smart_wallet_import": {
+                        "file_name": "smart-pro.json",
+                        "payload": {"wallets": [{"address": refresh_wallet, "userName": "refresh"}]},
+                    }
+                },
+                refresh_run,
+                refresh_config,
+            )
+
+            relay_run = RunState(
+                run_id="relay-run",
+                status="queued",
+                output_dir=str(artifacts_root / "relay-run"),
+                created_at="2026-05-09T00:00:00+00:00",
+                progress_log_path=str(artifacts_root / "relay-run" / "progress.log"),
+            )
+            relay_config = {
+                "runtime": {"analysis_mode": RELAY_ANALYSIS_MODE},
+            }
+            relay_summary = prepare_import_wallet_source_for_run(
+                state,
+                {
+                    "smart_wallet_import": {
+                        "file_name": "finder-relay.json",
+                        "payload": {"wallets": [{"address": relay_wallet, "userName": "relay"}]},
+                    }
+                },
+                relay_run,
+                relay_config,
+            )
+
+            self.assertIsNotNone(refresh_summary)
+            self.assertIsNotNone(relay_summary)
+            assert refresh_summary is not None
+            assert relay_summary is not None
+            self.assertEqual(refresh_summary["created_profiles"], 1)
+            self.assertTrue(smart_wallet_profile_path(artifacts_root, refresh_wallet).exists())
+            self.assertFalse(smart_wallet_profile_path(artifacts_root, relay_wallet).exists())
+            self.assertEqual(relay_summary["wallet_count"], 1)
+            self.assertEqual(relay_summary["source_type"], "finder_relay")
+            self.assertEqual(relay_config["runtime"]["analysis_mode"], RELAY_ANALYSIS_MODE)
+            self.assertEqual(relay_config["runtime"]["relay_wallet_count"], 1)
+            self.assertIn("relay_import_rows.json", relay_config["runtime"]["relay_source_path"])
+            self.assertNotIn("smart_wallet_library_source_path", relay_config["runtime"])
+            self.assertNotIn("created_profiles", relay_summary)
+
     def test_read_run_summary_backfills_core_labeled_wallet_count_for_legacy_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "legacy-run"
@@ -292,6 +412,760 @@ class ServerConfigTests(unittest.TestCase):
 
         self.assertEqual(summary["wallets_selected"], 2)
         self.assertEqual(summary["wallets_core_labeled"], 1)
+        self.assertEqual(summary["diagnostics"]["core_labels"]["wallets"], 1)
+        self.assertEqual(
+            summary["diagnostics"]["core_labels"]["by_key"]["high_frequency_region"],
+            1,
+        )
+
+    def test_read_run_summary_exposes_pipeline_diagnostics_for_unfinished_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            wallet = "0xaaa0000000000000000000000000000000000000"
+            (output_dir / "resolved_config.json").write_text(
+                json.dumps({"weather": {"max_events": 10000, "tag_id": 84, "tag_slug": "weather", "use_keyset": True}}),
+                encoding="utf-8",
+            )
+            (output_dir / "progress.log").write_text(
+                "2026-05-08T17:40:22+00:00\tLoading existing weather events for resumed run\n"
+                "2026-05-08T17:40:28+00:00\tIndexed 4511 weather events\n",
+                encoding="utf-8",
+            )
+            (output_dir / "selected_wallets.json").write_text(
+                json.dumps([{"wallet": wallet, "selected": True}]),
+                encoding="utf-8",
+            )
+            (wallets_dir / f"{wallet}.json").write_text(
+                json.dumps(
+                    {
+                        "wallet": wallet,
+                        "selection_record": {"wallet": wallet, "selected": True},
+                        "metrics": {"history_scope": "recent_activity"},
+                        "label_evaluations": [
+                            {"key": "high_frequency_region", "matched": True},
+                            {"key": "split_player", "matched": False},
+                        ],
+                        "deep_hydration": {
+                            "status": "skipped",
+                            "reason": "full_hydration_not_required",
+                        },
+                        "finder_ai": {
+                            "briefGeneration": {
+                                "status": "needs_review",
+                                "reason": "analysis_audit_incomplete",
+                                "gate": {"eligible": True},
+                            },
+                            "needsReview": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = read_run_summary(output_dir)
+
+        diagnostics = summary["diagnostics"]
+        self.assertEqual(diagnostics["weather_events"]["indexed"], 4511)
+        self.assertEqual(diagnostics["weather_events"]["max"], 10000)
+        self.assertTrue(diagnostics["weather_events"]["reused_existing"])
+        self.assertFalse(diagnostics["weather_events"]["cap_hit"])
+        self.assertEqual(diagnostics["weather_events"]["stop_reason"], "below_cap_unknown")
+        self.assertEqual(
+            diagnostics["weather_events"]["shortfall_hint"],
+            "tag_natural_end_or_filter_scope",
+        )
+        self.assertTrue(diagnostics["weather_events"]["trading_fallback_enabled"])
+        self.assertIn("交易记录自身", diagnostics["weather_events"]["coverage_note"])
+        self.assertEqual(diagnostics["core_labels"]["wallets"], 1)
+        self.assertEqual(diagnostics["core_labels"]["by_key"]["high_frequency_region"], 1)
+        self.assertEqual(diagnostics["hydration"]["skipped"], 1)
+        self.assertEqual(diagnostics["hydration"]["history_scopes"]["recent_activity"], 1)
+        self.assertEqual(
+            diagnostics["hydration"]["reason_counts"]["full_hydration_not_required"],
+            1,
+        )
+        self.assertEqual(diagnostics["finder_ai"]["eligible"], 1)
+        self.assertEqual(
+            diagnostics["finder_ai"]["reason_counts"]["analysis_audit_incomplete"],
+            1,
+        )
+
+    def test_read_run_summary_uses_lightweight_core_counts_for_large_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            wallet = "0xaaa0000000000000000000000000000000000000"
+            (output_dir / "progress.log").write_text(
+                "2026-05-08T17:40:28+00:00\tIndexed 4511 weather events\n",
+                encoding="utf-8",
+            )
+            (output_dir / "resolved_config.json").write_text(
+                json.dumps({"weather": {"max_events": 10000}}),
+                encoding="utf-8",
+            )
+            (output_dir / "selected_wallets.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "wallet": wallet,
+                            "selected": True,
+                            "dominant_region_trade_ratio": 0.5,
+                            "history_scope": "recent_activity",
+                            "ai_generation_status": "needs_review",
+                            "ai_generation_reason": "analysis_audit_incomplete",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            for index in range(21):
+                (wallets_dir / f"0x{index:040x}.json").write_text(
+                    json.dumps({"wallet": f"0x{index:040x}"}),
+                    encoding="utf-8",
+                )
+
+            summary = read_run_summary(output_dir)
+
+        diagnostics = summary["diagnostics"]
+        self.assertEqual(diagnostics["detail_diagnostics_source"], "lightweight_rows")
+        self.assertEqual(diagnostics["core_labels"]["wallets"], 1)
+        self.assertEqual(diagnostics["core_labels"]["by_key"]["high_frequency_region"], 1)
+        self.assertEqual(diagnostics["finder_ai"]["reason_counts"]["analysis_audit_incomplete"], 1)
+
+    def test_read_run_summary_uses_hydration_details_when_full_details_exceed_byte_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            first_wallet = "0xaaa0000000000000000000000000000000000000"
+            second_wallet = "0xbbb0000000000000000000000000000000000000"
+            (output_dir / "progress.log").write_text(
+                "2026-05-08T17:40:28+00:00\tIndexed 4511 weather events\n",
+                encoding="utf-8",
+            )
+            (output_dir / "resolved_config.json").write_text(
+                json.dumps({"weather": {"max_events": 10000, "use_keyset": True}}),
+                encoding="utf-8",
+            )
+            (output_dir / "selected_wallets.json").write_text(
+                json.dumps(
+                    [
+                        {"wallet": first_wallet, "selected": True, "history_scope": "recent_activity"},
+                        {"wallet": second_wallet, "selected": True, "history_scope": "recent_activity"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            large_text = "x" * (14 * 1024 * 1024)
+            (wallets_dir / f"{first_wallet}.json").write_text(
+                json.dumps(
+                    {
+                        "wallet": first_wallet,
+                        "metrics": {"history_scope": "full"},
+                        "deep_hydration": {"status": "completed"},
+                        "large": large_text,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (wallets_dir / f"{second_wallet}.json").write_text(
+                json.dumps(
+                    {
+                        "wallet": second_wallet,
+                        "metrics": {"history_scope": "recent_activity"},
+                        "deep_hydration": {
+                            "status": "failed",
+                            "reason": "Remote end closed connection without response",
+                        },
+                        "large": large_text,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = read_run_summary(output_dir)
+
+        diagnostics = summary["diagnostics"]
+        self.assertEqual(diagnostics["detail_diagnostics_source"], "hydration_wallet_details")
+        self.assertEqual(diagnostics["hydration"]["completed"], 1)
+        self.assertEqual(diagnostics["hydration"]["failed"], 1)
+        self.assertEqual(diagnostics["hydration"]["skipped"], 0)
+        self.assertEqual(
+            diagnostics["hydration"]["reason_counts"]["Remote end closed connection without response"],
+            1,
+        )
+
+    def test_read_run_summary_skips_oversized_hydration_details(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            wallet = "0xaaa0000000000000000000000000000000000000"
+            (output_dir / "progress.log").write_text(
+                "2026-05-08T17:40:28+00:00\tIndexed 4511 weather events\n",
+                encoding="utf-8",
+            )
+            (output_dir / "resolved_config.json").write_text(
+                json.dumps({"weather": {"max_events": 10000, "use_keyset": True}}),
+                encoding="utf-8",
+            )
+            (output_dir / "selected_wallets.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "wallet": wallet,
+                            "selected": True,
+                            "dominant_region_trade_ratio": 0.5,
+                            "history_scope": "screening_window",
+                            "ai_generation_status": "generated",
+                            "ai_generation_reason": "generated",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            oversized_text = "x" * (DIAGNOSTIC_DETAIL_TOTAL_BYTES_LIMIT + 1)
+            (wallets_dir / f"{wallet}.json").write_text(
+                json.dumps(
+                    {
+                        "wallet": wallet,
+                        "metrics": {"history_scope": "full"},
+                        "deep_hydration": {"status": "completed"},
+                        "large": oversized_text,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = read_run_summary(output_dir)
+
+        diagnostics = summary["diagnostics"]
+        self.assertEqual(diagnostics["detail_diagnostics_source"], "lightweight_rows")
+        self.assertEqual(diagnostics["hydration"]["history_scopes"]["screening_window"], 1)
+        self.assertEqual(diagnostics["finder_ai"]["status_counts"]["generated"], 1)
+
+    def test_unfinished_run_wallet_rows_fallback_to_wallet_details(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifacts_root = root / "artifacts"
+            run_id = "polymarket-weather-20260507-183410Z-59031f"
+            output_dir = artifacts_root / run_id
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            wallet = "0xabc0000000000000000000000000000000000000"
+            (output_dir / "progress.log").write_text(
+                "2026-05-08T06:25:19+00:00\tAnalyzing wallets 85-86 of 177\n",
+                encoding="utf-8",
+            )
+            (output_dir / "selected_wallets.json").write_text("[]", encoding="utf-8")
+            (wallets_dir / f"{wallet}.json").write_text(
+                json.dumps(
+                    {
+                        "wallet": wallet,
+                        "leaderboard_entry": {"rank": 45, "userName": "relay-user"},
+                        "selection_record": {
+                            "wallet": wallet,
+                            "selected": True,
+                            "pnl": 12.5,
+                            "labels": ["Weather specialist"],
+                        },
+                        "label_evaluations": [{"key": "high_frequency_region", "matched": True}],
+                        "finder_ai": {
+                            "normalizedAddress": wallet,
+                            "matched": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            rows = selected_wallet_rows(output_dir)
+            summary = read_run_summary(output_dir)
+            payload = build_smart_pro_import_payload(
+                output_dir,
+                run_id,
+                requested_wallets=[wallet],
+            )
+
+            self.assertIn(run_id, artifact_run_ids(artifacts_root))
+            self.assertEqual(infer_artifact_status(output_dir), "partial")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["wallet"], wallet)
+            self.assertEqual(rows[0]["rank"], 45)
+            self.assertEqual(rows[0]["user_name"], "relay-user")
+            self.assertEqual(rows[0]["labels"], ["Weather specialist"])
+            self.assertTrue(rows[0]["detail_available"])
+            self.assertEqual(summary["wallets_selected"], 1)
+            self.assertEqual(summary["wallets_core_labeled"], 0)
+            self.assertEqual(payload["wallets"][0]["row"]["wallet"], wallet)
+            self.assertEqual(payload["wallets"][0]["detail"]["wallet"], wallet)
+            self.assertEqual(payload["wallets"][0]["finderAi"]["normalizedAddress"], wallet)
+
+    def test_selected_wallet_rows_merges_existing_rows_with_wallet_detail_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "artifacts" / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            first_wallet = "0xaaa0000000000000000000000000000000000000"
+            second_wallet = "0xbbb0000000000000000000000000000000000000"
+            (output_dir / "selected_wallets.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "wallet": first_wallet,
+                            "selected": True,
+                            "labels": ["manual"],
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (wallets_dir / f"{first_wallet}.json").write_text(
+                json.dumps(
+                    {
+                        "wallet": first_wallet,
+                        "leaderboard_entry": {"rank": 8, "userName": "first"},
+                        "selection_record": {"wallet": first_wallet, "selected": True},
+                        "labels": [{"display_name": "Weather specialist"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (wallets_dir / f"{second_wallet}.json").write_text(
+                json.dumps(
+                    {
+                        "wallet": second_wallet,
+                        "leaderboard_entry": {"rank": 9, "userName": "second"},
+                        "selection_record": {
+                            "wallet": second_wallet,
+                            "selected": True,
+                            "labels": ["detail-only"],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            rows = selected_wallet_rows(output_dir)
+
+        self.assertEqual([row["wallet"] for row in rows], [first_wallet, second_wallet])
+        self.assertEqual(rows[0]["labels"], ["manual"])
+        self.assertEqual(rows[0]["rank"], 8)
+        self.assertTrue(rows[0]["detail_available"])
+        self.assertEqual(rows[1]["labels"], ["detail-only"])
+        self.assertEqual(rows[1]["user_name"], "second")
+
+    def test_relay_import_uses_original_source_pool_and_keeps_no_detail_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "artifacts" / "source-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            core_wallet = "0xaaa0000000000000000000000000000000000000"
+            no_core_wallet = "0xbbb0000000000000000000000000000000000000"
+            no_detail_wallet = "0xccc0000000000000000000000000000000000000"
+            (output_dir / "smart_wallet_import_rows.json").write_text(
+                json.dumps(
+                    [
+                        {"address": core_wallet, "userName": "core"},
+                        {"address": no_core_wallet, "userName": "no-core"},
+                        {"address": no_detail_wallet, "userName": "no-detail"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (wallets_dir / f"{core_wallet}.json").write_text(
+                json.dumps(
+                    {
+                        "wallet": core_wallet,
+                        "selection_record": {"wallet": core_wallet, "selected": True},
+                        "label_evaluations": [{"key": "high_frequency_region", "matched": True}],
+                        "finder_ai": {"briefGeneration": {"status": "generated"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (wallets_dir / f"{no_core_wallet}.json").write_text(
+                json.dumps(
+                    {
+                        "wallet": no_core_wallet,
+                        "selection_record": {"wallet": no_core_wallet, "selected": True},
+                        "label_evaluations": [{"key": "high_frequency_region", "matched": False}],
+                        "finder_ai": {"briefGeneration": {"status": "needs_review"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            incomplete = build_relay_import_payload_from_run(
+                output_dir,
+                "source-run",
+                deepseek_filter="incomplete",
+            )
+            completed = build_relay_import_payload_from_run(
+                output_dir,
+                "source-run",
+                deepseek_filter="completed",
+            )
+            core = build_relay_import_payload_from_run(
+                output_dir,
+                "source-run",
+                core_label_filter="core",
+            )
+            non_core = build_relay_import_payload_from_run(
+                output_dir,
+                "source-run",
+                core_label_filter="non_core",
+            )
+
+        self.assertEqual(incomplete["source_total"], 3)
+        self.assertEqual(incomplete["completed_count"], 1)
+        self.assertEqual(incomplete["incomplete_count"], 2)
+        incomplete_rows = normalize_import_wallet_rows(incomplete["payload"])
+        incomplete_wallets = [
+            row["wallet"]["normalizedAddress"]
+            for row in incomplete_rows
+        ]
+        self.assertEqual(incomplete_wallets, [no_core_wallet, no_detail_wallet])
+
+        completed_rows = normalize_import_wallet_rows(completed["payload"])
+        self.assertEqual(
+            [row["wallet"]["normalizedAddress"] for row in completed_rows],
+            [core_wallet],
+        )
+
+        core_rows = normalize_import_wallet_rows(core["payload"])
+        self.assertEqual([row["wallet"]["normalizedAddress"] for row in core_rows], [core_wallet])
+
+        non_core_rows = normalize_import_wallet_rows(non_core["payload"])
+        self.assertEqual(
+            [row["wallet"]["normalizedAddress"] for row in non_core_rows],
+            [no_core_wallet, no_detail_wallet],
+        )
+
+    def test_public_run_record_counts_wallets_without_loading_detail_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifacts_root = root / "artifacts"
+            output_dir = artifacts_root / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            first_wallet = "0xaaa0000000000000000000000000000000000000"
+            second_wallet = "0xbbb0000000000000000000000000000000000000"
+            (output_dir / "progress.log").write_text("working", encoding="utf-8")
+            (output_dir / "resolved_config.json").write_text("{}", encoding="utf-8")
+            (output_dir / "selected_wallets.json").write_text(
+                json.dumps([{"wallet": first_wallet, "selected": True}]),
+                encoding="utf-8",
+            )
+            for wallet in (first_wallet, second_wallet):
+                (wallets_dir / f"{wallet}.json").write_text('{"wallet":', encoding="utf-8")
+
+            record = public_run_record(
+                ServerState(root=root, artifacts_root=artifacts_root),
+                "partial-run",
+                include_files=False,
+            )
+
+        self.assertEqual(record["status"], "partial")
+        self.assertTrue(record["resumable"])
+        self.assertEqual(record["selected_wallet_count"], 1)
+        self.assertEqual(record["wallet_detail_count"], 2)
+
+    def test_public_run_record_tolerates_non_array_selected_wallets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifacts_root = root / "artifacts"
+            output_dir = artifacts_root / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            wallet = "0xaaa0000000000000000000000000000000000000"
+            (output_dir / "progress.log").write_text("working", encoding="utf-8")
+            (output_dir / "resolved_config.json").write_text("{}", encoding="utf-8")
+            (output_dir / "selected_wallets.json").write_text("{}", encoding="utf-8")
+            (wallets_dir / f"{wallet}.json").write_text(
+                json.dumps({"wallet": wallet, "selection_record": {"wallet": wallet, "selected": True}}),
+                encoding="utf-8",
+            )
+
+            state = ServerState(root=root, artifacts_root=artifacts_root)
+            record = public_run_record(state, "partial-run", include_files=False)
+            summary = read_run_summary(output_dir)
+            rows, total = paginated_selected_wallet_rows(output_dir, offset=0, limit=10)
+
+        self.assertEqual(record["status"], "partial")
+        self.assertEqual(record["selected_wallet_count"], 1)
+        self.assertEqual(record["wallet_detail_count"], 1)
+        self.assertEqual(summary["wallets_selected"], 1)
+        self.assertEqual(total, 1)
+        self.assertEqual(rows[0]["wallet"], wallet)
+
+    def test_read_run_summary_uses_lightweight_counts_for_unfinished_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "artifacts" / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            first_wallet = "0xaaa0000000000000000000000000000000000000"
+            second_wallet = "0xbbb0000000000000000000000000000000000000"
+            (output_dir / "selected_wallets.json").write_text(
+                json.dumps([{"wallet": first_wallet, "selected": True}]),
+                encoding="utf-8",
+            )
+            for wallet in (first_wallet, second_wallet):
+                (wallets_dir / f"{wallet}.json").write_text('{"wallet":', encoding="utf-8")
+
+            summary = read_run_summary(output_dir)
+
+        self.assertEqual(summary["wallets_selected"], 1)
+        self.assertEqual(summary["wallets_core_labeled"], 0)
+
+    def test_paginated_selected_wallet_rows_reads_only_requested_detail_page(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "artifacts" / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            first_wallet = "0xaaa0000000000000000000000000000000000000"
+            second_wallet = "0xbbb0000000000000000000000000000000000000"
+            third_wallet = "0xccc0000000000000000000000000000000000000"
+            (output_dir / "selected_wallets.json").write_text("[]", encoding="utf-8")
+            (wallets_dir / f"{first_wallet}.json").write_text('{"wallet":', encoding="utf-8")
+            for wallet, name in ((second_wallet, "second"), (third_wallet, "third")):
+                (wallets_dir / f"{wallet}.json").write_text(
+                    json.dumps({"wallet": wallet, "leaderboard_entry": {"userName": name}}),
+                    encoding="utf-8",
+                )
+
+            rows, total = paginated_selected_wallet_rows(output_dir, offset=1, limit=1)
+
+        self.assertEqual(total, 3)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["wallet"], second_wallet)
+        self.assertEqual(rows[0]["user_name"], "second")
+        self.assertEqual(rows[0]["labels"], [])
+        self.assertEqual(rows[0]["source"], "wallet_detail")
+        self.assertTrue(rows[0]["detail_available"])
+
+    def test_paginated_selected_wallet_rows_uses_lightweight_selection_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "artifacts" / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            first_wallet = "0xaaa0000000000000000000000000000000000000"
+            second_wallet = "0xbbb0000000000000000000000000000000000000"
+            (output_dir / "selected_wallets.json").write_text(
+                json.dumps(
+                    [
+                        {"wallet": first_wallet, "selected": True, "labels": ["selection"]},
+                        {"wallet": second_wallet, "selected": True, "labels": ["selection"]},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (wallets_dir / f"{first_wallet}.json").write_text('{"wallet":', encoding="utf-8")
+            (wallets_dir / f"{second_wallet}.json").write_text('{"wallet":', encoding="utf-8")
+
+            rows, total = paginated_selected_wallet_rows(output_dir, offset=0, limit=2)
+
+        self.assertEqual(total, 2)
+        self.assertEqual([row["wallet"] for row in rows], [first_wallet, second_wallet])
+        self.assertEqual(rows[0]["labels"], ["selection"])
+        self.assertTrue(rows[0]["detail_available"])
+
+    def test_paginated_selected_wallet_rows_exposes_core_label_flags_from_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "artifacts" / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            wallet = "0xaaa0000000000000000000000000000000000000"
+            (output_dir / "selected_wallets.json").write_text(
+                json.dumps([{"wallet": wallet, "selected": True}]),
+                encoding="utf-8",
+            )
+            (wallets_dir / f"{wallet}.json").write_text(
+                json.dumps(
+                    {
+                        "wallet": wallet,
+                        "selection_record": {"wallet": wallet, "selected": True},
+                        "label_evaluations": [
+                            {"key": "high_frequency_region", "matched": True},
+                            {"key": "split_player", "matched": False},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            rows, total = paginated_selected_wallet_rows(output_dir, offset=0, limit=10)
+
+        self.assertEqual(total, 1)
+        self.assertTrue(rows[0]["has_core_label"])
+        self.assertEqual(rows[0]["core_label_keys"], ["high_frequency_region"])
+
+    def test_paginated_selected_wallet_rows_switches_to_lightweight_mode_above_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "artifacts" / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            (output_dir / "progress.log").write_text("working", encoding="utf-8")
+            (output_dir / "resolved_config.json").write_text("{}", encoding="utf-8")
+            wallets = [f"0x{index:040x}" for index in range(51)]
+            for wallet in wallets:
+                (wallets_dir / f"{wallet}.json").write_text(
+                    json.dumps({"wallet": wallet, "leaderboard_entry": {"userName": f"user-{wallet[-4:]}"}}),
+                    encoding="utf-8",
+                )
+
+            rows, total = paginated_selected_wallet_rows(output_dir, offset=0, limit=5)
+            summary = read_run_summary(output_dir)
+
+        self.assertEqual(total, 51)
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(rows[0]["wallet"], wallets[0])
+        self.assertEqual(rows[0]["source"], "wallet_detail_file")
+        self.assertTrue(rows[0]["detail_available"])
+        self.assertNotIn("user_name", rows[0])
+        self.assertEqual(summary["wallets_selected"], 51)
+        self.assertEqual(summary["label_counts"], {})
+        self.assertEqual(summary["top_wallets_by_pnl"][0], {"wallet": wallets[0]})
+
+    def test_missing_selected_wallet_snapshot_lists_detail_stubs_without_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "artifacts" / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            wallet = "0xaaa0000000000000000000000000000000000000"
+            (output_dir / "progress.log").write_text("working", encoding="utf-8")
+            (output_dir / "resolved_config.json").write_text("{}", encoding="utf-8")
+            (wallets_dir / f"{wallet}.json").write_text('{"wallet":', encoding="utf-8")
+
+            rows, total = paginated_selected_wallet_rows(output_dir, offset=0, limit=10)
+            summary = read_run_summary(output_dir)
+            snapshot_exists = (output_dir / "selected_wallets.json").exists()
+
+        self.assertEqual(total, 1)
+        self.assertEqual(rows[0]["wallet"], wallet)
+        self.assertEqual(rows[0]["source"], "wallet_detail")
+        self.assertTrue(rows[0]["detail_available"])
+        self.assertEqual(rows[0]["user_name"], "")
+        self.assertFalse(snapshot_exists)
+        self.assertEqual(summary["wallets_selected"], 1)
+        self.assertEqual(summary["label_counts"], {})
+        self.assertEqual(summary["top_wallets_by_pnl"], [{"wallet": wallet}])
+
+    def test_unfinished_run_detail_prune_is_protected_until_final_outputs_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "artifacts" / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            (output_dir / "resolved_config.json").write_text("{}", encoding="utf-8")
+            (output_dir / "progress.log").write_text("working", encoding="utf-8")
+            (wallets_dir / "0xabc0000000000000000000000000000000000000.json").write_text(
+                '{"wallet":"0xabc0000000000000000000000000000000000000"}',
+                encoding="utf-8",
+            )
+
+            protected_paths = run_prunable_paths(output_dir)
+            (output_dir / "analysis_summary.json").write_text("{}", encoding="utf-8")
+            (output_dir / "report.txt").write_text("report", encoding="utf-8")
+            prunable_paths = run_prunable_paths(output_dir)
+
+        self.assertEqual(protected_paths, [])
+        self.assertIn(output_dir / "wallets", prunable_paths)
+
+    def test_build_resume_config_for_run_reuses_output_and_enables_resume_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifacts_root = root / "artifacts"
+            output_dir = artifacts_root / "partial-run"
+            output_dir.mkdir(parents=True)
+            config = {
+                "runtime": {
+                    "run_id": "old-run",
+                    "progress_log_path": "old-progress.log",
+                    "smart_wallet_library_source_path": str(output_dir / "smart_wallet_import_rows.json"),
+                },
+                "api": {},
+            }
+            (output_dir / "resolved_config.json").write_text(json.dumps(config), encoding="utf-8")
+            state = ServerState(root=root, artifacts_root=artifacts_root)
+            run_state = RunState(
+                run_id="partial-run",
+                status="queued",
+                output_dir=str(output_dir),
+                created_at="2026-05-08T00:00:00+00:00",
+                progress_log_path=str(output_dir / "progress.log"),
+            )
+
+            resume_config = build_resume_config_for_run(state, "partial-run", output_dir, run_state)
+
+        self.assertEqual(resume_config["runtime"]["run_id"], "partial-run")
+        self.assertEqual(resume_config["runtime"]["progress_log_path"], str(output_dir / "progress.log"))
+        self.assertTrue(resume_config["runtime"]["resume_existing_output"])
+        self.assertEqual(
+            resume_config["runtime"]["smart_wallet_library_source_path"],
+            str(output_dir / "smart_wallet_import_rows.json"),
+        )
+
+    def test_resume_existing_run_queues_same_run_and_sets_resume_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifacts_root = root / "artifacts"
+            output_dir = artifacts_root / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            (output_dir / "progress.log").write_text("working", encoding="utf-8")
+            (output_dir / "resolved_config.json").write_text(
+                json.dumps({"runtime": {"run_id": "partial-run"}, "api": {}}),
+                encoding="utf-8",
+            )
+            (wallets_dir / "0xabc0000000000000000000000000000000000000.json").write_text(
+                '{"wallet":"0xabc0000000000000000000000000000000000000"}',
+                encoding="utf-8",
+            )
+            state = ServerState(root=root, artifacts_root=artifacts_root)
+            captured: dict[str, Any] = {}
+
+            def fake_run_in_background(fake_state: ServerState, run_state: RunState, config: dict[str, Any]) -> None:
+                captured["run_state"] = run_state
+                captured["config"] = config
+
+            with patch("polymarket_weather_tool.server.run_in_background", side_effect=fake_run_in_background):
+                payload = resume_existing_run(state, "partial-run")
+
+        self.assertEqual(payload["run_id"], "partial-run")
+        self.assertEqual(payload["status"], "queued")
+        self.assertEqual(captured["run_state"].output_dir, str(output_dir))
+        self.assertTrue(captured["config"]["runtime"]["resume_existing_output"])
+        self.assertEqual(captured["config"]["runtime"]["run_id"], "partial-run")
+        self.assertEqual(captured["config"]["runtime"]["progress_log_path"], str(output_dir / "progress.log"))
+
+    def test_resume_existing_run_rejects_running_or_finished_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifacts_root = root / "artifacts"
+            output_dir = artifacts_root / "partial-run"
+            output_dir.mkdir(parents=True)
+            (output_dir / "progress.log").write_text("working", encoding="utf-8")
+            (output_dir / "resolved_config.json").write_text("{}", encoding="utf-8")
+            state = ServerState(root=root, artifacts_root=artifacts_root)
+            state.runs["partial-run"] = RunState(
+                run_id="partial-run",
+                status="running",
+                output_dir=str(output_dir),
+                created_at="2026-05-08T00:00:00+00:00",
+                progress_log_path=str(output_dir / "progress.log"),
+            )
+
+            with self.assertRaises(ValueError):
+                resume_existing_run(state, "partial-run")
+
+            state.runs.clear()
+            (output_dir / "analysis_summary.json").write_text("{}", encoding="utf-8")
+            (output_dir / "report.txt").write_text("report", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                resume_existing_run(state, "partial-run")
 
     def test_build_cleanup_inventory_groups_runs_outputs_and_actions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -902,7 +1776,7 @@ class ServerConfigTests(unittest.TestCase):
             wallet_detail["finder_ai"]["providerMeta"] = {
                 "provider": "deepseek",
                 "model": "deepseek-v4-flash",
-                "promptVersion": "finder-weather-brief-v3",
+                "promptVersion": "finder-weather-brief-v6",
                 "generatedAt": "2026-05-05T00:00:00+00:00",
                 "inputHash": "sha256:test",
                 "cacheKey": "cache|" + ("m" * 2000),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import http.client
 import sys
 import tempfile
 import unittest
@@ -22,14 +23,17 @@ from polymarket_weather_tool.analysis import (
     fetch_wallet_snapshot,
     fetch_weather_events,
     fetch_weather_events_keyset,
+    fetch_weather_events_keyset_with_summary,
     history_provider_fetch_plan,
     paginate,
     probe_wallet_trade_window,
     project_trades_page_from_activity,
+    should_hydrate_wallet_result_full_history,
     split_leaderboard_prefilter_candidates,
 )
 from polymarket_weather_tool.client import PolymarketClient
 from polymarket_weather_tool.config import (
+    RELAY_ANALYSIS_MODE,
     SMART_WALLET_LIBRARY_REFRESH_MODE,
     apply_analysis_mode,
 )
@@ -39,7 +43,10 @@ from polymarket_weather_tool.cloudflare_backend import (
     _cloudflare_headers,
     cloudflare_d1_delete_rows,
 )
-from polymarket_weather_tool.history_ledger import history_ledger_table_path
+from polymarket_weather_tool.history_ledger import (
+    create_history_ledger_store,
+    history_ledger_table_path,
+)
 from polymarket_weather_tool.history_registry import create_history_registry
 from polymarket_weather_tool.report import format_trade
 
@@ -47,17 +54,18 @@ from polymarket_weather_tool.report import format_trade
 class FakeClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.events = [{"id": "1"}, {"id": "2"}, {"id": "3"}, {"id": "4"}]
 
     def fetch_events_keyset_page(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
-        if kwargs.get("after_cursor") is None:
-            return {
-                "events": [{"id": "1"}, {"id": "2"}],
-                "next_cursor": "cursor-2",
-            }
+        limit = int(kwargs.get("limit") or 2)
+        cursor = kwargs.get("after_cursor")
+        start = 0 if cursor is None else int(str(cursor).removeprefix("cursor-") or "0")
+        page = self.events[start : start + limit]
+        next_cursor = f"cursor-{start + len(page)}" if start + len(page) < len(self.events) else None
         return {
-            "events": [{"id": "3"}, {"id": "4"}],
-            "next_cursor": "cursor-4",
+            "events": page,
+            "next_cursor": next_cursor,
         }
 
 
@@ -235,6 +243,21 @@ class ScreeningHydrationClient(WindowActivityClient):
                 "endDate": "2026-04-30T00:00:00Z",
             }
         ]
+
+
+class RetryingFullHydrationClient(ScreeningHydrationClient):
+    def __init__(self, records: list[dict[str, Any]]) -> None:
+        super().__init__(records)
+        self.full_activity_failures_remaining = 1
+
+    def fetch_activity_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+        if kwargs.get("start") is None and kwargs.get("activity_type") in (None, ""):
+            self.calls.append(("activity", kwargs))
+            if self.full_activity_failures_remaining > 0:
+                self.full_activity_failures_remaining -= 1
+                raise http.client.RemoteDisconnected("Remote end closed connection without response")
+            return list(self.records)
+        return super().fetch_activity_page(**kwargs)
 
 
 class GraphHistoryProviderClient(WindowActivityClient):
@@ -478,6 +501,29 @@ class UpgradeBehaviorTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 2)
         self.assertEqual(client.calls[1]["after_cursor"], "cursor-2")
 
+    def test_keyset_weather_fetch_reports_natural_terminal_metadata(self) -> None:
+        client = FakeClient()
+        events, summary = fetch_weather_events_keyset_with_summary(
+            client=client,  # type: ignore[arg-type]
+            page_size=2,
+            max_events=10,
+            order="createdAt",
+            ascending=False,
+            tag_id=84,
+            tag_slug="weather",
+            active=None,
+            closed=None,
+            archived=False,
+        )
+
+        self.assertEqual([event["id"] for event in events], ["1", "2", "3", "4"])
+        self.assertEqual(summary["mode"], "keyset")
+        self.assertEqual(summary["page_count"], 2)
+        self.assertEqual(summary["last_page_size"], 2)
+        self.assertFalse(summary["terminal_next_cursor_present"])
+        self.assertEqual(summary["stop_reason"], "natural_end_no_cursor")
+        self.assertTrue(summary["natural_end"])
+
     def test_fetch_weather_events_falls_back_to_offset_pagination_when_keyset_fails(self) -> None:
         client = KeysetFallbackClient()
         config = {
@@ -504,6 +550,28 @@ class UpgradeBehaviorTests(unittest.TestCase):
             [call["offset"] for call in client.offset_calls],
             [0, 2],
         )
+
+    def test_fetch_weather_events_offset_fallback_respects_max_events(self) -> None:
+        client = KeysetFallbackClient()
+        config = {
+            "pagination": {"page_size": 2, "max_offset": 10},
+            "weather": {
+                "tag_id": 84,
+                "tag_slug": "weather",
+                "use_keyset": True,
+                "order": "createdAt",
+                "ascending": False,
+                "max_events": 2,
+                "active_only": False,
+                "closed_only": False,
+                "include_archived": False,
+                "page_size": 2,
+            },
+        }
+
+        events = fetch_weather_events(client, config)  # type: ignore[arg-type]
+
+        self.assertEqual([event["id"] for event in events], ["1", "2"])
 
     def test_leaderboard_time_period_alias_uses_day_for_1d(self) -> None:
         client = FakeLeaderboardClient()
@@ -596,6 +664,7 @@ class UpgradeBehaviorTests(unittest.TestCase):
 
     def test_trade_probe_rejects_wallets_over_max_trade_count_without_full_snapshot(self) -> None:
         config = {
+            "analysis": {"full_history_core_gate_enabled": False},
             "pagination": {"page_size": 500},
             "wallet_filter": {
                 "min_traded_count": 11,
@@ -619,6 +688,7 @@ class UpgradeBehaviorTests(unittest.TestCase):
 
     def test_trade_probe_falls_back_to_full_snapshot_when_probe_request_fails(self) -> None:
         config = {
+            "analysis": {"full_history_core_gate_enabled": False},
             "history_provider": {
                 "enabled": False,
             },
@@ -643,6 +713,7 @@ class UpgradeBehaviorTests(unittest.TestCase):
 
     def test_trade_probe_can_fallback_to_history_provider_for_full_history(self) -> None:
         config = {
+            "analysis": {"full_history_core_gate_enabled": False},
             "history_provider": {
                 "enabled": True,
                 "trade_probe_fallback_enabled": True,
@@ -923,6 +994,67 @@ class UpgradeBehaviorTests(unittest.TestCase):
                     for row in gap_rows
                 )
             )
+            self.assertTrue(gap_rows)
+            for row in gap_rows:
+                self.assertNotIn("records", row["payload"])
+
+    def test_history_ledger_batch_compaction_removes_legacy_gap_records_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifacts_root = Path(temp_dir)
+            gap_path = history_ledger_table_path(artifacts_root, "gaps")
+            gap_path.parent.mkdir(parents=True, exist_ok=True)
+            gap_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "gap_key": "gap-1",
+                            "wallet_address": "0xabc",
+                            "section_name": "trades",
+                            "payload": {
+                                "complete": True,
+                                "record_count": 2,
+                                "records": [{"id": "heavy-trade"}],
+                                "nested": {"records": [{"id": "nested-heavy"}]},
+                            },
+                        }
+                    ],
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            trade_path = history_ledger_table_path(artifacts_root, "trades")
+            trade_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "record_key": "trade-1",
+                            "wallet_address": "0xabc",
+                            "payload": {"id": "trade-payload"},
+                        }
+                    ],
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            store = create_history_ledger_store(
+                artifacts_root,
+                {"history_ledger": {"enabled": True, "backend": "local"}},
+            )
+            result = store.compact_local_gap_payloads()
+
+            self.assertEqual(result["status"], "compacted")
+            self.assertEqual(result["updated_count"], 1)
+            self.assertEqual(result["removed_record_lists"], 2)
+            gap_rows = self.read_history_ledger_rows(artifacts_root, "gaps")
+            self.assertNotIn("records", gap_rows[0]["payload"])
+            self.assertNotIn("records", gap_rows[0]["payload"]["nested"])
+            self.assertEqual(gap_rows[0]["payload"]["record_count"], 2)
+            trade_rows = self.read_history_ledger_rows(artifacts_root, "trades")
+            self.assertEqual(trade_rows[0]["payload"], {"id": "trade-payload"})
 
     def test_fetch_wallet_snapshot_replicates_history_ledger_rows_to_cloudflare_when_backend_is_local(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1054,6 +1186,7 @@ class UpgradeBehaviorTests(unittest.TestCase):
 
         wallet_result = result["wallet_result"]
         self.assertTrue(wallet_result["screening"]["selected"])
+        self.assertFalse(any(label.get("system_core") for label in wallet_result["labels"]))
         self.assertEqual(
             wallet_result["deep_hydration"]["reason"],
             "full_hydration_not_required",
@@ -1064,6 +1197,125 @@ class UpgradeBehaviorTests(unittest.TestCase):
         )
         self.assertTrue(wallet_result["metrics"]["screening_evidence_complete"])
         self.assertFalse(wallet_result["metrics"]["snapshot_complete"])
+        self.assertFalse(any(name == "positions" for name, _kwargs in client.calls))
+        self.assertFalse(any(name == "closed_positions" for name, _kwargs in client.calls))
+
+    def test_smart_wallet_refresh_hydrates_selected_wallet_with_system_core_label(self) -> None:
+        current_ts = 1_777_000_000
+        records = [
+            {
+                "type": "TRADE",
+                "id": "recent-trade-1",
+                "timestamp": current_ts - 60,
+                "conditionId": "cond-core",
+                "side": "BUY",
+                "size": "2",
+                "price": "0.25",
+                "usdcSize": "0.50",
+            },
+            {
+                "type": "TRADE",
+                "id": "recent-trade-2",
+                "timestamp": current_ts - 30,
+                "conditionId": "cond-core",
+                "side": "BUY",
+                "size": "2",
+                "price": "0.30",
+                "usdcSize": "0.60",
+            },
+        ]
+        client = ScreeningHydrationClient(records)
+        config = apply_analysis_mode(
+            {
+                "analysis": {
+                    "current_datetime": "2026-04-25T00:00:00+00:00",
+                    "position_size_threshold": 0.1,
+                    "top_trades_in_report": 3,
+                    "top_positions_in_report": 3,
+                    "top_closed_positions_in_report": 3,
+                },
+                "chain_validation": {"enabled": False},
+                "leaderboard": {"time_period": "DAY"},
+                "pagination": {"page_size": 10, "max_offset": 100},
+                "wallet_filter": {
+                    "include_wallets": [],
+                    "exclude_wallets": [],
+                    "min_traded_count": 1,
+                    "min_weather_trade_ratio": 0,
+                    "activity_filter_mode": "all",
+                },
+            },
+            SMART_WALLET_LIBRARY_REFRESH_MODE,
+        )
+
+        result = analyze_leaderboard_entry(
+            client=client,  # type: ignore[arg-type]
+            leaderboard_entry={
+                "proxyWallet": "0xabc",
+                "pnl": "20",
+                "vol": "1000",
+                "rank": 1,
+                "userName": "smart-refresh-core",
+            },
+            weather_index=WeatherIndex(set(), set(), {"cond-core"}, set(), {"cond-core": "NYC"}),
+            config=config,
+        )
+
+        wallet_result = result["wallet_result"]
+        self.assertTrue(wallet_result["screening"]["selected"])
+        self.assertTrue(any(label.get("system_core") for label in wallet_result["labels"]))
+        self.assertEqual(wallet_result["deep_hydration"]["status"], "completed")
+        self.assertTrue(any(name == "positions" for name, _kwargs in client.calls))
+        self.assertTrue(any(name == "closed_positions" for name, _kwargs in client.calls))
+
+    def test_relay_analysis_uses_imported_wallet_chain_without_refresh_mode_reason(self) -> None:
+        current_ts = 1_777_000_000
+        records = [
+            {"type": "TRADE", "id": "recent-trade", "timestamp": current_ts - 60},
+            {"type": "REWARD", "id": "recent-reward", "timestamp": current_ts - 30},
+        ]
+        client = ScreeningHydrationClient(records)
+        config = apply_analysis_mode(
+            {
+                "analysis": {
+                    "current_datetime": "2026-04-25T00:00:00+00:00",
+                    "position_size_threshold": 0.1,
+                    "top_trades_in_report": 3,
+                    "top_positions_in_report": 3,
+                    "top_closed_positions_in_report": 3,
+                },
+                "chain_validation": {"enabled": False},
+                "leaderboard": {"time_period": "DAY"},
+                "pagination": {"page_size": 10, "max_offset": 100},
+                "wallet_filter": {
+                    "include_wallets": [],
+                    "exclude_wallets": [],
+                    "activity_filter_mode": "all",
+                },
+            },
+            RELAY_ANALYSIS_MODE,
+        )
+
+        result = analyze_leaderboard_entry(
+            client=client,  # type: ignore[arg-type]
+            leaderboard_entry={
+                "proxyWallet": "0xabc",
+                "pnl": "20",
+                "vol": "1000",
+                "rank": 1,
+                "userName": "relay-analysis",
+            },
+            weather_index=WeatherIndex(set(), set(), set(), set(), {}),
+            config=config,
+        )
+
+        wallet_result = result["wallet_result"]
+        self.assertEqual(config["runtime"]["analysis_mode"], RELAY_ANALYSIS_MODE)
+        self.assertTrue(wallet_result["screening"]["selected"])
+        self.assertIn("relay_analysis:skip_numeric_filters", wallet_result["screening"]["reasons"])
+        self.assertNotIn("smart_wallet_library_refresh:skip_numeric_filters", wallet_result["screening"]["reasons"])
+        self.assertEqual(wallet_result["metrics"]["history_scope"], "recent_activity")
+        self.assertEqual(wallet_result["deep_hydration"]["reason"], "full_hydration_not_required")
         self.assertFalse(any(name == "positions" for name, _kwargs in client.calls))
         self.assertFalse(any(name == "closed_positions" for name, _kwargs in client.calls))
 
@@ -1601,7 +1853,10 @@ class UpgradeBehaviorTests(unittest.TestCase):
     def test_trade_probe_can_read_history_ledger_from_cloudflare_when_backend_is_local(self) -> None:
         client = FailingTradeProbeAllSourcesClient()
         config = {
-            "analysis": {"position_size_threshold": 0.1},
+            "analysis": {
+                "position_size_threshold": 0.1,
+                "full_history_core_gate_enabled": False,
+            },
             "history_ledger": {
                 "enabled": True,
                 "backend": "local",
@@ -1697,7 +1952,16 @@ class UpgradeBehaviorTests(unittest.TestCase):
     def test_analyze_leaderboard_entry_hydrates_selected_wallet_after_screening_snapshot(self) -> None:
         current_ts = 1_777_000_000
         records = [
-            {"type": "TRADE", "id": "recent-trade", "timestamp": current_ts - 60},
+            {
+                "type": "TRADE",
+                "id": "recent-trade",
+                "timestamp": current_ts - 60,
+                "conditionId": "cond-core",
+                "side": "BUY",
+                "size": "4",
+                "price": "0.20",
+                "usdcSize": "0.80",
+            },
             {"type": "REWARD", "id": "recent-reward", "timestamp": current_ts - 30},
         ]
         client = ScreeningHydrationClient(records)
@@ -1733,16 +1997,217 @@ class UpgradeBehaviorTests(unittest.TestCase):
                 "rank": 1,
                 "userName": "hydrate-me",
             },
-            weather_index=WeatherIndex(set(), set(), set(), set(), {}),
+            weather_index=WeatherIndex(set(), set(), {"cond-core"}, set(), {"cond-core": "NYC"}),
             config=config,
         )
 
         wallet_result = result["wallet_result"]
+        self.assertTrue(any(label.get("system_core") for label in wallet_result["labels"]))
         self.assertEqual(wallet_result["deep_hydration"]["status"], "completed")
         self.assertEqual(wallet_result["metrics"]["snapshot_collection_status"]["positions"]["record_count"], 1)
         self.assertEqual(wallet_result["metrics"]["snapshot_collection_status"]["closed_positions"]["record_count"], 1)
         self.assertTrue(any(name == "positions" for name, _kwargs in client.calls))
         self.assertTrue(any(name == "closed_positions" for name, _kwargs in client.calls))
+
+    def test_full_hydration_retry_recovers_remote_disconnect(self) -> None:
+        current_ts = 1_777_000_000
+        records = [
+            {
+                "type": "TRADE",
+                "id": "recent-trade",
+                "timestamp": current_ts - 60,
+                "conditionId": "cond-core",
+                "side": "BUY",
+                "size": "4",
+                "price": "0.20",
+                "usdcSize": "0.80",
+            }
+        ]
+        client = RetryingFullHydrationClient(records)
+        config = {
+            "analysis": {
+                "current_datetime": "2026-04-25T00:00:00+00:00",
+                "position_size_threshold": 0.1,
+                "screening_snapshot_enabled": True,
+                "hydrate_selected_wallet_full_history": True,
+                "full_hydration_retry_attempts": 2,
+                "full_hydration_retry_backoff_seconds": 0,
+                "top_trades_in_report": 3,
+                "top_positions_in_report": 3,
+                "top_closed_positions_in_report": 3,
+            },
+            "chain_validation": {"enabled": False},
+            "leaderboard": {"time_period": "DAY"},
+            "pagination": {"page_size": 10, "max_offset": 100},
+            "wallet_filter": {
+                "min_pnl": 0,
+                "min_volume": 0,
+                "min_traded_count": 1,
+                "min_weather_trade_ratio": 0,
+                "include_wallets": [],
+                "exclude_wallets": [],
+            },
+        }
+
+        result = analyze_leaderboard_entry(
+            client=client,  # type: ignore[arg-type]
+            leaderboard_entry={
+                "proxyWallet": "0xabc",
+                "pnl": "20",
+                "vol": "1000",
+                "rank": 1,
+                "userName": "retry-hydration",
+            },
+            weather_index=WeatherIndex(set(), set(), {"cond-core"}, set(), {"cond-core": "NYC"}),
+            config=config,
+        )
+
+        wallet_result = result["wallet_result"]
+        self.assertEqual(wallet_result["deep_hydration"]["status"], "completed")
+        self.assertEqual(
+            wallet_result["metrics"]["snapshot_collection_status"]["full_hydration_retry"]["attempts"],
+            2,
+        )
+        full_activity_calls = [
+            kwargs
+            for name, kwargs in client.calls
+            if name == "activity" and kwargs.get("start") is None and kwargs.get("activity_type") in (None, "")
+        ]
+        self.assertEqual(len(full_activity_calls), 2)
+
+    def test_should_hydrate_wallet_result_full_history_requires_selected_and_system_core_label(self) -> None:
+        config = {
+            "analysis": {
+                "current_datetime": "2026-04-25T00:00:00+00:00",
+                "screening_snapshot_enabled": True,
+                "hydrate_selected_wallet_full_history": True,
+            },
+            "leaderboard": {"time_period": "DAY"},
+        }
+
+        self.assertFalse(
+            should_hydrate_wallet_result_full_history(
+                config,
+                {"screening": {"selected": False}, "labels": [{"system_core": True}]},
+            )
+        )
+        self.assertFalse(
+            should_hydrate_wallet_result_full_history(
+                config,
+                {"screening": {"selected": True}, "labels": []},
+            )
+        )
+        self.assertFalse(
+            should_hydrate_wallet_result_full_history(
+                config,
+                {"screening": {"selected": True}, "labels": [{"system_core": False}]},
+            )
+        )
+        self.assertTrue(
+            should_hydrate_wallet_result_full_history(
+                config,
+                {"screening": {"selected": True}, "labels": [{"system_core": True}]},
+            )
+        )
+
+    def test_analyze_leaderboard_entry_skips_full_hydration_for_selected_wallet_without_system_core_label(self) -> None:
+        current_ts = 1_777_000_000
+        records = [
+            {"type": "TRADE", "id": "recent-trade", "timestamp": current_ts - 60},
+            {"type": "REWARD", "id": "recent-reward", "timestamp": current_ts - 30},
+        ]
+        client = ScreeningHydrationClient(records)
+        config = {
+            "analysis": {
+                "current_datetime": "2026-04-25T00:00:00+00:00",
+                "position_size_threshold": 0.1,
+                "screening_snapshot_enabled": True,
+                "hydrate_selected_wallet_full_history": True,
+                "top_trades_in_report": 3,
+                "top_positions_in_report": 3,
+                "top_closed_positions_in_report": 3,
+            },
+            "chain_validation": {"enabled": False},
+            "leaderboard": {"time_period": "DAY"},
+            "pagination": {"page_size": 10, "max_offset": 100},
+            "wallet_filter": {
+                "min_pnl": 0,
+                "min_volume": 0,
+                "min_traded_count": 1,
+                "min_weather_trade_ratio": 0,
+                "include_wallets": [],
+                "exclude_wallets": [],
+            },
+        }
+
+        result = analyze_leaderboard_entry(
+            client=client,  # type: ignore[arg-type]
+            leaderboard_entry={
+                "proxyWallet": "0xabc",
+                "pnl": "20",
+                "vol": "1000",
+                "rank": 1,
+                "userName": "selected-non-core",
+            },
+            weather_index=WeatherIndex(set(), set(), set(), set(), {}),
+            config=config,
+        )
+
+        wallet_result = result["wallet_result"]
+        self.assertTrue(wallet_result["screening"]["selected"])
+        self.assertFalse(any(label.get("system_core") for label in wallet_result["labels"]))
+        self.assertEqual(wallet_result["deep_hydration"]["status"], "skipped")
+        self.assertEqual(wallet_result["deep_hydration"]["reason"], "full_hydration_not_required")
+        self.assertFalse(any(name == "positions" for name, _kwargs in client.calls))
+        self.assertFalse(any(name == "closed_positions" for name, _kwargs in client.calls))
+
+    def test_standard_all_period_uses_recent_activity_screening_before_full_hydration(self) -> None:
+        current_ts = 1_777_000_000
+        records = [
+            {"type": "TRADE", "id": "recent-trade", "timestamp": current_ts - 60},
+        ]
+        client = ScreeningHydrationClient(records)
+        config = {
+            "analysis": {
+                "current_datetime": "2026-04-25T00:00:00+00:00",
+                "position_size_threshold": 0.1,
+                "screening_snapshot_enabled": True,
+                "hydrate_selected_wallet_full_history": True,
+                "top_trades_in_report": 3,
+                "top_positions_in_report": 3,
+                "top_closed_positions_in_report": 3,
+            },
+            "chain_validation": {"enabled": False},
+            "leaderboard": {"time_period": "ALL"},
+            "pagination": {"page_size": 10, "max_offset": 100},
+            "wallet_filter": {
+                "min_pnl": 0,
+                "min_volume": 0,
+                "min_traded_count": 1,
+                "min_weather_trade_ratio": 0,
+                "include_wallets": [],
+                "exclude_wallets": [],
+            },
+        }
+
+        result = analyze_leaderboard_entry(
+            client=client,  # type: ignore[arg-type]
+            leaderboard_entry={
+                "proxyWallet": "0xabc",
+                "pnl": "20",
+                "vol": "1000",
+                "rank": 1,
+                "userName": "all-period-light-first",
+            },
+            weather_index=WeatherIndex(set(), set(), set(), set(), {}),
+            config=config,
+        )
+
+        wallet_result = result["wallet_result"]
+        self.assertEqual(wallet_result["metrics"]["history_scope"], "recent_activity")
+        self.assertEqual(wallet_result["deep_hydration"]["reason"], "full_hydration_not_required")
+        self.assertFalse(any(name == "positions" for name, _kwargs in client.calls))
+        self.assertFalse(any(name == "closed_positions" for name, _kwargs in client.calls))
 
     def test_screening_accepts_partial_snapshot_when_window_evidence_is_complete(self) -> None:
         config = {

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import gc
 import statistics
+import time
 import urllib.parse
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -15,7 +17,7 @@ from . import cloud_archive as cloud_archive_module
 from . import history_ledger as history_ledger_module
 from . import history_registry as history_registry_module
 from .client import PolymarketClient, PolymarketRequestError, resolve_api_key
-from .config import SMART_WALLET_LIBRARY_REFRESH_MODE
+from .config import DEFAULT_ANALYSIS_MODE, RELAY_ANALYSIS_MODE, SMART_WALLET_LIBRARY_REFRESH_MODE
 from .finder_ai_contract import build_finder_ai_contract, enrich_finder_ai_generation_context
 from .finder_ai_generation import generate_finder_ai_brief
 from . import history_provider as history_provider_module
@@ -80,6 +82,64 @@ DEFAULT_HISTORY_PROVIDER_MAX_PAGES = 30
 DEFAULT_HISTORY_PROVIDER_TOKEN_LOOKUP_CHUNK_SIZE = 100
 DEFAULT_HISTORY_PROVIDER_ASSET_DECIMALS = 6
 DEFAULT_HISTORY_PROVIDER_USDC_ASSET_ID = "0"
+DEFAULT_FULL_HYDRATION_RETRY_ATTEMPTS = 2
+DEFAULT_FULL_HYDRATION_RETRY_BACKOFF_SECONDS = 0.75
+WEATHER_FETCH_SUMMARY_FILENAME = "weather_fetch_summary.json"
+WEATHER_RECORD_TAG_TERMS = {
+    "weather",
+    "daily weather",
+    "daily-weather",
+    "daily temperature",
+    "daily-temperature",
+    "temperature",
+    "highest temperature",
+    "highest-temperature",
+    "lowest temperature",
+    "lowest-temperature",
+    "rainfall",
+    "rainfall total",
+    "snowfall",
+    "snowfall total",
+    "wind speed",
+    "wind-speed",
+    "air quality",
+    "air-quality",
+}
+WEATHER_RECORD_TEXT_PATTERNS = (
+    "daily-weather",
+    "daily-temperature",
+    "temperature-in-",
+    "highest-temperature-in-",
+    "lowest-temperature-in-",
+    "rainfall-in-",
+    "snowfall-in-",
+    "wind-speed-in-",
+    "air-quality-in-",
+    "weather in ",
+    "temperature in ",
+    "highest temperature in ",
+    "lowest temperature in ",
+    "rainfall in ",
+    "snowfall in ",
+    "wind speed in ",
+    "air quality in ",
+)
+WEATHER_RECORD_TEXT_FIELDS = (
+    "title",
+    "question",
+    "description",
+    "slug",
+    "marketSlug",
+    "market_slug",
+    "eventSlug",
+    "event_slug",
+    "category",
+    "series",
+    "tags",
+    "tag",
+    "tagSlug",
+    "tag_slug",
+)
 
 
 @dataclass
@@ -90,6 +150,261 @@ class WeatherIndex:
     market_slugs: set[str]
     regions_by_key: dict[str, str]
     market_dates_by_key: dict[str, str] = field(default_factory=dict)
+
+
+def bool_config_value(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def compact_collection_status_payload(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): compact_collection_status_payload(item)
+            for key, item in value.items()
+            if str(key) != "records"
+        }
+    if isinstance(value, list):
+        return [compact_collection_status_payload(item) for item in value]
+    return value
+
+
+def compact_collection_status_map(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(key): compact_collection_status_payload(item)
+        for key, item in value.items()
+        if str(key) != "records"
+    }
+
+
+def compact_operation_audit_for_embedding(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    compact = {
+        str(key): compact_collection_status_payload(item)
+        for key, item in value.items()
+        if str(key) != "records"
+    }
+    operations = compact.get("operations")
+    if isinstance(operations, Mapping):
+        compact["operations"] = {
+            str(name): {
+                str(key): compact_collection_status_payload(item)
+                for key, item in operation.items()
+                if str(key) != "evidence"
+            }
+            for name, operation in operations.items()
+            if isinstance(operation, Mapping)
+        }
+    return compact
+
+
+def compact_finder_ai_for_run_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for key in (
+        "briefGeneration",
+        "providerMeta",
+        "needsReview",
+        "hasConflict",
+        "evidenceLevel",
+        "matched",
+        "strategyFocus",
+        "aiBriefShort",
+        "aiBriefNote",
+    ):
+        if key in value:
+            result[key] = value.get(key)
+    return result
+
+
+def compact_wallet_result_for_run_summary(wallet_result: Mapping[str, Any]) -> dict[str, Any]:
+    metrics = (
+        dict(wallet_result.get("metrics", {}))
+        if isinstance(wallet_result.get("metrics", {}), Mapping)
+        else {}
+    )
+    operation_audit = (
+        wallet_result.get("operation_audit")
+        if isinstance(wallet_result.get("operation_audit"), Mapping)
+        else metrics.get("operation_audit")
+    )
+    if isinstance(metrics.get("snapshot_collection_status"), Mapping):
+        metrics["snapshot_collection_status"] = compact_collection_status_map(
+            metrics.get("snapshot_collection_status")
+        )
+    if isinstance(metrics.get("operation_audit"), Mapping):
+        metrics["operation_audit"] = compact_operation_audit_for_embedding(
+            metrics.get("operation_audit")
+        )
+
+    compact: dict[str, Any] = {}
+    for key in (
+        "wallet",
+        "leaderboard_entry",
+        "screening",
+        "selection_record",
+        "labels",
+        "label_evaluations",
+        "label_evidence",
+        "label_match_details",
+        "evidence_summary",
+        "profile",
+        "strategy_notes",
+        "top_trades",
+        "top_positions",
+        "top_closed_positions",
+        "raw_counts",
+        "deep_hydration",
+        "cloud_fallback",
+    ):
+        if key in wallet_result:
+            compact[key] = wallet_result.get(key)
+    compact["metrics"] = metrics
+    if isinstance(operation_audit, Mapping):
+        compact["operation_audit"] = compact_operation_audit_for_embedding(operation_audit)
+    compact["finder_ai"] = compact_finder_ai_for_run_summary(wallet_result.get("finder_ai"))
+    return compact
+
+
+def cleanup_completed_analysis_batch(
+    config: Mapping[str, Any],
+    batch_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    analysis_settings = (
+        config.get("analysis", {}) if isinstance(config.get("analysis", {}), Mapping) else {}
+    )
+    if not bool_config_value(analysis_settings.get("lightweight_batch_cleanup_enabled"), True):
+        return {"status": "disabled", "released_result_count": 0}
+
+    released_count = len(batch_results)
+    batch_results.clear()
+    ledger_compaction = history_ledger_store(config).compact_local_gap_payloads()
+    gc_triggered = False
+    if bool_config_value(analysis_settings.get("gc_after_wallet_batch"), True):
+        gc.collect()
+        gc_triggered = True
+    return {
+        "status": "completed",
+        "released_result_count": released_count,
+        "history_ledger_gap_compaction": ledger_compaction,
+        "gc_triggered": gc_triggered,
+    }
+
+
+def runtime_should_resume_existing_output(config: Mapping[str, Any]) -> bool:
+    runtime = config.get("runtime", {}) if isinstance(config, Mapping) else {}
+    return bool_config_value(runtime.get("resume_existing_output"), False)
+
+
+def read_json_list(path: Path) -> list[Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return payload if isinstance(payload, list) else []
+
+
+def load_existing_errors(output_dir: Path) -> list[dict[str, Any]]:
+    return [dict(item) for item in read_json_list(output_dir / "errors.json") if isinstance(item, Mapping)]
+
+
+def wallet_address_from_result(wallet_result: Mapping[str, Any], fallback: str = "") -> str:
+    candidates: list[Any] = [wallet_result.get("wallet"), fallback]
+    for key in ("selection_record", "screening", "leaderboard_entry", "profile"):
+        value = wallet_result.get(key)
+        if isinstance(value, Mapping):
+            candidates.extend(
+                [
+                    value.get("wallet"),
+                    value.get("address"),
+                    value.get("proxyWallet"),
+                    value.get("proxy_wallet"),
+                ]
+            )
+    for candidate in candidates:
+        wallet = normalize_address(candidate)
+        if wallet:
+            return wallet
+    return ""
+
+
+def selection_record_from_wallet_result(wallet_result: Mapping[str, Any], wallet: str) -> dict[str, Any]:
+    selection_record = wallet_result.get("selection_record")
+    if isinstance(selection_record, Mapping):
+        record = dict(selection_record)
+    else:
+        screening = wallet_result.get("screening")
+        record = dict(screening) if isinstance(screening, Mapping) else {"wallet": wallet}
+    record["wallet"] = wallet
+    if "selected" not in record:
+        record["selected"] = True
+    core_label_keys = wallet_result_system_core_label_keys(wallet_result)
+    record["has_core_label"] = bool(core_label_keys)
+    record["core_label_keys"] = core_label_keys
+    finder_ai = wallet_result.get("finder_ai")
+    if isinstance(finder_ai, Mapping):
+        record = sync_selection_record_finder_ai_fields(record, finder_ai)
+    return record
+
+
+def load_existing_wallet_results_for_resume(
+    output_dir: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], set[str]]:
+    wallets_dir = output_dir / "wallets"
+    if not wallets_dir.exists():
+        return [], [], [], set()
+
+    selected_wallets: list[dict[str, Any]] = []
+    wallet_results: list[dict[str, Any]] = []
+    screening_records: list[dict[str, Any]] = []
+    completed_wallets: set[str] = set()
+    for wallet_path in sorted(wallets_dir.glob("*.json")):
+        wallet_result = read_json_file(wallet_path)
+        if not isinstance(wallet_result, Mapping):
+            continue
+        wallet = wallet_address_from_result(wallet_result, wallet_path.stem)
+        if not wallet or wallet in completed_wallets:
+            continue
+        completed_wallets.add(wallet)
+        screening = wallet_result.get("screening")
+        if isinstance(screening, Mapping):
+            screening_records.append(dict(screening))
+            if screening.get("selected") is False:
+                continue
+        selected_wallets.append(selection_record_from_wallet_result(wallet_result, wallet))
+        wallet_results.append(compact_wallet_result_for_run_summary(wallet_result))
+    return selected_wallets, wallet_results, screening_records, completed_wallets
+
+
+def load_existing_weather_events_for_resume(output_dir: Path) -> list[dict[str, Any]]:
+    return [dict(item) for item in read_json_list(output_dir / "weather_events.json") if isinstance(item, Mapping)]
+
+
+def entry_wallet(entry: Mapping[str, Any]) -> str:
+    return normalize_address(entry.get("proxyWallet") or entry.get("wallet") or entry.get("address"))
+
+
+def filter_completed_leaderboard_entries(
+    entries: list[dict[str, Any]],
+    completed_wallets: set[str],
+) -> list[dict[str, Any]]:
+    if not completed_wallets:
+        return entries
+    return [entry for entry in entries if entry_wallet(entry) not in completed_wallets]
 
 
 def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
@@ -108,7 +423,8 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     write_json(output_dir / "resolved_config.json", config)
 
     client = PolymarketClient(config["api"])
-    errors: list[dict[str, Any]] = []
+    resume_existing_output = runtime_should_resume_existing_output(config)
+    errors: list[dict[str, Any]] = load_existing_errors(output_dir) if resume_existing_output else []
     leaderboard_settings = config["leaderboard"]
     target_count = int(config["wallet_filter"]["target_count"])
     concurrent_wallets = max(1, int(config["analysis"].get("concurrent_wallets", 1)))
@@ -119,11 +435,33 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
         None if raw_max_leaderboard_rows in (None, "") else max(0, int(raw_max_leaderboard_rows))
     )
 
+    screening_records: list[dict[str, Any]] = []
+    selected_wallets: list[dict[str, Any]] = []
+    wallet_results: list[dict[str, Any]] = []
+    completed_wallets: set[str] = set()
+    if resume_existing_output:
+        (
+            selected_wallets,
+            wallet_results,
+            screening_records,
+            completed_wallets,
+        ) = load_existing_wallet_results_for_resume(output_dir)
+        if completed_wallets:
+            progress(
+                config,
+                f"Resuming existing run; skipping {len(completed_wallets)} completed wallet details",
+            )
+
     imported_rows = load_import_wallet_rows_from_config(config)
     if imported_rows is not None:
-        progress(config, "Loading imported Smart Pro wallet library")
+        if analysis_mode_reason_key(config) == RELAY_ANALYSIS_MODE:
+            progress(config, "Loading relay wallet source")
+        else:
+            progress(config, "Loading imported Smart Pro wallet library")
         leaderboard = leaderboard_entries_from_import_rows(imported_rows)
         if not leaderboard:
+            if analysis_mode_reason_key(config) == RELAY_ANALYSIS_MODE:
+                raise ValueError("接力地址名单为空，无法启动接力分析")
             raise ValueError("Smart Pro 导入地址库为空，无法启动回流分析")
         progress(config, f"Loaded {len(leaderboard)} imported wallet rows")
         auto_extend_leaderboard = False
@@ -135,13 +473,13 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
         leaderboard = fetch_leaderboard(client, config)
         progress(config, f"Fetched {len(leaderboard)} leaderboard rows")
 
-    screening_records: list[dict[str, Any]] = []
-    selected_wallets: list[dict[str, Any]] = []
-    wallet_results: list[dict[str, Any]] = []
+    write_json(output_dir / "leaderboard.json", leaderboard)
+
     seen_candidate_wallets: set[str] = set()
     leaderboard_entries = [
         entry for entry in leaderboard if str(entry.get("proxyWallet", "")).strip()
     ]
+    leaderboard_entries = filter_completed_leaderboard_entries(leaderboard_entries, completed_wallets)
     candidate_entries, prefiltered_records = split_leaderboard_prefilter_candidates(
         leaderboard_entries,
         config,
@@ -157,7 +495,10 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     weather_events: list[dict[str, Any]] = []
     weather_index = WeatherIndex(set(), set(), set(), set(), {})
     weather_index_ready = False
-    write_json(output_dir / "weather_events.json", weather_events)
+    if not (resume_existing_output and (output_dir / "weather_events.json").exists()):
+        write_json(output_dir / "weather_events.json", weather_events)
+    write_json(output_dir / "selected_wallets.json", selected_wallets)
+    write_json(output_dir / "errors.json", errors)
 
     processed_entries = 0
     next_leaderboard_offset = len(leaderboard)
@@ -191,9 +532,11 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
                 break
 
             leaderboard.extend(extra_rows)
+            write_json(output_dir / "leaderboard.json", leaderboard)
             extra_entries = [
                 entry for entry in extra_rows if str(entry.get("proxyWallet", "")).strip()
             ]
+            extra_entries = filter_completed_leaderboard_entries(extra_entries, completed_wallets)
             extra_candidates, extra_prefiltered = split_leaderboard_prefilter_candidates(
                 extra_entries,
                 config,
@@ -210,9 +553,13 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
             continue
 
         if candidate_entries and not weather_index_ready:
-            progress(config, "Fetching weather events")
-            weather_events = fetch_weather_events(client, config)
-            write_json(output_dir / "weather_events.json", weather_events)
+            if resume_existing_output and (output_dir / "weather_events.json").exists():
+                progress(config, "Loading existing weather events for resumed run")
+                weather_events = load_existing_weather_events_for_resume(output_dir)
+            if not weather_events:
+                progress(config, "Fetching weather events")
+                weather_events = fetch_weather_events(client, config)
+                write_json(output_dir / "weather_events.json", weather_events)
             weather_index = build_weather_index(weather_events)
             weather_index_ready = True
             progress(config, f"Indexed {len(weather_events)} weather events")
@@ -222,7 +569,7 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
             config,
             f"Analyzing wallets {processed_entries + 1}-{processed_entries + len(batch)} of {len(candidate_entries)}",
         )
-        for result in analyze_wallet_batch(
+        batch_results = analyze_wallet_batch(
             client=client,
             leaderboard_entries=batch,
             weather_index=weather_index,
@@ -230,35 +577,47 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
             max_workers=concurrent_wallets,
             history_registry_dir=history_registry_dir,
             history_run_id=history_run_id,
-        ):
-            wallet = result["wallet"]
-            if result.get("error"):
-                error_payload = result["error"]
-                if isinstance(error_payload, Mapping):
-                    errors.append(dict(error_payload))
-                else:
-                    errors.append({"wallet": wallet, "error": str(error_payload)})
-                continue
-            if result.get("screening"):
-                screening_records.append(result["screening"])
-                continue
+        )
+        try:
+            for result in batch_results:
+                wallet = result["wallet"]
+                if result.get("error"):
+                    error_payload = result["error"]
+                    if isinstance(error_payload, Mapping):
+                        errors.append(dict(error_payload))
+                    else:
+                        errors.append({"wallet": wallet, "error": str(error_payload)})
+                    write_json(output_dir / "errors.json", errors)
+                    progress(config, f"Wallet failed {len(errors)}: {wallet}")
+                    continue
+                if result.get("screening"):
+                    screening_records.append(result["screening"])
+                    continue
 
-            wallet_result = result["wallet_result"]
-            screening_records.append(wallet_result["screening"])
-            if wallet_result["screening"]["selected"]:
-                wallet_result["finder_ai"] = generate_finder_ai_brief(
-                    payload=wallet_result.get("finder_ai"),
-                    wallet_result=wallet_result,
-                )
-                wallet_result["selection_record"] = sync_selection_record_finder_ai_fields(
-                    wallet_result.get("selection_record"),
-                    wallet_result.get("finder_ai"),
-                )
-                wallet_results.append(wallet_result)
-                selected_wallets.append(wallet_result["selection_record"])
-                write_json(wallets_dir / f"{wallet}.json", wallet_result)
-                if len(selected_wallets) >= target_count:
-                    break
+                wallet_result = result["wallet_result"]
+                screening_records.append(wallet_result["screening"])
+                if wallet_result["screening"]["selected"]:
+                    if should_generate_finder_ai_for_wallet_result(wallet_result):
+                        wallet_result["finder_ai"] = generate_finder_ai_brief(
+                            payload=wallet_result.get("finder_ai"),
+                            wallet_result=wallet_result,
+                        )
+                    wallet_result["selection_record"] = sync_selection_record_finder_ai_fields(
+                        wallet_result.get("selection_record"),
+                        wallet_result.get("finder_ai"),
+                    )
+                    core_label_keys = wallet_result_system_core_label_keys(wallet_result)
+                    wallet_result["selection_record"]["has_core_label"] = bool(core_label_keys)
+                    wallet_result["selection_record"]["core_label_keys"] = core_label_keys
+                    selected_wallets.append(wallet_result["selection_record"])
+                    write_json(wallets_dir / f"{wallet}.json", wallet_result)
+                    wallet_results.append(compact_wallet_result_for_run_summary(wallet_result))
+                    write_json(output_dir / "selected_wallets.json", selected_wallets)
+                    progress(config, f"Wallet completed {len(selected_wallets)} of {target_count}: {wallet}")
+                    if len(selected_wallets) >= target_count:
+                        break
+        finally:
+            cleanup_completed_analysis_batch(config, batch_results)
         processed_entries += len(batch)
 
     write_json(output_dir / "leaderboard.json", leaderboard)
@@ -349,6 +708,7 @@ def fetch_leaderboard(
 def fetch_weather_events(client: PolymarketClient, config: dict[str, Any]) -> list[dict[str, Any]]:
     weather = config["weather"]
     pagination = config["pagination"]
+    max_events = int(weather.get("max_events", weather["page_size"]))
     active = True if weather.get("active_only") else None
     closed = True if weather.get("closed_only") else None
     archived = None if weather.get("include_archived") else False
@@ -357,10 +717,10 @@ def fetch_weather_events(client: PolymarketClient, config: dict[str, Any]) -> li
 
     if weather.get("use_keyset", True):
         try:
-            return fetch_weather_events_keyset(
+            events, fetch_summary = fetch_weather_events_keyset_with_summary(
                 client=client,
                 page_size=int(weather["page_size"]),
-                max_events=int(weather.get("max_events", weather["page_size"])),
+                max_events=max_events,
                 order=str(weather.get("order", "createdAt")),
                 ascending=bool(weather.get("ascending", False)),
                 tag_id=tag_id,
@@ -369,10 +729,12 @@ def fetch_weather_events(client: PolymarketClient, config: dict[str, Any]) -> li
                 closed=closed,
                 archived=archived,
             )
+            write_weather_fetch_summary(config, fetch_summary)
+            return events
         except Exception:
             pass
 
-    return paginate(
+    events = paginate(
         page_size=int(weather["page_size"]),
         max_offset=int(pagination["max_offset"]),
         fetch_page=lambda limit, offset: client.fetch_events_page(
@@ -384,7 +746,18 @@ def fetch_weather_events(client: PolymarketClient, config: dict[str, Any]) -> li
             closed=closed,
             archived=archived,
         ),
+    )[:max_events]
+    write_weather_fetch_summary(
+        config,
+        {
+            "mode": "offset",
+            "indexed": len(events),
+            "max_events": max_events,
+            "stop_reason": "max_events_reached" if len(events) >= max_events else "offset_complete_or_max_offset",
+            "natural_end": len(events) < max_events,
+        },
     )
+    return events
 
 
 def fetch_weather_events_keyset(
@@ -400,8 +773,40 @@ def fetch_weather_events_keyset(
     closed: bool | None,
     archived: bool | None,
 ) -> list[dict[str, Any]]:
+    events, _summary = fetch_weather_events_keyset_with_summary(
+        client=client,
+        page_size=page_size,
+        max_events=max_events,
+        order=order,
+        ascending=ascending,
+        tag_id=tag_id,
+        tag_slug=tag_slug,
+        active=active,
+        closed=closed,
+        archived=archived,
+    )
+    return events
+
+
+def fetch_weather_events_keyset_with_summary(
+    *,
+    client: PolymarketClient,
+    page_size: int,
+    max_events: int,
+    order: str,
+    ascending: bool,
+    tag_id: int | str | None,
+    tag_slug: str | None,
+    active: bool | None,
+    closed: bool | None,
+    archived: bool | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     events: list[dict[str, Any]] = []
     cursor: str | None = None
+    page_count = 0
+    last_page_size = 0
+    terminal_next_cursor_present = False
+    stop_reason = "max_events_reached"
 
     while len(events) < max_events:
         limit = min(page_size, max_events - len(events))
@@ -417,13 +822,54 @@ def fetch_weather_events_keyset(
             archived=archived,
         )
         page = payload.get("events", [])
+        page_count += 1
+        last_page_size = len(page) if isinstance(page, list) else 0
+        terminal_next_cursor_present = bool(payload.get("next_cursor"))
         if not page:
+            stop_reason = "empty_page"
             break
         events.extend(page[: max_events - len(events)])
         cursor = payload.get("next_cursor")
-        if not cursor or len(page) < limit:
+        if len(events) >= max_events:
+            stop_reason = "max_events_reached"
             break
-    return events
+        if not cursor:
+            stop_reason = "natural_end_no_cursor"
+            break
+        if len(page) < limit:
+            stop_reason = "natural_end_partial_page"
+            break
+    summary = {
+        "mode": "keyset",
+        "indexed": len(events),
+        "max_events": max_events,
+        "page_size": page_size,
+        "page_count": page_count,
+        "last_page_size": last_page_size,
+        "terminal_next_cursor_present": terminal_next_cursor_present,
+        "stop_reason": stop_reason,
+        "natural_end": stop_reason in {"empty_page", "natural_end_no_cursor", "natural_end_partial_page"},
+        "tag_id": tag_id,
+        "tag_slug": tag_slug,
+        "order": order,
+        "ascending": ascending,
+        "active": active,
+        "closed": closed,
+        "archived": archived,
+    }
+    return events, summary
+
+
+def write_weather_fetch_summary(config: Mapping[str, Any], summary: Mapping[str, Any]) -> None:
+    runtime = config.get("runtime", {}) if isinstance(config, Mapping) else {}
+    progress_log_path = str(runtime.get("progress_log_path") or "").strip()
+    if not progress_log_path:
+        return
+    output_dir = Path(progress_log_path).parent
+    try:
+        write_json(output_dir / WEATHER_FETCH_SUMMARY_FILENAME, dict(summary))
+    except OSError:
+        return
 
 
 def fetch_wallet_snapshot(
@@ -681,19 +1127,23 @@ def fetch_wallet_snapshot(
         else fetch_optional_chain_validation(client, wallet, config)
     )
     collection_status = {
-        "activity": activity_page,
-        "trades": trades_page,
+        "activity": compact_collection_status_map(activity_page),
+        "trades": compact_collection_status_map(trades_page),
         "positions": {
-            **positions_page,
+            **compact_collection_status_map(positions_page),
             "analysis_size_threshold": position_size_threshold,
             "size_threshold": None,
         },
-        "closed_positions": closed_positions_page,
+        "closed_positions": compact_collection_status_map(closed_positions_page),
     }
     if history_provider is not None:
-        collection_status["history_provider"] = dict(history_provider.get("status") or {})
+        collection_status["history_provider"] = compact_collection_status_map(
+            history_provider.get("status") or {}
+        )
     if history_ledger_fallback is not None:
-        collection_status["history_ledger"] = dict(history_ledger_fallback.get("status_payload") or {})
+        collection_status["history_ledger"] = compact_collection_status_map(
+            history_ledger_fallback.get("status_payload") or {}
+        )
     provider_operation_records = (
         list(history_provider.get("operation_records", []))
         if isinstance(history_provider, Mapping)
@@ -720,7 +1170,7 @@ def fetch_wallet_snapshot(
                     ),
                 ]
             )
-            collection_status["history_ledger_operations"] = dict(
+            collection_status["history_ledger_operations"] = compact_collection_status_map(
                 operation_ledger_fallback.get("status_payload") or {}
             )
     if accounting_snapshot is not None:
@@ -777,6 +1227,52 @@ def fetch_wallet_snapshot(
             "error": str(exc),
         }
     return snapshot
+
+
+def fetch_full_wallet_snapshot_with_retry(
+    client: PolymarketClient,
+    wallet: str,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    analysis_settings = config.get("analysis", {}) if isinstance(config.get("analysis"), Mapping) else {}
+    attempts = max(
+        1,
+        int(analysis_settings.get("full_hydration_retry_attempts") or DEFAULT_FULL_HYDRATION_RETRY_ATTEMPTS),
+    )
+    backoff_seconds = max(
+        0.0,
+        float(
+            analysis_settings.get("full_hydration_retry_backoff_seconds")
+            if analysis_settings.get("full_hydration_retry_backoff_seconds") is not None
+            else DEFAULT_FULL_HYDRATION_RETRY_BACKOFF_SECONDS
+        ),
+    )
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            snapshot = fetch_wallet_snapshot(
+                client,
+                wallet,
+                config,
+                snapshot_scope="full",
+            )
+            if attempt:
+                collection_status = snapshot.setdefault("collection_status", {})
+                if isinstance(collection_status, dict):
+                    collection_status["full_hydration_retry"] = {
+                        "attempts": attempt + 1,
+                        "recovered": True,
+                    }
+            return snapshot
+        except (PolymarketRequestError, HTTPError, URLError, TimeoutError, RuntimeError, OSError) as exc:
+            last_exc = exc
+            if attempt >= attempts - 1:
+                break
+            if backoff_seconds:
+                time.sleep(backoff_seconds * (2**attempt))
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("full hydration failed without an exception")
 
 
 def deferred_collection_page(section_name: str) -> dict[str, Any]:
@@ -2369,19 +2865,59 @@ def wallet_history_registry_dir(output_dir: Path) -> Path:
 def is_smart_wallet_library_mode(config: Mapping[str, Any]) -> bool:
     runtime = config.get("runtime", {}) if isinstance(config, Mapping) else {}
     analysis_mode = str(runtime.get("analysis_mode") or "").strip().lower()
-    return analysis_mode == SMART_WALLET_LIBRARY_REFRESH_MODE or bool(
+    return analysis_mode == SMART_WALLET_LIBRARY_REFRESH_MODE
+
+
+def is_import_wallet_analysis_mode(config: Mapping[str, Any]) -> bool:
+    runtime = config.get("runtime", {}) if isinstance(config, Mapping) else {}
+    analysis_mode = str(runtime.get("analysis_mode") or "").strip().lower()
+    return analysis_mode in {SMART_WALLET_LIBRARY_REFRESH_MODE, RELAY_ANALYSIS_MODE} or bool(
+        str(runtime.get("import_wallet_source_path") or "").strip()
+        or str(runtime.get("wallet_import_source_path") or "").strip()
+        or str(runtime.get("relay_source_path") or "").strip()
+        or str(runtime.get("smart_wallet_library_source_path") or "").strip()
+    )
+
+
+def runtime_import_wallet_source_path(config: Mapping[str, Any]) -> str:
+    runtime = config.get("runtime", {}) if isinstance(config, Mapping) else {}
+    return str(
+        runtime.get("import_wallet_source_path")
+        or runtime.get("wallet_import_source_path")
+        or runtime.get("relay_source_path")
+        or runtime.get("smart_wallet_library_source_path")
+        or ""
+    ).strip()
+
+
+def runtime_import_wallet_flag(config: Mapping[str, Any], generic_key: str, legacy_key: str) -> bool:
+    runtime = config.get("runtime", {}) if isinstance(config, Mapping) else {}
+    return bool(runtime.get(generic_key) or runtime.get(legacy_key))
+
+
+def is_legacy_smart_wallet_import_source(config: Mapping[str, Any]) -> bool:
+    runtime = config.get("runtime", {}) if isinstance(config, Mapping) else {}
+    return bool(
         str(runtime.get("smart_wallet_library_source_path") or "").strip()
     )
 
 
-def runtime_should_process_all_candidates(config: Mapping[str, Any]) -> bool:
+def analysis_mode_reason_key(config: Mapping[str, Any]) -> str:
     runtime = config.get("runtime", {}) if isinstance(config, Mapping) else {}
-    return bool(runtime.get("smart_wallet_library_process_all"))
+    analysis_mode = str(runtime.get("analysis_mode") or "").strip().lower()
+    return analysis_mode or DEFAULT_ANALYSIS_MODE
+
+
+def runtime_should_process_all_candidates(config: Mapping[str, Any]) -> bool:
+    return runtime_import_wallet_flag(
+        config,
+        "import_wallet_process_all",
+        "smart_wallet_library_process_all",
+    )
 
 
 def load_import_wallet_rows_from_config(config: Mapping[str, Any]) -> list[dict[str, Any]] | None:
-    runtime = config.get("runtime", {}) if isinstance(config, Mapping) else {}
-    source_path = str(runtime.get("smart_wallet_library_source_path") or "").strip()
+    source_path = runtime_import_wallet_source_path(config)
     if not source_path:
         return None
     return load_import_wallet_rows(Path(source_path))
@@ -2532,7 +3068,7 @@ def screening_trade_window_bounds(
 
 
 def should_collect_screening_window_first(config: Mapping[str, Any]) -> bool:
-    if is_smart_wallet_library_mode(config):
+    if is_import_wallet_analysis_mode(config):
         return bool(
             config.get("analysis", {}).get("smart_wallet_screening_window_first", False)
         )
@@ -2541,16 +3077,32 @@ def should_collect_screening_window_first(config: Mapping[str, Any]) -> bool:
 
 def screening_snapshot_mode(config: Mapping[str, Any]) -> str:
     analysis_settings = config.get("analysis", {})
-    if is_smart_wallet_library_mode(config):
-        if bool(analysis_settings.get("smart_wallet_screening_snapshot_enabled", True)):
+    full_history_core_gate_enabled = bool_config_value(
+        analysis_settings.get("full_history_core_gate_enabled")
+        if isinstance(analysis_settings, Mapping)
+        else None,
+        True,
+    )
+    if is_import_wallet_analysis_mode(config):
+        if bool(analysis_settings.get("smart_wallet_screening_snapshot_enabled", True)) or full_history_core_gate_enabled:
             return "recent_activity"
         return ""
-    if not bool(analysis_settings.get("screening_snapshot_enabled", True)):
+    if (
+        not bool(analysis_settings.get("screening_snapshot_enabled", True))
+        and not full_history_core_gate_enabled
+    ):
         return ""
     if should_collect_screening_window_first(config) and screening_trade_window_bounds(
         dict(config)
     ) is not None:
         return "screening_window"
+    if bool(
+        analysis_settings.get(
+            "recent_activity_screening_snapshot_enabled",
+            full_history_core_gate_enabled,
+        )
+    ):
+        return "recent_activity"
     return ""
 
 
@@ -2559,9 +3111,65 @@ def should_use_screening_snapshot(config: Mapping[str, Any]) -> bool:
 
 
 def should_hydrate_selected_wallet_full_history(config: Mapping[str, Any]) -> bool:
-    if screening_snapshot_mode(config) != "screening_window":
+    if screening_snapshot_mode(config) not in {"screening_window", "recent_activity"}:
         return False
     return bool(config.get("analysis", {}).get("hydrate_selected_wallet_full_history", True))
+
+
+def wallet_result_has_system_core_label(wallet_result: Mapping[str, Any]) -> bool:
+    return bool(wallet_result_system_core_label_keys(wallet_result))
+
+
+def wallet_result_system_core_label_keys(wallet_result: Mapping[str, Any]) -> list[str]:
+    core_label_keys = set(CORE_LABEL_KEYS)
+    keys: list[str] = []
+    evaluations = wallet_result.get("label_evaluations", [])
+    if isinstance(evaluations, list):
+        for item in evaluations:
+            if (
+                isinstance(item, Mapping)
+                and str(item.get("key") or "") in core_label_keys
+                and bool(item.get("matched"))
+            ):
+                keys.append(str(item.get("key")))
+
+    labels = wallet_result.get("labels", [])
+    if not isinstance(labels, list):
+        labels = []
+    for label in labels:
+        if not isinstance(label, Mapping):
+            continue
+        key = str(label.get("key") or "").strip()
+        if bool(label.get("system_core")):
+            keys.append(key or "unknown_core_label")
+        elif key in core_label_keys:
+            keys.append(key)
+
+    deduped: list[str] = []
+    for key in keys:
+        if key and key not in deduped:
+            deduped.append(key)
+    return deduped
+
+
+def wallet_result_selected(wallet_result: Mapping[str, Any]) -> bool:
+    screening = wallet_result.get("screening")
+    return bool(isinstance(screening, Mapping) and screening.get("selected"))
+
+
+def should_hydrate_wallet_result_full_history(
+    config: Mapping[str, Any],
+    wallet_result: Mapping[str, Any],
+) -> bool:
+    return (
+        wallet_result_selected(wallet_result)
+        and wallet_result_has_system_core_label(wallet_result)
+        and should_hydrate_selected_wallet_full_history(config)
+    )
+
+
+def should_generate_finder_ai_for_wallet_result(wallet_result: Mapping[str, Any]) -> bool:
+    return wallet_result_selected(wallet_result) and wallet_result_has_system_core_label(wallet_result)
 
 
 def trades_in_screening_window(
@@ -2608,7 +3216,11 @@ def build_leaderboard_prefilter_record(
         )
     if wallet in include_wallets:
         return None
-    if not bool(runtime.get("smart_wallet_library_skip_history_registry")) and wallet_is_in_history_registry(
+    if not runtime_import_wallet_flag(
+        config,
+        "import_wallet_skip_history_registry",
+        "smart_wallet_library_skip_history_registry",
+    ) and wallet_is_in_history_registry(
         history_registry_dir, wallet
     ):
         return prefilter_screening_record(
@@ -2617,7 +3229,11 @@ def build_leaderboard_prefilter_record(
             reasons=[HISTORY_ALREADY_FETCHED_REASON],
             stage="leaderboard",
         )
-    if bool(runtime.get("smart_wallet_library_skip_numeric_prefilter")):
+    if runtime_import_wallet_flag(
+        config,
+        "import_wallet_skip_numeric_prefilter",
+        "smart_wallet_library_skip_numeric_prefilter",
+    ):
         return None
 
     checks = [
@@ -2662,7 +3278,9 @@ def probe_wallet_trade_window(
     leaderboard_entry: dict[str, Any],
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    if is_smart_wallet_library_mode(config):
+    if is_import_wallet_analysis_mode(config):
+        return {"prefetched_trades": None, "trade_probe_fetched": False}
+    if screening_snapshot_mode(config) == "recent_activity":
         return {"prefetched_trades": None, "trade_probe_fetched": False}
 
     filter_config = config["wallet_filter"]
@@ -2870,14 +3488,13 @@ def analyze_leaderboard_entry(
         if (
             screening_snapshot_used
             and wallet_result["screening"]["selected"]
-            and should_hydrate_selected_wallet_full_history(config)
+            and should_hydrate_wallet_result_full_history(config, wallet_result)
         ):
             try:
-                full_snapshot = fetch_wallet_snapshot(
+                full_snapshot = fetch_full_wallet_snapshot_with_retry(
                     client,
                     wallet,
                     config,
-                    snapshot_scope="full",
                 )
                 wallet_result = analyze_wallet(
                     wallet=wallet,
@@ -4087,7 +4704,7 @@ def build_operation_audit(
     return {
         "wallet": wallet,
         "complete": complete,
-        "collection_status": dict(collection_status),
+        "collection_status": compact_collection_status_map(collection_status),
         "profit_summary": profit_summary,
         "operations": operations,
         "record_count": len(records),
@@ -4562,7 +5179,8 @@ def build_screening_record(
     reasons: list[str] = []
     selected = True
 
-    if is_smart_wallet_library_mode(config):
+    if is_import_wallet_analysis_mode(config):
+        mode_reason = analysis_mode_reason_key(config)
         activity_filter_mode = str(filter_config.get("activity_filter_mode") or "all").strip().lower()
         if normalized_wallet in exclude_wallets:
             selected = False
@@ -4579,6 +5197,8 @@ def build_screening_record(
             reasons.append("failed:snapshot_complete")
         elif not snapshot_complete:
             reasons.append("partial_snapshot:screening_evidence_complete")
+        if not selected:
+            pass
         elif activity_filter_mode == "normal_active":
             if str(metrics.get("activity_level") or "").strip().lower() == "normal_active":
                 reasons.append("activity_level==normal_active")
@@ -4592,7 +5212,7 @@ def build_screening_record(
                 selected = False
                 reasons.append("failed:activity_level==inactive")
         else:
-            reasons.append("smart_wallet_library_refresh:skip_numeric_filters")
+            reasons.append(f"{mode_reason}:skip_numeric_filters")
         return {
             "wallet": wallet,
             "rank": leaderboard_entry.get("rank"),
@@ -4795,7 +5415,7 @@ def is_weather_record(record: dict[str, Any], weather_index: WeatherIndex) -> bo
     event_slug = str(record.get("eventSlug", "")).strip()
     condition_id = str(record.get("conditionId", "")).strip()
     market_slug = str(record.get("slug", "")).strip()
-    return any(
+    indexed_match = any(
         (
             event_id and event_id in weather_index.event_ids,
             event_slug and event_slug in weather_index.event_slugs,
@@ -4803,6 +5423,35 @@ def is_weather_record(record: dict[str, Any], weather_index: WeatherIndex) -> bo
             market_slug and market_slug in weather_index.market_slugs,
         )
     )
+    return indexed_match or record_has_weather_evidence(record)
+
+
+def record_has_weather_evidence(record: Mapping[str, Any]) -> bool:
+    for field in WEATHER_RECORD_TEXT_FIELDS:
+        if value_has_weather_evidence(get_field_value(record, field)):
+            return True
+    return False
+
+
+def value_has_weather_evidence(value: Any) -> bool:
+    if value in (None, ""):
+        return False
+    if isinstance(value, Mapping):
+        for key in ("slug", "label", "name", "title", "tag", "tagSlug", "tag_slug"):
+            if value_has_weather_evidence(value.get(key)):
+                return True
+        return False
+    if isinstance(value, (list, tuple, set)):
+        return any(value_has_weather_evidence(item) for item in value)
+
+    normalized = " ".join(str(value).strip().lower().replace("_", "-").split())
+    if not normalized:
+        return False
+    dashed = normalized.replace(" ", "-")
+    spaced = normalized.replace("-", " ")
+    if normalized in WEATHER_RECORD_TAG_TERMS or dashed in WEATHER_RECORD_TAG_TERMS or spaced in WEATHER_RECORD_TAG_TERMS:
+        return True
+    return any(pattern in dashed or pattern in spaced for pattern in WEATHER_RECORD_TEXT_PATTERNS)
 
 
 GENERIC_WEATHER_TAGS = {

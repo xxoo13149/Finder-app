@@ -133,6 +133,10 @@ def resolve_history_ledger_settings(config: Mapping[str, Any] | None = None) -> 
             section.get("replicate_to_cloudflare", True),
             True,
         ),
+        "compact_gap_payloads_after_batch": coerce_bool(
+            section.get("compact_gap_payloads_after_batch", True),
+            True,
+        ),
         "persist_trades": coerce_bool(section.get("persist_trades", True), True),
         "persist_operations": coerce_bool(section.get("persist_operations", True), True),
         "persist_gaps": coerce_bool(section.get("persist_gaps", True), True),
@@ -176,6 +180,9 @@ class HistoryLedgerStore:
             ),
             "fallback_to_local_on_error": bool(
                 self.settings.get("fallback_to_local_on_error", True)
+            ),
+            "compact_gap_payloads_after_batch": bool(
+                self.settings.get("compact_gap_payloads_after_batch", True)
             ),
         }
 
@@ -610,6 +617,68 @@ class HistoryLedgerStore:
             "trade_count": len(trade_rows),
             "operation_count": len(operation_rows),
             "gap_count": len(gap_rows),
+        }
+
+    def compact_local_gap_payloads(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {
+                "status": "disabled",
+                "reason": "history_ledger_disabled",
+                "updated_count": 0,
+                "removed_record_lists": 0,
+            }
+        if self.artifacts_root is None:
+            return {
+                "status": "skipped",
+                "reason": "artifacts_root_missing",
+                "updated_count": 0,
+                "removed_record_lists": 0,
+            }
+        if not bool(self.settings.get("compact_gap_payloads_after_batch", True)):
+            return {
+                "status": "disabled",
+                "reason": "gap_payload_compaction_disabled",
+                "updated_count": 0,
+                "removed_record_lists": 0,
+            }
+
+        path = history_ledger_table_path(self.artifacts_root, "gaps")
+        if not path.exists():
+            return {
+                "status": "skipped",
+                "reason": "gap_ledger_missing",
+                "updated_count": 0,
+                "removed_record_lists": 0,
+            }
+
+        with LEDGER_LOCK:
+            rows = read_local_ledger_rows(path)
+            changed = False
+            updated_count = 0
+            removed_record_lists = 0
+            compacted_rows: list[dict[str, Any]] = []
+            for row in rows:
+                next_row = dict(row)
+                payload = next_row.get("payload")
+                if isinstance(payload, Mapping):
+                    compact_payload, removed_count = compact_ledger_status_with_count(payload)
+                    if removed_count:
+                        next_row["payload"] = compact_payload
+                        changed = True
+                        updated_count += 1
+                        removed_record_lists += removed_count
+                compacted_rows.append(next_row)
+
+            if changed:
+                path.write_text(
+                    json.dumps(compacted_rows, ensure_ascii=False, indent=2, default=str),
+                    encoding="utf-8",
+                )
+
+        return {
+            "status": "compacted" if changed else "unchanged",
+            "updated_count": updated_count,
+            "removed_record_lists": removed_record_lists,
         }
 
     def _persist_cloudflare_rows(
@@ -1588,7 +1657,7 @@ def build_gap_ledger_rows(
     for section_name, raw_status in collection_status.items():
         if not isinstance(raw_status, Mapping):
             continue
-        status = dict(raw_status)
+        status = compact_collection_status_for_ledger(raw_status)
         history_scope = str(status.get("history_scope") or snapshot_scope or "aggregate").strip()
         range_start = to_optional_int(status.get("range_start"))
         range_end = to_optional_int(status.get("range_end"))
@@ -1624,6 +1693,49 @@ def build_gap_ledger_rows(
             }
         )
     return rows
+
+
+def compact_collection_status_for_ledger(status: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): compact_ledger_status_value(value)
+        for key, value in status.items()
+        if str(key) != "records"
+    }
+
+
+def compact_ledger_status_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return compact_collection_status_for_ledger(value)
+    if isinstance(value, list):
+        return [compact_ledger_status_value(item) for item in value]
+    return value
+
+
+def compact_ledger_status_with_count(status: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
+    removed_count = 0
+    result: dict[str, Any] = {}
+    for key, value in status.items():
+        if str(key) == "records":
+            removed_count += 1
+            continue
+        compact_value, nested_removed_count = compact_ledger_status_value_with_count(value)
+        result[str(key)] = compact_value
+        removed_count += nested_removed_count
+    return result, removed_count
+
+
+def compact_ledger_status_value_with_count(value: Any) -> tuple[Any, int]:
+    if isinstance(value, Mapping):
+        return compact_ledger_status_with_count(value)
+    if isinstance(value, list):
+        compacted_values: list[Any] = []
+        removed_count = 0
+        for item in value:
+            compacted_item, item_removed_count = compact_ledger_status_value_with_count(item)
+            compacted_values.append(compacted_item)
+            removed_count += item_removed_count
+        return compacted_values, removed_count
+    return value, 0
 
 
 def infer_operation_history_scope(

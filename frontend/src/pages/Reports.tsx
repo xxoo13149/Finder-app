@@ -14,8 +14,9 @@ import {
   getReport,
   getSummary,
   getWallets,
-  latestCompletedRun,
+  hasReadableRunResult,
   listRuns,
+  resolveSelectedRunId,
   runDisplayName,
   shortAddress,
 } from '../lib/api';
@@ -40,7 +41,7 @@ export function Reports({
   const [exporting, setExporting] = useState<'report' | 'wallets'>();
   const [error, setError] = useState<string>();
 
-  const selectedRunId = activeRunId || latestCompletedRun(runs)?.run_id;
+  const selectedRunId = resolveSelectedRunId(runs, activeRunId);
   const selectedRun = runs.find((item) => item.run_id === selectedRunId);
   const averages = summary?.averages || {};
 
@@ -91,7 +92,7 @@ export function Reports({
   const loadResult = async (runId: string) => {
     setLoading(true);
     try {
-      const [nextSummary, walletPayload] = await Promise.all([getSummary(runId), getWallets(runId, {limit: 500})]);
+      const [nextSummary, walletPayload] = await Promise.all([getSummary(runId), getWallets(runId, {limit: 80})]);
       setSummary(nextSummary);
       setWallets(walletPayload.items || []);
       setError(undefined);
@@ -108,8 +109,11 @@ export function Reports({
       .then((items) => {
         if (cancelled) return;
         setRuns(items);
-        const latest = activeRunId || latestCompletedRun(items)?.run_id;
-        if (latest && !activeRunId) onRunSelected(latest);
+        const activeRun = activeRunId ? items.find((item) => item.run_id === activeRunId) : undefined;
+        const nextRunId = resolveSelectedRunId(items, activeRunId);
+        if (nextRunId && (!activeRunId || !activeRun || !hasReadableRunResult(activeRun))) {
+          onRunSelected(nextRunId);
+        }
       })
       .catch((err) => {
         if (!cancelled) setError(err.message);

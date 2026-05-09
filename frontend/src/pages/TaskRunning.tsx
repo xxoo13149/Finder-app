@@ -1,13 +1,18 @@
-import {CheckCircle2, FileText, List, RefreshCcw, XCircle} from 'lucide-react';
-import {useEffect, useMemo, useState} from 'react';
+import {CheckCircle2, FileText, List, PlayCircle, RefreshCcw, XCircle} from 'lucide-react';
+import {useCallback, useEffect, useMemo, useState} from 'react';
 import {RunPicker} from '../components/RunPicker';
 import {
+  AnalysisSummary,
+  RunDiagnostics,
   RunRecord,
   formatDateTime,
   getArtifact,
   getRun,
-  latestCompletedRun,
+  getSummary,
+  hasReadableRunResult,
   listRuns,
+  resolveSelectedRunId,
+  resumeRun,
   runDisplayName,
   statusLabel as formatStatusLabel,
   statusTone,
@@ -28,12 +33,20 @@ export function TaskRunning({
 }) {
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [run, setRun] = useState<RunRecord>();
+  const [summary, setSummary] = useState<AnalysisSummary>();
   const [errors, setErrors] = useState<PipelineError[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
+  const [resuming, setResuming] = useState(false);
 
-  const selectedRunId = activeRunId || latestCompletedRun(runs)?.run_id;
-  const selectedRun = run || runs.find((item) => item.run_id === selectedRunId);
+  const selectedRunId = resolveSelectedRunId(runs, activeRunId);
+  const selectedRun = (run?.run_id === selectedRunId ? run : undefined) || runs.find((item) => item.run_id === selectedRunId);
+
+  const reloadRuns = useCallback(async () => {
+    const items = await listRuns();
+    setRuns(items);
+    return items;
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -41,8 +54,11 @@ export function TaskRunning({
       .then((items) => {
         if (cancelled) return;
         setRuns(items);
-        const latest = activeRunId || latestCompletedRun(items)?.run_id;
-        if (latest && !activeRunId) onRunSelected(latest);
+        const activeRun = activeRunId ? items.find((item) => item.run_id === activeRunId) : undefined;
+        const nextRunId = resolveSelectedRunId(items, activeRunId);
+        if (nextRunId && (!activeRunId || !activeRun || !hasReadableRunResult(activeRun))) {
+          onRunSelected(nextRunId);
+        }
       })
       .catch((err) => {
         if (!cancelled) setError(err.message);
@@ -55,62 +71,126 @@ export function TaskRunning({
     };
   }, [activeRunId, onRunSelected]);
 
-  useEffect(() => {
+  const loadRun = useCallback(async () => {
     if (!selectedRunId) return;
-    let cancelled = false;
+    try {
+      const nextRun = await getRun(selectedRunId);
+      setRun(nextRun);
+      setSummary(nextRun.summary);
+      setError(undefined);
 
-    const load = async () => {
+      getSummary(selectedRunId)
+        .then(setSummary)
+        .catch(() => undefined);
+
       try {
-        const nextRun = await getRun(selectedRunId);
-        if (cancelled) return;
-        setRun(nextRun);
-        setError(undefined);
-        try {
-          const text = await getArtifact(selectedRunId, 'errors.json');
-          if (!cancelled) setErrors(JSON.parse(text));
-        } catch {
-          if (!cancelled) setErrors((nextRun.result?.errors as PipelineError[]) || []);
-        }
-      } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+        const text = await getArtifact(selectedRunId, 'errors.json');
+        setErrors(JSON.parse(text));
+      } catch {
+        setErrors((nextRun.result?.errors as PipelineError[]) || []);
       }
-    };
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, [selectedRunId]);
 
-    load();
+  useEffect(() => {
+    setRun(undefined);
+    setSummary(undefined);
+    setErrors([]);
+    setError(undefined);
+    if (selectedRunId) void loadRun();
+  }, [loadRun, selectedRunId]);
+
+  useEffect(() => {
+    if (!selectedRunId || !autoRefresh) return;
     const interval = window.setInterval(() => {
-      if (!autoRefresh) return;
-      if (run?.status === 'running' || run?.status === 'queued' || !run) load();
+      if (run?.status === 'running' || run?.status === 'queued') void loadRun();
     }, 2500);
     return () => {
-      cancelled = true;
       window.clearInterval(interval);
     };
-  }, [autoRefresh, selectedRunId, run?.status]);
+  }, [autoRefresh, loadRun, run?.status, selectedRunId]);
+
+  const activeSummary = summary || run?.summary;
+  const diagnostics = activeSummary?.diagnostics;
+  const weatherEvents = diagnostics?.weather_events;
+  const hydration = diagnostics?.hydration;
+  const coreLabels = diagnostics?.core_labels;
+  const finderAiSummary = diagnostics?.finder_ai || activeSummary?.finder_ai_summary;
+  const activeDiagnostics = run?.active_diagnostics;
+  const activeWallets = activeDiagnostics?.wallets || {};
+  const activeRelaySource = activeDiagnostics?.relay_source || {};
 
   const progress = Math.max(0, Math.min(100, run?.percent ?? 0));
   const logs = run?.progress || [];
   const statusLabel = run?.status || 'artifact';
   const isComplete = run?.status === 'succeeded';
   const isFailed = run?.status === 'failed';
+  const canResume = Boolean(run?.resumable || selectedRun?.resumable);
+
+  const handleResume = async () => {
+    if (!selectedRunId || resuming) return;
+    setResuming(true);
+    setError(undefined);
+    try {
+      const nextRun = await resumeRun(selectedRunId);
+      setRun(nextRun);
+      setSummary(nextRun.summary);
+      onRunSelected(nextRun.run_id);
+      await reloadRuns();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setResuming(false);
+    }
+  };
+
+  const refreshSelectedRun = async () => {
+    if (!selectedRunId) return;
+    const [nextRun, nextSummary] = await Promise.all([
+      getRun(selectedRunId),
+      getSummary(selectedRunId).catch(() => undefined),
+      reloadRuns(),
+    ]);
+    setRun(nextRun);
+    setSummary(nextSummary || nextRun.summary);
+  };
 
   const stats = useMemo(
     () => [
       {label: '进度', value: `${progress}%`, tone: 'text-[#2E5CFF]'},
-      {label: '入选钱包', value: String(run?.result?.selected_wallet_count ?? '-'), tone: 'text-slate-900'},
+      {label: '入选钱包', value: String(run?.selected_wallet_count ?? run?.result?.selected_wallet_count ?? '-'), tone: 'text-slate-900'},
+      {label: '详情文件', value: String(run?.wallet_detail_count ?? '-'), tone: 'text-slate-900'},
+      {
+        label: '天气事件',
+        value: formatIndexedMax(weatherEvents?.indexed ?? activeSummary?.weather_events_indexed, weatherEvents?.max),
+        tone: weatherEvents?.cap_hit ? 'text-amber-600' : 'text-slate-900',
+      },
+      {
+        label: '核心命中',
+        value: formatIndexedMax(coreLabels?.wallets ?? activeSummary?.wallets_core_labeled, run?.selected_wallet_count ?? activeSummary?.wallets_selected),
+        tone: 'text-emerald-700',
+      },
+      {
+        label: 'DeepSeek',
+        value: formatIndexedMax((finderAiSummary?.generated || 0) + (finderAiSummary?.cached || 0), finderAiSummary?.eligible),
+        tone: 'text-indigo-700',
+      },
       {label: '错误数', value: String(errors.length || run?.result?.errors?.length || 0), tone: 'text-red-600'},
     ],
-    [errors.length, progress, run],
+    [activeSummary, coreLabels, errors.length, finderAiSummary, progress, run, weatherEvents],
   );
 
   if (loading && !selectedRunId) {
-    return <Message title="正在读取运行记录" body="正在检查已有分析结果和当前任务..." />;
+    return <Message title="正在读取运行记录" body="正在检查已有分析结果和当前任务。" />;
   }
 
   if (!selectedRunId) {
     return (
       <Message
         title="还没有选择任务"
-        body="先新建一次分析，这里会显示进度、日志和错误信息。"
+        body="先新建一次分析，这里会显示进度、日志、卡点和错误信息。"
         actionLabel="新建分析"
         onAction={() => onNavigate('new_task')}
       />
@@ -118,7 +198,7 @@ export function TaskRunning({
   }
 
   return (
-    <div className="mx-auto mt-6 flex w-full max-w-4xl flex-col overflow-hidden rounded-md border border-slate-200 bg-white shadow-sm">
+    <div className="mx-auto mt-6 flex w-full max-w-6xl flex-col overflow-hidden rounded-md border border-slate-200 bg-white shadow-sm">
       <div className="flex flex-col gap-4 border-b border-slate-100 px-6 py-5 lg:flex-row lg:items-start lg:justify-between">
         <div>
           <h1 className="text-xl font-bold text-slate-900">运行状态</h1>
@@ -127,7 +207,7 @@ export function TaskRunning({
         <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
           <RunPicker runs={runs} selectedRunId={selectedRunId} onRunSelected={onRunSelected} />
           <button
-            onClick={() => selectedRunId && getRun(selectedRunId).then(setRun)}
+            onClick={refreshSelectedRun}
             className="inline-flex h-10 items-center justify-center rounded-md border border-slate-300 bg-white px-4 text-sm font-medium text-slate-700 hover:bg-slate-50"
           >
             <RefreshCcw className="mr-2 h-4 w-4" />
@@ -155,7 +235,7 @@ export function TaskRunning({
             <div className="h-3 rounded-full bg-[#2E5CFF] transition-all duration-500" style={{width: `${progress}%`}} />
           </div>
 
-          <div className="grid grid-cols-1 gap-4 border-t border-slate-100 pt-6 md:grid-cols-3">
+          <div className="grid grid-cols-1 gap-4 border-t border-slate-100 pt-6 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
             {stats.map((stat) => (
               <div key={stat.label}>
                 <div className="mb-1 text-sm text-slate-500">{stat.label}</div>
@@ -163,17 +243,56 @@ export function TaskRunning({
               </div>
             ))}
           </div>
+
           <div className="mt-4 grid grid-cols-1 gap-2 text-sm text-slate-500 md:grid-cols-3">
             <span>创建时间：{formatDateTime(run?.created_at)}</span>
             <span>开始时间：{formatDateTime(run?.started_at)}</span>
             <span>完成时间：{formatDateTime(run?.finished_at)}</span>
           </div>
 
+          <div className="mt-5 grid grid-cols-1 gap-3 text-sm lg:grid-cols-3">
+            <DiagnosticPanel
+              title="轻量筛选"
+              rows={[
+                ['来源地址池', formatRelaySource(activeRelaySource)],
+                ['接力筛选', formatRelayFilters(activeRelaySource)],
+                ['候选预筛', formatActiveCount(activeWallets.prefilter_kept, activeWallets.prefilter_total)],
+                ['当前批次', formatActiveBatch(activeWallets)],
+                ['天气索引', formatIndexedMax(weatherEvents?.indexed ?? activeSummary?.weather_events_indexed, weatherEvents?.max)],
+                ['抓取方式', [weatherEvents?.fetch_mode || '-', weatherEvents?.reused_existing ? '复用旧索引' : '新抓取'].join(' · ')],
+                ['停止原因', weatherEvents?.stop_reason || '-'],
+                ['抓取页数', formatWeatherPageCount(weatherEvents)],
+                ['末页游标', formatWeatherCursor(weatherEvents?.terminal_next_cursor_present)],
+                ['覆盖提示', weatherEvents?.coverage_note || weatherEvents?.shortfall_hint || '-'],
+                ['标签门槛', '命中任意系统核心标签才进重链路'],
+              ]}
+            />
+            <DiagnosticPanel
+              title="重链路"
+              rows={[
+                ['钱包进度', formatActiveCount(activeWallets.completed_from_log ?? run?.selected_wallet_count, activeWallets.current_batch_total)],
+                ['详情文件', String(run?.wallet_detail_count ?? activeWallets.detail_files ?? '-')],
+                ['失败钱包', String(activeWallets.failed_from_log ?? errors.length ?? 0)],
+                ['Full hydration', `完成 ${hydration?.completed || 0} / 跳过 ${hydration?.skipped || 0} / 失败 ${hydration?.failed || 0}`],
+                ['历史范围', topCountsLabel(hydration?.history_scopes)],
+                ['跳过原因', topCountsLabel(hydration?.reason_counts)],
+              ]}
+            />
+            <DiagnosticPanel
+              title="DeepSeek"
+              rows={[
+                ['生成结果', `生成 ${finderAiSummary?.generated || 0} / 缓存 ${finderAiSummary?.cached || 0} / 候选 ${finderAiSummary?.eligible || 0}`],
+                ['需复核', `${finderAiSummary?.needs_review || 0}`],
+                ['Gate reason', topCountsLabel(finderAiSummary?.reason_counts)],
+              ]}
+            />
+          </div>
+
           {isComplete && (
             <div className="mt-6 flex flex-col gap-3 rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <div className="text-sm font-semibold text-emerald-900">分析已完成</div>
-                <div className="mt-1 text-sm text-emerald-700">可以继续查看分析结果，或直接进入钱包列表。</div>
+                <div className="mt-1 text-sm text-emerald-700">可以查看报告，或进入钱包列表继续筛选。</div>
               </div>
               <div className="flex flex-col gap-2 sm:flex-row">
                 <button
@@ -189,6 +308,32 @@ export function TaskRunning({
                 >
                   <List className="mr-2 h-4 w-4" />
                   查看钱包列表
+                </button>
+              </div>
+            </div>
+          )}
+
+          {canResume && (
+            <div className="mt-6 flex flex-col gap-3 rounded-md border border-blue-200 bg-blue-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <div className="text-sm font-semibold text-blue-950">可以继续这批分析</div>
+                <div className="mt-1 text-sm text-blue-800">已写入的钱包详情会保留，继续时会跳过已经完成的钱包。</div>
+              </div>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <button
+                  onClick={handleResume}
+                  disabled={resuming}
+                  className="inline-flex h-10 items-center justify-center rounded-md bg-[#2E5CFF] px-4 text-sm font-medium text-white shadow-sm hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <PlayCircle className="mr-2 h-4 w-4" />
+                  {resuming ? '接力中...' : '继续分析'}
+                </button>
+                <button
+                  onClick={() => onNavigate('wallet_list')}
+                  className="inline-flex h-10 items-center justify-center rounded-md border border-blue-300 bg-white px-4 text-sm font-medium text-blue-800 shadow-sm hover:bg-blue-50"
+                >
+                  <List className="mr-2 h-4 w-4" />
+                  查看已跑钱包
                 </button>
               </div>
             </div>
@@ -244,6 +389,120 @@ export function TaskRunning({
       </div>
     </div>
   );
+}
+
+function DiagnosticPanel({title, rows}: {title: string; rows: Array<[string, string]>}) {
+  return (
+    <div className="rounded-md border border-slate-200 bg-slate-50 px-4 py-3">
+      <div className="mb-2 font-semibold text-slate-900">{title}</div>
+      <div className="space-y-1">
+        {rows.map(([label, value]) => (
+          <div key={label} className="flex gap-3">
+            <span className="w-24 shrink-0 text-slate-500">{label}</span>
+            <span className="min-w-0 break-words text-slate-800">{value || '-'}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function formatIndexedMax(value?: number | null, max?: number | null): string {
+  const left = value == null ? '-' : String(value);
+  return max == null || max === 0 ? left : `${left}/${max}`;
+}
+
+function formatActiveCount(value?: number, total?: number): string {
+  const hasValue = typeof value === 'number' && Number.isFinite(value) && value > 0;
+  const hasTotal = typeof total === 'number' && Number.isFinite(total) && total > 0;
+  if (!hasValue && !hasTotal) return '-';
+  if (!hasTotal) return String(value ?? 0);
+  return `${value ?? 0}/${total}`;
+}
+
+function formatActiveBatch(wallets?: Record<string, number>): string {
+  const start = wallets?.current_batch_start || 0;
+  const end = wallets?.current_batch_end || 0;
+  const total = wallets?.current_batch_total || 0;
+  if (!start || !end || !total) return '-';
+  return `${start}-${end}/${total}`;
+}
+
+function formatWeatherPageCount(weatherEvents?: RunDiagnostics['weather_events']): string {
+  if (!weatherEvents || weatherEvents.page_count == null) return '-';
+  const pageCount = weatherEvents.page_count;
+  const lastPageSize = weatherEvents.last_page_size;
+  return lastPageSize == null ? `${pageCount} 页` : `${pageCount} 页 · 末页 ${lastPageSize}`;
+}
+
+function formatWeatherCursor(value?: boolean | null): string {
+  if (value == null) return '-';
+  return value ? '仍有下一页' : '无下一页';
+}
+
+function formatRelaySource(source?: Record<string, unknown>): string {
+  if (!source || !Object.keys(source).length) return '-';
+  const sourceTotal = Number(source.source_total || source.wallet_count || 0);
+  const matched = Number(source.matched_count || source.wallet_count || 0);
+  const pool = relaySourcePoolLabel(source.source_pool);
+  if (sourceTotal > 0 && matched > 0 && sourceTotal !== matched) {
+    return `${matched}/${sourceTotal} · ${pool}`;
+  }
+  return `${matched || sourceTotal || '-'} · ${pool}`;
+}
+
+function formatRelayFilters(source?: Record<string, unknown>): string {
+  if (!source || !Object.keys(source).length) return '-';
+  const core = relayCoreFilterLabel(source.core_label_filter);
+  const deepseek = relayDeepSeekFilterLabel(source.deepseek_filter);
+  return `${core} · ${deepseek}`;
+}
+
+function relaySourcePoolLabel(value: unknown): string {
+  switch (String(value || '')) {
+    case 'smart_wallet_import_rows':
+      return '原始地址库';
+    case 'relay_import_rows':
+      return '接力输入';
+    case 'selected_wallets':
+      return '已选快照';
+    case 'leaderboard':
+      return '排行榜';
+    default:
+      return '当前链路';
+  }
+}
+
+function relayCoreFilterLabel(value: unknown): string {
+  switch (String(value || 'all')) {
+    case 'core':
+      return '核心标签';
+    case 'non_core':
+      return '非核心';
+    default:
+      return '全部标签';
+  }
+}
+
+function relayDeepSeekFilterLabel(value: unknown): string {
+  switch (String(value || 'all')) {
+    case 'completed':
+      return 'DeepSeek 已完成';
+    case 'incomplete':
+      return 'DeepSeek 未完成';
+    default:
+      return '全部 DeepSeek';
+  }
+}
+
+function topCountsLabel(counts?: Record<string, number>, limit = 2): string {
+  if (!counts) return '-';
+  const entries = Object.entries(counts)
+    .filter(([, value]) => Number(value) > 0)
+    .sort((left, right) => Number(right[1]) - Number(left[1]))
+    .slice(0, limit);
+  if (!entries.length) return '-';
+  return entries.map(([key, value]) => `${key}: ${value}`).join(' · ');
 }
 
 function Message({

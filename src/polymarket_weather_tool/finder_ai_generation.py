@@ -29,6 +29,22 @@ FINDER_AI_CACHE_DIR = PROJECT_ROOT / ".cache" / "finder-ai"
 DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_DEFAULT_TIMEOUT_SECONDS = 45.0
 FINDER_AI_BRIEF_SHORT_MAX_LENGTH = 28
+FINDER_AI_PROVIDER_MAX_ATTEMPTS = 2
+FINDER_AI_REQUIRED_FIELDS = ("strategyFocus", "aiBriefShort", "aiBriefNote", "aiDeepNote")
+NON_CITY_FOCUS_REGIONS = {
+    "ai",
+    "crypto",
+    "culture",
+    "economics",
+    "economy",
+    "finance",
+    "global temp",
+    "global temperature",
+    "health",
+    "politics",
+    "science",
+    "sports",
+}
 
 
 def generate_finder_ai_brief(
@@ -73,27 +89,53 @@ def generate_finder_ai_brief(
     cache_key = text_value(provider_meta.get("cacheKey") or brief_generation.get("cacheKey"))
     cached = read_cached_finder_ai_brief(cache_key)
     if cached:
-        return apply_generated_finder_ai_brief(
+        validation_error = validate_generated_finder_ai_brief(
             result=result,
             generated=cached,
-            status="cached",
-            reason="cache_hit",
             wallet_result=wallet_result,
         )
+        if not validation_error:
+            return apply_generated_finder_ai_brief(
+                result=result,
+                generated=cached,
+                status="cached",
+                reason="cache_hit",
+                wallet_result=wallet_result,
+            )
 
-    try:
-        generated = request_deepseek_finder_ai_brief(
-            api_key=api_key,
-            model=model,
-            payload=result,
-            wallet_result=wallet_result,
-        )
-    except Exception as exc:
+    generated: dict[str, Any] | None = None
+    last_error: Exception | None = None
+    repair_hint = ""
+    for attempt in range(max(1, FINDER_AI_PROVIDER_MAX_ATTEMPTS)):
+        try:
+            candidate = request_deepseek_finder_ai_brief(
+                api_key=api_key,
+                model=model,
+                payload=result,
+                wallet_result=wallet_result,
+                repair_hint=repair_hint,
+            )
+            validation_error = validate_generated_finder_ai_brief(
+                result=result,
+                generated=candidate,
+                wallet_result=wallet_result,
+            )
+            if validation_error:
+                raise ValueError(validation_error)
+            generated = candidate
+            break
+        except Exception as exc:
+            last_error = exc
+            repair_hint = build_finder_ai_repair_hint(exc)
+            if attempt >= max(1, FINDER_AI_PROVIDER_MAX_ATTEMPTS) - 1:
+                break
+
+    if generated is None:
         failed = dict(result)
         brief_generation = safe_mapping(failed.get("briefGeneration"))
         brief_generation["status"] = "failed"
         brief_generation["reason"] = "provider_error"
-        brief_generation["lastError"] = (text_value(exc) or str(exc).strip())[:240]
+        brief_generation["lastError"] = (text_value(last_error) or str(last_error).strip())[:240]
         failed["briefGeneration"] = brief_generation
         return failed
 
@@ -155,16 +197,67 @@ def apply_local_finder_ai_fallback(
     return updated
 
 
+def build_finder_ai_repair_hint(exc: Exception) -> str:
+    message = (text_value(exc) or str(exc).strip())[:180]
+    return (
+        "Previous DeepSeek output was rejected: "
+        f"{message}. Return strict JSON only, with non-empty string fields "
+        "strategyFocus, aiBriefShort, aiBriefNote, and aiDeepNote. "
+        "Do not include replacement characters or corrupted text."
+    )
+
+
+def validate_generated_finder_ai_brief(
+    *,
+    result: Mapping[str, Any],
+    generated: Mapping[str, Any],
+    wallet_result: Mapping[str, Any],
+) -> str:
+    if has_mojibake_text(generated):
+        return "DeepSeek response contained replacement characters"
+    if not text_value(generated.get("aiBriefNote")):
+        return "DeepSeek response did not contain aiBriefNote"
+    try:
+        updated = postprocess_finder_ai_brief_fields(
+            result=result,
+            generated=generated,
+            wallet_result=wallet_result,
+        )
+    except Exception as exc:
+        return text_value(exc) or str(exc).strip()
+    for field in FINDER_AI_REQUIRED_FIELDS:
+        if not text_value(updated.get(field)):
+            return f"DeepSeek response did not produce {field}"
+    if has_mojibake_text({field: updated.get(field) for field in FINDER_AI_REQUIRED_FIELDS}):
+        return "DeepSeek postprocessed brief contained replacement characters"
+    return ""
+
+
+def has_mojibake_text(value: Any) -> bool:
+    if isinstance(value, str):
+        return any(pattern in value for pattern in ("\ufffd", "锟斤拷", "ï¿½"))
+    if isinstance(value, Mapping):
+        return any(has_mojibake_text(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(has_mojibake_text(item) for item in value)
+    return False
+
+
 def request_deepseek_finder_ai_brief(
     *,
     api_key: str,
     model: str,
     payload: Mapping[str, Any],
     wallet_result: Mapping[str, Any],
+    repair_hint: str = "",
 ) -> dict[str, Any]:
     request_payload = {
         "model": model,
-        "messages": build_finder_ai_prompt_messages(payload=payload, wallet_result=wallet_result),
+        "messages": build_finder_ai_prompt_messages(
+            payload=payload,
+            wallet_result=wallet_result,
+            repair_hint=repair_hint,
+        ),
         "temperature": 0.2,
     }
     response_payload = post_deepseek_json(
@@ -177,6 +270,8 @@ def request_deepseek_finder_ai_brief(
         raise ValueError("DeepSeek response did not contain choices")
     message = choices[0].get("message") if isinstance(choices[0], Mapping) else {}
     content = text_value(safe_mapping(message).get("content"))
+    if has_mojibake_text(content):
+        raise ValueError("DeepSeek response contained replacement characters")
     parsed = parse_generated_brief_content(content)
     ai_brief_note = text_value(parsed.get("aiBriefNote"))
     if not ai_brief_note:
@@ -222,6 +317,7 @@ def build_finder_ai_prompt_messages(
     *,
     payload: Mapping[str, Any],
     wallet_result: Mapping[str, Any],
+    repair_hint: str = "",
 ) -> list[dict[str, str]]:
     layered_input = safe_mapping(payload.get("layeredInput"))
     l0 = safe_mapping(layered_input.get("L0"))
@@ -271,24 +367,43 @@ def build_finder_ai_prompt_messages(
 
     system_prompt = (
         "You are Finder's Polymarket weather wallet analyst. "
+        "Analyze like an experienced, high-intensity Polymarket weather-market trader who has studied many city-weather contracts and many styles of wallet behavior. "
+        "You are not a generic summarizer: your job is to infer the trading logic behind the address, including its city focus, timing, conviction, entry cost, exit route, payoff shape, and failure mode. "
+        "Bring trader intuition and market feel, but use them only to connect evidence that is actually present; never invent forecasts, private data sources, city expertise, motives, or off-chain knowledge. "
+        "Write with human texture: concrete, vivid, slightly opinionated, and efficient, as if explaining the wallet to another serious trader who wants the point quickly. "
+        "Translate metrics into trader intuition: cheap entries can mean optionality, repeated city bets can show a comfort zone, holding to settlement can show patience or illiquidity tolerance, and frequent small exits can show edge harvesting. "
+        "Do not psychoanalyze the person behind the address; infer only the trading logic visible from orders, cities, timing, prices, size, holding, and settlement behavior. "
         "Use only the structured evidence from the user message. "
         "Do not invent facts, dates, numbers, motives, regions, or behaviors that were not provided. "
-        "Write natural Simplified Chinese that sounds like a human analyst, not a label dump or metric list. "
-        "Use behaviorSnapshot, coverage, and tradeSamples as your main behavioral evidence, and use primarySignals or labelHits as supporting evidence. "
-        "Use profileSnapshot, operationAuditSnapshot, and topTrades to explain the wallet's preferred battlefield, execution style, and how profits are actually realized. "
-        "When possible, point to repeatable patterns shown in the trade samples instead of only repeating label names. "
-        "Avoid empty phrases such as 'still worth watching' unless you say exactly what should be verified next. "
-        "When evidence exists, mention at least one concrete city, market, or execution pattern. "
+        "Write decisive, natural Simplified Chinese for a user who wants a fast wallet portrait, not a cautious model disclaimer. "
+        "Make the strongest conclusion supported by the data, but do not force every wallet into the same few stock labels. "
+        "Think in trader images and plain language: what kind of wallet this is, which city or setup attracts its risk, how it enters, how it exits, why that route can make money, and when the setup gives money back to the market. "
+        "You may invent fresh Chinese wording or metaphors, but only for phrasing; facts, motives, dates, regions, numbers, and behaviors must come from the evidence. "
+        "Name the wallet's pattern from the evidence itself; do not reuse a fixed taxonomy just because it is available. "
+        "If the wallet has a recognizable signature, give that signature a fresh name, but make the name explainable from the numbers or examples. "
+        "Do not perform a persona or write dramatic fiction; the human voice should come from sharp judgment, not invented scenes. "
+        "Avoid hedges such as '可能', '看起来', '仍需观察' when the evidence is already concrete. "
+        "Use behaviorSnapshot, coverage, and tradeSamples as the main behavioral evidence, and use primarySignals or labelHits only as supporting evidence. "
+        "Use profileSnapshot, operationAuditSnapshot, and topTrades to explain the wallet's preferred setup, execution style, and how profits are actually realized. "
+        "topTrades can include non-weather or cross-topic positions; use them as portfolio context, but do not treat them as weather evidence unless they match the weather samples or focus market. "
+        "Some region or city fields can be market groups such as Science or Global Temp; do not call those cities unless the trade titles clearly name a real place. "
+        "Do not dump metrics as a list; weave two to four key numbers into a causal judgment. "
+        "Every strong claim should be traceable to at least one concrete evidence item: a region/city, sample trade, price or size, win rate, profit multiple, holding/exit behavior, or operation audit result. "
+        "When evidence exists, mention concrete cities, dates, price/cost behavior, profit multiple, holding style, or execution pattern. "
+        "Avoid fixed section words such as '主战场', '硬证据', or '脆弱点' unless they are the most natural wording for this specific wallet. "
+        "Avoid generic endings like '后续要看能否复现' or '不是只在这批样本成立'. "
+        "If a caveat is needed, explain it in user-friendly words, not jargon: say what would make this wallet stop working or give back money. "
         "Return strict JSON with exactly four string fields: strategyFocus, aiBriefShort, aiBriefNote, aiDeepNote. "
         "strategyFocus should be one short Simplified Chinese strategy conclusion, not an English tag or abstract label. "
-        "When evidence exists, prefer concrete wording such as region plus execution style or region plus settlement preference. "
-        "aiBriefShort should be one crisp, scan-friendly preview line and should stay within 28 Chinese characters when possible. "
-        "It should read like a human-facing short takeaway, not a stacked label. "
-        "aiBriefNote should use 2 to 4 sentences to explain what kind of trader this looks like, what evidence supports that view, and the main caveat. "
-        "aiDeepNote should use 4 to 6 sentences to explain the trader archetype, repeatable behavior pattern, likely edge or motivation, what looks fragile, and what still needs verification. "
-        "If the evidence is incomplete or mixed, say that explicitly instead of guessing. "
+        "aiBriefShort should read like a trader's one-line read on the wallet, not a product label, and should stay within 28 Chinese characters when possible. "
+        "aiBriefNote should use 2 to 4 sentences in a natural order: give the wallet's read, anchor it with evidence, and say where this setup gives money back. "
+        "aiDeepNote should use 4 to 6 sentences and feel like a short trader desk note: describe the signature, rhythm, profit route, unusual signal if any, and the concrete condition that would make the style lose its edge. "
+        "If evidence is incomplete, say what part of the conclusion is limited, but do not make the whole note sound uncertain. "
         "Do not output markdown or any text outside the JSON object."
     )
+    repair_hint_text = text_value(repair_hint)
+    if repair_hint_text:
+        system_prompt = f"{system_prompt} {repair_hint_text}"
 
     return [
         {
@@ -671,6 +786,8 @@ def build_top_trade_insight(top_trades: list[dict[str, Any]]) -> str:
         return ""
     first_trade = safe_mapping(top_trades[0])
     title = text_value(first_trade.get("title"))
+    if title and not is_relevant_weather_or_focus_title(title):
+        return ""
     side = text_value(first_trade.get("side"))
     size = first_trade.get("size")
     if title and side and size not in (None, ""):
@@ -746,9 +863,9 @@ def build_context_brief_note(
     operation_snapshot = build_prompt_operation_snapshot(wallet_result)
     sentences: list[str] = []
     if region:
-        lead = f"\u5b83\u66f4\u50cf\u56f4\u7ed5 {region} \u8fd9\u7c7b\u719f\u6089\u57ce\u5e02\u53cd\u590d\u4e0b\u6ce8\u7684\u5929\u6c14\u4ea4\u6613\u8005"
+        lead = f"\u5b83\u66f4\u50cf\u56f4\u7ed5 {focus_region_descriptor(region)}\u53cd\u590d\u4e0b\u6ce8\u7684\u4ea4\u6613\u8005"
     else:
-        lead = "\u5b83\u66f4\u50cf\u56f4\u7ed5\u5c11\u6570\u719f\u6089\u9898\u6750\u53cd\u590d\u4e0b\u6ce8\u7684\u5929\u6c14\u4ea4\u6613\u8005"
+        lead = "\u5b83\u66f4\u50cf\u56f4\u7ed5\u5c11\u6570\u719f\u6089\u9898\u6750\u53cd\u590d\u4e0b\u6ce8\u7684\u4ea4\u6613\u8005"
 
     evidence_fragment = build_brief_evidence_fragment(payload=payload, wallet_result=wallet_result)
     if evidence_fragment:
@@ -789,9 +906,11 @@ def build_brief_evidence_fragment(
     size = trade.get("size_usd")
     if not trade and top_trades:
         top_trade = safe_mapping(top_trades[0])
-        title = text_value(top_trade.get("title"))
-        side = text_value(top_trade.get("side"))
-        size = top_trade.get("size")
+        top_title = text_value(top_trade.get("title"))
+        if is_relevant_weather_or_focus_title(top_title):
+            title = top_title
+            side = text_value(top_trade.get("side"))
+            size = top_trade.get("size")
 
     if title and side:
         fragments.append(f"\u4ee3\u8868\u6027\u8ba2\u5355\u662f\u201c{title}\u201d\u7684 {side}")
@@ -815,8 +934,12 @@ def build_context_brief_short(
 
     if region and isinstance(trade_multiple, (int, float)) and isinstance(final_multiple, (int, float)):
         if trade_multiple < 1 and final_multiple > 1:
+            if is_non_city_focus_region(region):
+                return f"{region} \u4e3b\u9898\u53cd\u590d\u4e0b\u6ce8\u3001\u504f\u7ed3\u7b97\u5151\u73b0"
             return f"{region} \u53cd\u590d\u4e0b\u6ce8\u3001\u504f\u7ed3\u7b97\u5151\u73b0"
     if region:
+        if is_non_city_focus_region(region):
+            return f"{region} \u4e3b\u9898\u53cd\u590d\u4e0b\u6ce8"
         return f"{region} \u53cd\u590d\u4e0b\u6ce8"
 
     strategy_focus = text_value(payload.get("strategyFocus"))
@@ -866,10 +989,16 @@ def build_context_strategy_focus(
 
     if region and isinstance(trade_multiple, (int, float)) and isinstance(final_multiple, (int, float)):
         if trade_multiple < 1 and final_multiple > 1:
+            if is_non_city_focus_region(region):
+                return f"{region} \u4e3b\u9898\u96c6\u4e2d\u3001\u504f\u7ed3\u7b97\u5151\u73b0"
             return f"{region} \u96c6\u4e2d\u4e0b\u6ce8\u3001\u504f\u7ed3\u7b97\u5151\u73b0"
         if trade_multiple > 1 and final_multiple > 1:
+            if is_non_city_focus_region(region):
+                return f"{region} \u4e3b\u9898\u96c6\u4e2d\u3001\u5206\u5c42\u5151\u73b0"
             return f"{region} \u96c6\u4e2d\u4e0b\u6ce8\u3001\u5206\u5c42\u5151\u73b0"
     if region:
+        if is_non_city_focus_region(region):
+            return f"{region} \u4e3b\u9898\u53cd\u590d\u4e0b\u6ce8"
         return f"{region} \u53cd\u590d\u4e0b\u6ce8"
 
     if isinstance(trade_multiple, (int, float)) and isinstance(final_multiple, (int, float)):
@@ -898,6 +1027,55 @@ def infer_focus_region(
         top_city = safe_mapping(top_realized[0])
         return first_non_empty(top_city.get("city"), top_city.get("region"))
     return ""
+
+
+def is_non_city_focus_region(region: str) -> bool:
+    normalized = text_value(region).lower()
+    if not normalized:
+        return False
+    return normalized in NON_CITY_FOCUS_REGIONS or any(
+        marker in normalized
+        for marker in (
+            "global temp",
+            "global temperature",
+        )
+    )
+
+
+def focus_region_descriptor(region: str) -> str:
+    normalized = text_value(region)
+    if not normalized:
+        return "\u5c11\u6570\u719f\u6089\u9898\u6750"
+    if is_non_city_focus_region(normalized):
+        if "temp" in normalized.lower() or normalized.lower() == "science":
+            return f"{normalized} \u8fd9\u7c7b\u5168\u7403\u6e29\u5ea6/\u79d1\u5b66\u4e3b\u9898"
+        return f"{normalized} \u8fd9\u7c7b\u4e3b\u9898\u5e02\u573a"
+    return f"{normalized} \u8fd9\u7c7b\u719f\u6089\u57ce\u5e02"
+
+
+def is_relevant_weather_or_focus_title(title: str) -> bool:
+    normalized = text_value(title).lower()
+    if not normalized:
+        return False
+    if re.search(r"\b\d+(?:\.\d+)?\s?[cf]\b", normalized):
+        return True
+    return any(
+        marker in normalized
+        for marker in (
+            "weather",
+            "temp",
+            "temperature",
+            "highest temperature",
+            "global temperature",
+            "rain",
+            "snow",
+            "wind",
+            "celsius",
+            "fahrenheit",
+            "\u00b0c",
+            "\u00b0f",
+        )
+    )
 
 
 def build_brief_execution_sentence(operation_snapshot: Mapping[str, Any]) -> str:
@@ -1057,6 +1235,8 @@ def has_persona_anchor(
     normalized = normalize_brief_text(text)
     if not normalized:
         return False
+    if has_concrete_evidence_anchor(normalized, payload=payload, wallet_result=wallet_result):
+        return True
 
     behavior_markers = (
         "结果兑现",
@@ -1076,6 +1256,25 @@ def has_persona_anchor(
         "SELL",
         "buy",
         "sell",
+        "买",
+        "卖",
+        "持有",
+        "入场",
+        "出手",
+        "仓位",
+        "价格",
+        "胜率",
+        "赔率",
+        "暴击",
+        "提前埋伏",
+        "低成本",
+        "筹码成本",
+        "持有至结算",
+        "结算兑现",
+        "流动性",
+        "redeem",
+        "split",
+        "swap",
         "天气占比",
         "天气交易占比",
         "同一座城",
@@ -1087,6 +1286,65 @@ def has_persona_anchor(
         return has_behavior_anchor
 
     return has_behavior_anchor
+
+
+def has_concrete_evidence_anchor(
+    text: str,
+    *,
+    payload: Mapping[str, Any],
+    wallet_result: Mapping[str, Any],
+) -> bool:
+    normalized = normalize_brief_text(text)
+    if not normalized:
+        return False
+
+    region = infer_focus_region(payload=payload, wallet_result=wallet_result)
+    has_region = bool(region and region in normalized)
+    has_number = bool(re.search(r"\d", normalized)) or "%" in normalized or "倍" in normalized or "x" in normalized
+    has_action = any(
+        marker in normalized
+        for marker in (
+            "BUY",
+            "SELL",
+            "buy",
+            "sell",
+            "买",
+            "卖",
+            "下注",
+            "入场",
+            "出手",
+            "持有",
+            "结算",
+            "兑现",
+            "调仓",
+            "仓位",
+            "价格",
+            "赔率",
+            "胜率",
+            "redeem",
+            "split",
+            "swap",
+        )
+    )
+
+    layered_input = safe_mapping(payload.get("layeredInput"))
+    l4 = safe_mapping(layered_input.get("L4"))
+    sample_hit = False
+    for item in build_prompt_trade_samples(l4.get("tradeSamples")) + build_prompt_top_trades(wallet_result.get("top_trades")):
+        sample = safe_mapping(item)
+        sample_values = (
+            sample.get("city"),
+            sample.get("market_date"),
+            sample.get("side"),
+            sample.get("outcome"),
+            sample.get("event_slug"),
+            sample.get("eventSlug"),
+        )
+        if any(text_value(value) and text_value(value) in normalized for value in sample_values):
+            sample_hit = True
+            break
+
+    return (has_region and (has_number or has_action)) or (sample_hit and (has_number or has_action))
 
 
 def extract_brief_note_from_deep_note(text: str) -> str:
@@ -1244,7 +1502,7 @@ def derive_finder_ai_deep_note(
     sentences: list[str] = []
     if region:
         sentences.append(
-            f"\u8fd9\u4e2a\u5730\u5740\u66f4\u50cf\u628a {region} \u8fd9\u7c7b\u719f\u6089\u57ce\u5e02\u5f53\u4e3b\u6218\u573a\u3001\u53cd\u590d\u4e0b\u6ce8\u7684\u5929\u6c14\u4ea4\u6613\u8005\u3002"
+            f"\u8fd9\u4e2a\u5730\u5740\u66f4\u50cf\u628a {focus_region_descriptor(region)}\u5f53\u6210\u6838\u5fc3\u573a\u666f\u3001\u53cd\u590d\u4e0b\u6ce8\u7684\u4ea4\u6613\u8005\u3002"
         )
     elif base:
         sentences.append(ensure_sentence(base))
@@ -1461,7 +1719,10 @@ def build_deep_note_verification_target(
 ) -> str:
     parts: list[str] = []
     if region:
-        parts.append(f"\u56f4\u7ed5 {region} \u96c6\u4e2d\u4e0b\u6ce8")
+        if is_non_city_focus_region(region):
+            parts.append(f"\u56f4\u7ed5 {region} \u4e3b\u9898\u96c6\u4e2d\u4e0b\u6ce8")
+        else:
+            parts.append(f"\u56f4\u7ed5 {region} \u96c6\u4e2d\u4e0b\u6ce8")
 
     trade_multiple = operation_snapshot.get("trade_liquidity_profit_multiple")
     final_multiple = operation_snapshot.get("final_settlement_profit_multiple")

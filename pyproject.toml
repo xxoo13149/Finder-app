@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "polymarket-weather-tool"
-version = "0.1.0"
-description = "CLI pipeline for Polymarket weather leaderboard screening and wallet strategy analysis."
+version = "0.2.0"
+description = "Local console for Polymarket weather wallet screening, tagging, relay analysis, and DeepSeek briefs."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []

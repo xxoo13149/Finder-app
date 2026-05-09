@@ -12,8 +12,9 @@ import {
   formatPercent,
   getArtifact,
   getWallets,
-  latestCompletedRun,
+  hasReadableRunResult,
   listRuns,
+  resolveSelectedRunId,
   runDisplayName,
   shortAddress,
   syncSmartProImport,
@@ -37,6 +38,7 @@ export function WalletList({
   const [tag, setTag] = useState('all');
   const [selectedOnly, setSelectedOnly] = useState('all');
   const [page, setPage] = useState(1);
+  const [walletTotal, setWalletTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [smartProSyncing, setSmartProSyncing] = useState(false);
@@ -44,7 +46,7 @@ export function WalletList({
   const [smartProError, setSmartProError] = useState<string>();
   const [smartProStatus, setSmartProStatus] = useState<string>();
 
-  const selectedRunId = activeRunId || latestCompletedRun(runs)?.run_id;
+  const selectedRunId = resolveSelectedRunId(runs, activeRunId);
   const selectedRun = runs.find((item) => item.run_id === selectedRunId);
 
   useEffect(() => {
@@ -53,8 +55,11 @@ export function WalletList({
       .then((items) => {
         if (cancelled) return;
         setRuns(items);
-        const latest = activeRunId || latestCompletedRun(items)?.run_id;
-        if (latest && !activeRunId) onRunSelected(latest);
+        const activeRun = activeRunId ? items.find((item) => item.run_id === activeRunId) : undefined;
+        const nextRunId = resolveSelectedRunId(items, activeRunId);
+        if (nextRunId && (!activeRunId || !activeRun || !hasReadableRunResult(activeRun))) {
+          onRunSelected(nextRunId);
+        }
       })
       .catch((err) => {
         if (!cancelled) setError(err.message);
@@ -67,14 +72,18 @@ export function WalletList({
   useEffect(() => {
     if (!selectedRunId) {
       setLoading(false);
+      setWallets([]);
+      setWalletTotal(0);
       return;
     }
     let cancelled = false;
     setLoading(true);
-    getWallets(selectedRunId, {limit: 500})
+    const offset = Math.max(0, (page - 1) * pageSize);
+    getWallets(selectedRunId, {offset, limit: pageSize})
       .then((payload) => {
         if (!cancelled) {
           setWallets(payload.items || []);
+          setWalletTotal(Number(payload.total || 0));
           setError(undefined);
         }
       })
@@ -87,7 +96,7 @@ export function WalletList({
     return () => {
       cancelled = true;
     };
-  }, [selectedRunId]);
+  }, [page, pageSize, selectedRunId]);
 
   const tags = useMemo(() => {
     const values = new Set<string>();
@@ -112,9 +121,9 @@ export function WalletList({
     });
   }, [query, selectedOnly, tag, wallets]);
 
-  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const pageCount = Math.max(1, Math.ceil((walletTotal || filtered.length) / pageSize));
   const currentPage = Math.min(page, pageCount);
-  const visible = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+  const visible = filtered;
 
   const exportJson = async () => {
     if (!selectedRunId) return;
@@ -340,7 +349,7 @@ export function WalletList({
 
       <div className="flex flex-shrink-0 items-center justify-between border-t border-slate-200 bg-white px-6 py-3">
         <div className="text-sm text-slate-500">
-          {filtered.length ? (currentPage - 1) * pageSize + 1 : 0}-{Math.min(currentPage * pageSize, filtered.length)} / 共 {filtered.length}
+          {filtered.length ? (currentPage - 1) * pageSize + 1 : 0}-{Math.min((currentPage - 1) * pageSize + filtered.length, walletTotal || filtered.length)} / 共 {walletTotal || filtered.length}
         </div>
         <div className="inline-flex rounded-md shadow-sm">
           <button

@@ -284,7 +284,7 @@ class FinderAiGenerationTests(unittest.TestCase):
         )
 
         self.assertIn("Dallas", note)
-        self.assertIn("\u5929\u6c14\u4ea4\u6613\u8005", note)
+        self.assertIn("\u4ea4\u6613\u8005", note)
         self.assertIn("\u7ed3\u679c\u5151\u73b0", note)
         self.assertIn("\u540e\u9762\u8fd8\u662f\u8981\u76ef", note)
         self.assertIn("\u7ed3\u7b97\u7aef", note)
@@ -327,7 +327,7 @@ class FinderAiGenerationTests(unittest.TestCase):
             wallet_result=build_wallet_result(),
         )
 
-        self.assertIn("\u4e3b\u6218\u573a", deep_note)
+        self.assertIn("\u6838\u5fc3\u573a\u666f", deep_note)
         self.assertIn("BUY", deep_note)
         self.assertNotIn("\u4ece\u76c8\u5229\u5206\u5e03\u770b", deep_note)
         self.assertIn("\u53cd\u590d\u51fa\u73b0", deep_note)
@@ -350,7 +350,7 @@ class FinderAiGenerationTests(unittest.TestCase):
 
         self.assertIn("Dallas", deep_note)
         self.assertIn("BUY", deep_note)
-        self.assertIn("\u4e3b\u6218\u573a", deep_note)
+        self.assertIn("\u6838\u5fc3\u573a\u666f", deep_note)
         self.assertNotIn("This generated deep note", deep_note)
 
     def test_derive_finder_ai_brief_note_rewrites_generic_region_anchor(self) -> None:
@@ -396,10 +396,12 @@ class FinderAiGenerationTests(unittest.TestCase):
         self.assertIn("profileSnapshot", messages[0]["content"])
         self.assertIn("operationAuditSnapshot", messages[0]["content"])
         self.assertIn("topTrades", messages[0]["content"])
-        self.assertIn("Avoid empty phrases", messages[0]["content"])
+        self.assertIn("high-intensity Polymarket weather-market trader", messages[0]["content"])
+        self.assertIn("do not treat them as weather evidence", messages[0]["content"])
+        self.assertIn("do not call those cities", messages[0]["content"])
         self.assertIn("Simplified Chinese strategy conclusion", messages[0]["content"])
         self.assertIn("not an English tag or abstract label", messages[0]["content"])
-        self.assertIn("scan-friendly preview line", messages[0]["content"])
+        self.assertIn("trader's one-line read", messages[0]["content"])
         self.assertIn("28 Chinese characters", messages[0]["content"])
         self.assertEqual(messages[1]["role"], "user")
         prompt_context = json.loads(messages[1]["content"])
@@ -427,6 +429,62 @@ class FinderAiGenerationTests(unittest.TestCase):
         self.assertEqual(prompt_context["keyMetrics"][0]["key"], "weather_trade_ratio")
         self.assertEqual(prompt_context["gate"]["strongEvidenceCount"], 1)
         self.assertEqual(prompt_context["updatedAt"], payload["layeredInput"]["L0"]["updatedAt"])
+
+    def test_postprocess_preserves_concrete_chinese_provider_brief(self) -> None:
+        payload = build_payload()
+        generated = {
+            "strategyFocus": "Dallas 低价提前埋伏",
+            "aiBriefShort": "Dallas低价票埋伏",
+            "aiBriefNote": "这个钱包在Dallas反复买入低价天气合约，样本里有BUY 120.5美元、入场价0.42的订单，说明它不是泛泛扫盘，而是在熟悉城市里提前埋伏。收益更依赖持有到结算，一旦低价票没有重新定价，仓位会被时间拖住。",
+            "aiDeepNote": "这个钱包的节奏偏提前埋伏Dallas天气票，买入价0.42、单笔120.5美元的样本说明它会在有把握时放大仓位。它的利润更靠结算兑现，而不是盘中反复倒手。风险在于如果天气预期没有继续向它的方向修正，低价仓位会变成沉没成本。",
+        }
+
+        result = finder_ai_generation.apply_generated_finder_ai_brief(
+            result=payload,
+            generated=generated,
+            status="generated",
+            reason="generated",
+            wallet_result=build_wallet_result(),
+        )
+
+        self.assertEqual(result["aiBriefNote"], generated["aiBriefNote"])
+        self.assertEqual(result["aiDeepNote"], generated["aiDeepNote"])
+        self.assertNotIn("它更像围绕", result["aiBriefNote"])
+
+    def test_non_city_focus_region_is_not_rendered_as_familiar_city(self) -> None:
+        payload = build_payload()
+        payload["layeredInput"]["L3"]["behaviorSnapshot"]["dominant_region"] = "Science"
+        payload["layeredInput"]["L4"]["tradeSamples"] = [
+            {
+                "market_title": "Will global temperature increase by between 1.25\u00baC and 1.29\u00baC in April 2026?",
+                "city": "Science",
+                "side": "SELL",
+                "size_usd": 1.47,
+                "market_date": "2026-04",
+            }
+        ]
+        wallet_result = build_wallet_result()
+        wallet_result["top_trades"] = [
+            {
+                "title": "Will there be at least 1800 measles cases in the U.S. by April 30, 2026?",
+                "side": "SELL",
+                "size": 3000,
+                "price": 0.999,
+                "outcome": "No",
+            }
+        ]
+
+        note = finder_ai_generation.derive_finder_ai_deep_note(
+            "",
+            ai_brief_note="",
+            payload=payload,
+            wallet_result=wallet_result,
+        )
+
+        self.assertIn("Science", note)
+        self.assertIn("\u5168\u7403\u6e29\u5ea6/\u79d1\u5b66\u4e3b\u9898", note)
+        self.assertNotIn("\u719f\u6089\u57ce\u5e02", note)
+        self.assertNotIn("measles", note)
 
     def test_generate_finder_ai_brief_skips_when_not_ready(self) -> None:
         payload = build_payload(status="needs_review")
@@ -470,7 +528,7 @@ class FinderAiGenerationTests(unittest.TestCase):
         self.assertTrue(result["aiDeepNote"])
         self.assertIn("Dallas", result["aiDeepNote"])
         self.assertIn("BUY", result["aiDeepNote"])
-        self.assertIn("\u4e3b\u6218\u573a", result["aiDeepNote"])
+        self.assertIn("\u6838\u5fc3\u573a\u666f", result["aiDeepNote"])
         self.assertIn("\u590d\u73b0", result["aiDeepNote"])
         self.assertIn("\u7ed3\u7b97\u7aef", result["aiDeepNote"])
         self.assertEqual(result["providerMeta"]["generatedAt"], "")
@@ -581,6 +639,79 @@ class FinderAiGenerationTests(unittest.TestCase):
         self.assertEqual(result["providerMeta"]["model"], "deepseek-v4-flash")
         self.assertEqual(result["providerMeta"]["generatedAt"], "")
         self.assertNotIn("requestId", result["providerMeta"])
+
+    def test_generate_finder_ai_brief_retries_when_provider_returns_invalid_payload(self) -> None:
+        payload = build_payload()
+        invalid = {
+            "strategyFocus": "Missing brief",
+            "aiBriefShort": "Missing brief",
+            "aiBriefNote": "",
+            "aiDeepNote": "Missing brief",
+        }
+        generated = {
+            "strategyFocus": "Dallas \u7ed3\u7b97\u7aef\u6253\u6cd5",
+            "aiBriefShort": "Dallas \u9ad8\u786e\u4fe1\u5929\u6c14\u5355",
+            "aiBriefNote": "\u8fd9\u4e2a\u5730\u5740\u56f4\u7ed5 Dallas \u96c6\u4e2d\u4e0b\u6ce8\uff0c\u6837\u672c\u91cc\u80fd\u770b\u5230 BUY \u548c\u7ed3\u7b97\u7aef\u5151\u73b0\u3002",
+            "aiDeepNote": (
+                "This wallet repeatedly concentrates around Dallas weather setups. "
+                "The representative BUY sample supports the same-city behavior and settlement-oriented read."
+            ),
+            "generatedAt": "2026-05-05T09:00:00+00:00",
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "requestId": "req-retry-001",
+        }
+
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}, clear=True):
+            with patch.object(finder_ai_generation, "read_cached_finder_ai_brief", return_value={}):
+                with patch.object(
+                    finder_ai_generation,
+                    "request_deepseek_finder_ai_brief",
+                    side_effect=[invalid, generated],
+                ) as request_mock:
+                    with patch.object(finder_ai_generation, "write_cached_finder_ai_brief") as write_mock:
+                        result = finder_ai_generation.generate_finder_ai_brief(
+                            payload=payload,
+                            wallet_result=build_wallet_result(),
+                        )
+
+        self.assertEqual(request_mock.call_count, 2)
+        self.assertIn("Previous DeepSeek output was rejected", request_mock.call_args_list[1].kwargs["repair_hint"])
+        write_mock.assert_called_once_with(payload["providerMeta"]["cacheKey"], generated)
+        self.assertEqual(result["briefGeneration"]["status"], "generated")
+        self.assertEqual(result["providerMeta"]["requestId"], "req-retry-001")
+
+    def test_generate_finder_ai_brief_rejects_mojibake_without_caching(self) -> None:
+        payload = build_payload()
+        generated = {
+            "strategyFocus": "Dallas ���",
+            "aiBriefShort": "Dallas ���",
+            "aiBriefNote": "\u8fd9\u4e2a\u5730\u5740\u56f4\u7ed5 Dallas ���",
+            "aiDeepNote": "\u8fd9\u4e2a\u5730\u5740\u66f4\u50cf Dallas ���",
+            "generatedAt": "2026-05-05T09:00:00+00:00",
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+        }
+
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}, clear=True):
+            with patch.object(finder_ai_generation, "read_cached_finder_ai_brief", return_value={}):
+                with patch.object(
+                    finder_ai_generation,
+                    "request_deepseek_finder_ai_brief",
+                    return_value=generated,
+                ) as request_mock:
+                    with patch.object(finder_ai_generation, "write_cached_finder_ai_brief") as write_mock:
+                        result = finder_ai_generation.generate_finder_ai_brief(
+                            payload=payload,
+                            wallet_result=build_wallet_result(),
+                        )
+
+        self.assertEqual(request_mock.call_count, 2)
+        write_mock.assert_not_called()
+        self.assertEqual(result["briefGeneration"]["status"], "failed")
+        self.assertEqual(result["briefGeneration"]["reason"], "provider_error")
+        self.assertIn("replacement characters", result["briefGeneration"]["lastError"])
+        self.assertEqual(result["aiBriefNote"], "")
 
     def test_generate_finder_ai_brief_writes_generated_result_and_cache(self) -> None:
         payload = build_payload()
@@ -705,7 +836,7 @@ class FinderAiGenerationTests(unittest.TestCase):
         self.assertTrue(generated["aiDeepNote"])
         self.assertIn("Dallas", generated["aiDeepNote"])
         self.assertIn("BUY", generated["aiDeepNote"])
-        self.assertIn("\u4e3b\u6218\u573a", generated["aiDeepNote"])
+        self.assertIn("\u6838\u5fc3\u573a\u666f", generated["aiDeepNote"])
         self.assertIn("\u590d\u73b0", generated["aiDeepNote"])
         self.assertEqual(generated["provider"], "deepseek")
         self.assertEqual(generated["model"], "deepseek-v4-flash")

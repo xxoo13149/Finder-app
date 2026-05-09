@@ -5,7 +5,14 @@ import {
   type ActivityFilterMode,
   type AnalysisMode,
   type CreateRunInput,
+  type DeepSeekRelayFilter,
+  type RelayCoreLabelFilter,
+  type RelayImportBuildResult,
+  type RunRecord,
+  buildRelayImportPayload,
   getDefaultConfig,
+  listRuns,
+  runDisplayName,
   saveDefaultConfig,
   startRun,
 } from '../lib/api';
@@ -51,6 +58,11 @@ const analysisModeOptions: Array<{value: AnalysisMode; label: string; descriptio
     label: '后台地址库刷新',
     description: '导入后台地址库，对名单内地址重新抓取并刷新分析结果。',
   },
+  {
+    value: 'relay_analysis',
+    label: '接力分析',
+    description: '从历史运行的原始全量地址池接力，可按系统核心标签和 DeepSeek 状态筛选。',
+  },
 ];
 
 const activityFilterOptions: Array<{value: ActivityFilterMode; label: string; description: string}> = [
@@ -71,6 +83,42 @@ const activityFilterOptions: Array<{value: ActivityFilterMode; label: string; de
   },
 ];
 
+const deepSeekRelayFilterOptions: Array<{value: DeepSeekRelayFilter; label: string; description: string}> = [
+  {
+    value: 'all',
+    label: '全部地址',
+    description: '不按 DeepSeek 状态筛选，使用来源运行里的全部钱包。',
+  },
+  {
+    value: 'incomplete',
+    label: '未完成 DeepSeek',
+    description: '只接力还没有 generated/cached 深度解读的钱包。',
+  },
+  {
+    value: 'completed',
+    label: '已完成 DeepSeek',
+    description: '只接力已经完成 generated/cached 深度解读的钱包。',
+  },
+];
+
+const relayCoreLabelFilterOptions: Array<{value: RelayCoreLabelFilter; label: string; description: string}> = [
+  {
+    value: 'all',
+    label: '全部标签状态',
+    description: '不按系统核心标签状态筛选，使用来源运行里的全部钱包。',
+  },
+  {
+    value: 'core',
+    label: '已打系统核心标签',
+    description: '只接力来源结果里已经命中系统核心标签的钱包。',
+  },
+  {
+    value: 'non_core',
+    label: '未打系统核心标签',
+    description: '只接力来源结果里还没有命中系统核心标签的钱包。',
+  },
+];
+
 type SmartWalletImportSummary = {
   detectedCount: number;
   validAddressCount: number;
@@ -78,6 +126,12 @@ type SmartWalletImportSummary = {
   addressOnlyCount: number;
   latestUpdatedAt?: string;
   previewPairs: Array<{name: string; address: string}>;
+};
+
+type RelayImportPreview = RelayImportBuildResult & {
+  sourceRunId: string;
+  coreLabelFilter: RelayCoreLabelFilter;
+  deepSeekFilter: DeepSeekRelayFilter;
 };
 
 type SmartWalletImportState = {
@@ -99,7 +153,7 @@ const fallbackForm: FormState = {
   max_traded_count: 99,
   min_weather_trade_ratio: 0.5,
   fetch_limit: 100,
-  max_weather_events: 1000,
+  max_weather_events: 100000,
   max_wallet_offset: 10000,
   concurrent_wallets: 4,
   use_cache: true,
@@ -111,11 +165,17 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
   const [config, setConfig] = useState<Record<string, any>>();
   const [form, setForm] = useState<FormState>(fallbackForm);
   const [smartWalletImport, setSmartWalletImport] = useState<SmartWalletImportState>({});
+  const [runs, setRuns] = useState<RunRecord[]>([]);
+  const [relaySourceRunId, setRelaySourceRunId] = useState('');
+  const [relayCoreLabelFilter, setRelayCoreLabelFilter] = useState<RelayCoreLabelFilter>('all');
+  const [deepSeekRelayFilter, setDeepSeekRelayFilter] = useState<DeepSeekRelayFilter>('all');
+  const [relayImportPreview, setRelayImportPreview] = useState<RelayImportPreview>();
   const [loading, setLoading] = useState(true);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [importingFile, setImportingFile] = useState(false);
+  const [buildingRelayImport, setBuildingRelayImport] = useState(false);
   const [message, setMessage] = useState<string>();
   const [error, setError] = useState<string>();
 
@@ -138,7 +198,26 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    listRuns()
+      .then((items) => {
+        if (cancelled) return;
+        setRuns(items);
+        const firstReadable = items.find((item) => item.wallet_detail_count || item.selected_wallet_count);
+        if (firstReadable) {
+          setRelaySourceRunId((current) => current || firstReadable.run_id);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const isSmartWalletImportMode = form.analysis_mode === 'smart_wallet_library_refresh';
+  const isRelayAnalysisMode = form.analysis_mode === 'relay_analysis';
+  const isImportedWalletMode = isSmartWalletImportMode || isRelayAnalysisMode;
   const validationError = useMemo(() => validateForm(form), [form]);
   const smartWalletImportNotice = useMemo(
     () =>
@@ -154,9 +233,29 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
         : null,
     [isSmartWalletImportMode, smartWalletImport.fileName, smartWalletImport.summary, smartWalletImport.payload],
   );
+  const relayImportValidationError = useMemo(
+    () =>
+      isRelayAnalysisMode && relayImportPreview
+        ? validateRelayImport(relayImportPreview)
+        : null,
+    [isRelayAnalysisMode, relayImportPreview],
+  );
   const submitValidationError = useMemo(
-    () => validateSubmit(form, smartWalletImport.summary, smartWalletImport.payload),
-    [form, smartWalletImport.summary, smartWalletImport.payload],
+    () => validateSubmit(form, smartWalletImport.summary, smartWalletImport.payload, {
+      sourceRunId: relaySourceRunId,
+      preview: relayImportPreview,
+      coreLabelFilter: relayCoreLabelFilter,
+      deepSeekFilter: deepSeekRelayFilter,
+    }),
+    [
+      form,
+      smartWalletImport.summary,
+      smartWalletImport.payload,
+      relaySourceRunId,
+      relayImportPreview,
+      relayCoreLabelFilter,
+      deepSeekRelayFilter,
+    ],
   );
   const budgetNote = useMemo(() => describeBudgetNote(form, config), [form, config]);
   const canSubmit = !submitValidationError;
@@ -167,8 +266,42 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
     setError(undefined);
   };
 
+  const updateAnalysisMode = (value: AnalysisMode) => {
+    setForm((current) => ({
+      ...current,
+      analysis_mode: value,
+      activity_filter_mode: value === 'relay_analysis' ? 'all' : current.activity_filter_mode,
+    }));
+    setSmartWalletImport({});
+    setRelayImportPreview(undefined);
+    setMessage(undefined);
+    setError(undefined);
+  };
+
+  const clearRelayImportForFilterChange = () => {
+    setRelayImportPreview(undefined);
+    setMessage(undefined);
+    setError(undefined);
+  };
+
+  const updateRelaySourceRunId = (value: string) => {
+    setRelaySourceRunId(value);
+    clearRelayImportForFilterChange();
+  };
+
+  const updateRelayCoreLabelFilter = (value: RelayCoreLabelFilter) => {
+    setRelayCoreLabelFilter(value);
+    clearRelayImportForFilterChange();
+  };
+
+  const updateDeepSeekRelayFilter = (value: DeepSeekRelayFilter) => {
+    setDeepSeekRelayFilter(value);
+    clearRelayImportForFilterChange();
+  };
+
   const clearSmartWalletImport = () => {
     setSmartWalletImport({});
+    setRelayImportPreview(undefined);
     setMessage(undefined);
     setError(undefined);
   };
@@ -199,9 +332,43 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
     }
   };
 
+  const buildRelayImport = async () => {
+    if (!relaySourceRunId) {
+      setError('请先选择一个已有分析运行。');
+      return;
+    }
+    setBuildingRelayImport(true);
+    setMessage(undefined);
+    setError(undefined);
+    try {
+      const result = await buildRelayImportPayload({
+        sourceRunId: relaySourceRunId,
+        coreLabelFilter: relayCoreLabelFilter,
+        deepSeekFilter: deepSeekRelayFilter,
+      });
+      if ((result.matched_count || 0) <= 0) {
+        setRelayImportPreview(undefined);
+        setError('当前筛选条件下没有可接力的钱包。');
+        return;
+      }
+      setRelayImportPreview({
+        ...result,
+        sourceRunId: relaySourceRunId,
+        coreLabelFilter: relayCoreLabelFilter,
+        deepSeekFilter: deepSeekRelayFilter,
+      });
+      setMessage(`已确认接力来源：原始地址 ${result.source_total} 个，当前筛选命中 ${result.matched_count} 个钱包。`);
+    } catch (err) {
+      setError(err instanceof Error ? `接力来源确认失败：${err.message}` : '接力来源确认失败。');
+    } finally {
+      setBuildingRelayImport(false);
+    }
+  };
+
   const reset = () => {
     setForm(config ? configToForm(config) : fallbackForm);
     setSmartWalletImport({});
+    setRelayImportPreview(undefined);
     setMessage('已恢复为默认配置。');
     setError(undefined);
   };
@@ -214,13 +381,22 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
     setSubmitting(true);
     setError(undefined);
     try {
-      const input: CreateRunInput = isSmartWalletImportMode
+      const input: CreateRunInput = isRelayAnalysisMode
         ? {
             ...form,
-            smart_wallet_import_payload: smartWalletImport.payload,
-            smart_wallet_import_file_name: smartWalletImport.fileName,
+            relay_import: {
+              sourceRunId: relaySourceRunId,
+              coreLabelFilter: relayCoreLabelFilter,
+              deepSeekFilter: deepSeekRelayFilter,
+            },
           }
-        : form;
+        : isSmartWalletImportMode
+          ? {
+              ...form,
+              wallet_import_payload: smartWalletImport.payload,
+              wallet_import_file_name: smartWalletImport.fileName,
+            }
+          : form;
       const run = await startRun(input);
       onRunCreated(run.run_id);
     } catch (err) {
@@ -271,7 +447,7 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
           <SettingSection title="任务信息" description="名称可选；留空时系统会自动按时间生成分析记录。">
             <AnalysisModeField
               value={form.analysis_mode}
-              onChange={(value) => update('analysis_mode', value)}
+              onChange={updateAnalysisMode}
             />
             <TextField
               label="分析名称"
@@ -283,7 +459,7 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
 
           {isSmartWalletImportMode && (
             <SettingSection
-              title="导入地址库"
+              title="后台地址库输入"
               description="上传后台地址库导出的 JSON，作为这次地址库刷新任务的输入源。"
             >
               <SmartWalletImportField
@@ -293,6 +469,28 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
                 noticeMessage={smartWalletImportNotice}
                 validationMessage={smartWalletImportValidationError}
                 onFileChange={handleSmartWalletImportChange}
+                onClear={clearSmartWalletImport}
+              />
+            </SettingSection>
+          )}
+
+          {isRelayAnalysisMode && (
+            <SettingSection
+              title="接力来源"
+              description="从来源运行原始全量地址池确认接力范围，可选系统核心标签和 DeepSeek 状态筛选；启动后仍走统一轻量筛选、核心标签和 DeepSeek gate。"
+            >
+              <RelayImportField
+                runs={runs}
+                sourceRunId={relaySourceRunId}
+                coreFilter={relayCoreLabelFilter}
+                filter={deepSeekRelayFilter}
+                loading={buildingRelayImport}
+                preview={relayImportPreview}
+                validationMessage={relayImportValidationError}
+                onSourceRunChange={updateRelaySourceRunId}
+                onCoreFilterChange={updateRelayCoreLabelFilter}
+                onFilterChange={updateDeepSeekRelayFilter}
+                onBuild={buildRelayImport}
                 onClear={clearSmartWalletImport}
               />
             </SettingSection>
@@ -310,7 +508,7 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
             </SettingSection>
           )}
 
-          {!isSmartWalletImportMode && (
+          {!isImportedWalletMode && (
           <SettingSection title="筛选条件" description="这里决定最终保留哪些钱包，是本次分析最重要的确认项。">
             <NumberField
               label="目标钱包数量"
@@ -376,20 +574,22 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
                 <div className="flex items-center gap-2">
                   <SlidersHorizontal className="h-4 w-4 text-slate-400" />
                   <h2 className="text-base font-semibold text-slate-900">
-                    {isSmartWalletImportMode ? '处理范围与运行参数' : '数据范围与分析预算'}
+                    {isImportedWalletMode ? '处理范围与运行参数' : '数据范围与分析预算'}
                   </h2>
                 </div>
                 <p className="mt-1 text-sm text-slate-500">
-                  {isSmartWalletImportMode
-                    ? '这里控制导入地址的处理范围、事件索引上限和并发参数。'
+                  {isImportedWalletMode
+                    ? '这里控制输入地址的处理范围、事件索引上限和并发参数。'
                     : '这里控制候选池大小、事件索引范围和并发预算；默认值适合日常使用。'}
                 </p>
               </div>
               <div className="flex flex-shrink-0 items-center gap-3">
                 <span className="hidden text-xs text-slate-500 sm:inline">
-                  {isSmartWalletImportMode
-                    ? `导入地址全量处理 · 活跃度 ${activityFilterOptions.find((option) => option.value === form.activity_filter_mode)?.label ?? '不筛选'} · 并发 ${form.concurrent_wallets}`
-                    : `首轮前 ${form.fetch_limit} 名 · 目标入选 ${form.target_count} 个 · 并发 ${form.concurrent_wallets}`}
+                  {isRelayAnalysisMode
+                    ? `接力地址 · DeepSeek ${deepSeekRelayFilterOptions.find((option) => option.value === deepSeekRelayFilter)?.label ?? '全部地址'} · 并发 ${form.concurrent_wallets}`
+                    : isSmartWalletImportMode
+                      ? `后台地址库 · 活跃度 ${activityFilterOptions.find((option) => option.value === form.activity_filter_mode)?.label ?? '不筛选'} · 并发 ${form.concurrent_wallets}`
+                      : `首轮前 ${form.fetch_limit} 名 · 目标入选 ${form.target_count} 个 · 并发 ${form.concurrent_wallets}`}
                 </span>
                 <ChevronDown className={cn('h-4 w-4 text-slate-400 transition-transform', advancedOpen && 'rotate-180')} />
               </div>
@@ -399,7 +599,7 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
               <div className="border-t border-slate-100 px-6 py-6">
                 <BudgetNote tone={budgetNote.tone} title={budgetNote.title} body={budgetNote.body} />
                 <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-                  {!isSmartWalletImportMode && (
+                  {!isImportedWalletMode && (
                   <NumberField
                     label="首轮排行榜范围（前 N 名）"
                     help="先从排行榜前 N 个钱包开始筛选；如果后端还没选满目标钱包，会继续按页扩到系统预算上限。"
@@ -413,7 +613,7 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
                     value={form.max_weather_events}
                     onChange={(value) => update('max_weather_events', value)}
                   />
-                  {!isSmartWalletImportMode && (
+                  {!isImportedWalletMode && (
                   <NumberField
                     label="钱包分页上限"
                     help="限制深分页范围，避免单次运行过慢。"
@@ -545,6 +745,11 @@ function validateForm(form: FormState): string | null {
     if (!isPositiveNumber(form.concurrent_wallets)) return '并发钱包数量必须大于 0。';
     return null;
   }
+  if (form.analysis_mode === 'relay_analysis') {
+    if (!isPositiveNumber(form.max_weather_events)) return '天气事件上限必须大于 0。';
+    if (!isPositiveNumber(form.concurrent_wallets)) return '并发钱包数量必须大于 0。';
+    return null;
+  }
   if (!activityFilterOptions.some((option) => option.value === form.activity_filter_mode)) {
     return '活跃度筛选选项无效。';
   }
@@ -578,6 +783,19 @@ function validateSmartWalletImport(summary?: SmartWalletImportSummary, payload?:
   return null;
 }
 
+function validateRelayImport(preview?: RelayImportPreview): string | null {
+  if (!preview) {
+    return '请先确认接力来源。';
+  }
+  if ((preview.source_total ?? 0) <= 0) {
+    return '来源运行里没有可恢复的原始地址池，请换一个历史运行。';
+  }
+  if ((preview.matched_count ?? 0) <= 0) {
+    return '当前筛选条件下没有可接力的钱包。';
+  }
+  return null;
+}
+
 function describeSmartWalletImportNotice(summary?: SmartWalletImportSummary): string | null {
   if ((summary?.validAddressCount ?? 0) <= 0) {
     return null;
@@ -591,9 +809,33 @@ function describeSmartWalletImportNotice(summary?: SmartWalletImportSummary): st
   return null;
 }
 
-function validateSubmit(form: FormState, smartWalletImportSummary?: SmartWalletImportSummary, smartWalletImportPayload?: unknown): string | null {
+function validateSubmit(
+  form: FormState,
+  smartWalletImportSummary?: SmartWalletImportSummary,
+  smartWalletImportPayload?: unknown,
+  relay?: {
+    sourceRunId: string;
+    preview?: RelayImportPreview;
+    coreLabelFilter: RelayCoreLabelFilter;
+    deepSeekFilter: DeepSeekRelayFilter;
+  },
+): string | null {
   const formError = validateForm(form);
   if (formError) return formError;
+  if (form.analysis_mode === 'relay_analysis') {
+    if (!relay?.sourceRunId) {
+      return '请先选择一个历史运行作为接力来源。';
+    }
+    if (
+      !relay.preview ||
+      relay.preview.sourceRunId !== relay.sourceRunId ||
+      relay.preview.coreLabelFilter !== relay.coreLabelFilter ||
+      relay.preview.deepSeekFilter !== relay.deepSeekFilter
+    ) {
+      return '请先按当前筛选条件确认接力来源。';
+    }
+    return validateRelayImport(relay.preview);
+  }
   if (form.analysis_mode === 'smart_wallet_library_refresh') {
     return validateSmartWalletImport(smartWalletImportSummary, smartWalletImportPayload);
   }
@@ -607,8 +849,15 @@ function describeBudgetNote(
   if (form.analysis_mode === 'smart_wallet_library_refresh') {
     return {
       tone: 'blue',
-      title: '当前将直接刷新导入地址',
-      body: '系统会按导入地址库逐个刷新分析结果，不再额外套用盈利、交易量和交易笔数筛选，仅保留活跃度这一项简单筛选。',
+      title: '当前将刷新后台地址库',
+      body: '系统会按导入地址库逐个刷新分析结果，不套用盈利、交易量和交易笔数筛选；这里只保留活跃度这一项简单筛选。',
+    };
+  }
+  if (form.analysis_mode === 'relay_analysis') {
+    return {
+      tone: 'blue',
+      title: '当前将运行接力分析',
+      body: '接力筛选会从来源 run 的原始全量地址池里挑地址，默认不限制标签或 DeepSeek 状态；启动后会重新走统一链路，先轻量筛选和打核心标签，再决定是否进入重链路。',
     };
   }
   const leaderboard = config?.leaderboard || {};
@@ -829,6 +1078,21 @@ function latestUpdatedAtFromImportRows(rows: Array<Record<string, unknown>>): st
   return latestValue;
 }
 
+function relaySourcePoolLabel(value: unknown): string {
+  switch (String(value || '')) {
+    case 'smart_wallet_import_rows':
+      return '原始地址库导入';
+    case 'relay_import_rows':
+      return '上次接力输入';
+    case 'leaderboard':
+      return '原始排行榜';
+    case 'selected_wallets':
+      return '旧版已选快照';
+    default:
+      return '来源运行';
+  }
+}
+
 function summarizeSmartWalletImport(payload: unknown): SmartWalletImportSummary {
   const rows = importWalletRows(payload);
   const previewPairs: Array<{name: string; address: string}> = [];
@@ -888,8 +1152,10 @@ function AnalysisModeField({
     value === 'weekly_high_profit'
       ? '按周榜单找地址，盈利、交易量和交易笔数都按周口径衡量。'
       : value === 'smart_wallet_library_refresh'
-        ? '按导入地址直接刷新分析，仅保留活跃度这一项简单筛选。'
-        : '按日常分析链路运行，盈利、交易量和交易笔数都按日口径衡量。';
+        ? '只处理后台地址库 JSON，用于刷新 Smart Pro/后台钱包库对应地址的分析结果。'
+        : value === 'relay_analysis'
+          ? '从已有 run 的原始全量地址池接力，可选核心标签和 DeepSeek 状态后重新建立一轮独立分析。'
+          : '按日常分析链路运行，盈利、交易量和交易笔数都按日口径衡量。';
 
   return (
     <FieldRow label="分析模式" help="先确定这次任务走哪条分析链路。">
@@ -925,6 +1191,152 @@ function AnalysisModeField({
           <span className="font-medium text-slate-800">{selectedMode.label}</span>
           <span className="ml-2">{modeNote}</span>
         </div>
+      </div>
+    </FieldRow>
+  );
+}
+
+function RelayImportField({
+  runs,
+  sourceRunId,
+  coreFilter,
+  filter,
+  loading,
+  preview,
+  validationMessage,
+  onSourceRunChange,
+  onCoreFilterChange,
+  onFilterChange,
+  onBuild,
+  onClear,
+}: {
+  runs: RunRecord[];
+  sourceRunId: string;
+  coreFilter: RelayCoreLabelFilter;
+  filter: DeepSeekRelayFilter;
+  loading: boolean;
+  preview?: RelayImportPreview;
+  validationMessage?: string | null;
+  onSourceRunChange: (value: string) => void;
+  onCoreFilterChange: (value: RelayCoreLabelFilter) => void;
+  onFilterChange: (value: DeepSeekRelayFilter) => void;
+  onBuild: () => void;
+  onClear: () => void;
+}) {
+  const selectableRuns = runs.filter((run) => run.wallet_detail_count || run.selected_wallet_count);
+
+  return (
+    <FieldRow
+      label="历史结果接力"
+      help="从来源运行的原始全量地址池接力，核心标签和 DeepSeek 状态都可以按需筛选。"
+    >
+      <div className="space-y-4">
+        <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_190px]">
+          <select
+            value={sourceRunId}
+            onChange={(event) => onSourceRunChange(event.target.value)}
+            className="block h-10 w-full rounded-md border-0 px-3 text-slate-900 shadow-sm ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-inset focus:ring-[#2E5CFF] sm:text-sm"
+          >
+            <option value="">选择已有分析运行</option>
+            {selectableRuns.map((run) => (
+              <option key={run.run_id} value={run.run_id}>
+                {runDisplayName(run)} · 钱包 {run.selected_wallet_count ?? run.wallet_detail_count ?? 0}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            onClick={onBuild}
+            disabled={!sourceRunId || loading}
+            className="inline-flex h-10 items-center justify-center rounded-md bg-[#2E5CFF] px-4 text-sm font-medium text-white shadow-sm hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {loading ? '确认中...' : '确认接力来源'}
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+          {relayCoreLabelFilterOptions.map((option) => {
+            const checked = option.value === coreFilter;
+            return (
+              <label
+                key={option.value}
+                className={cn(
+                  'flex cursor-pointer gap-3 rounded-md border px-4 py-3 transition-colors',
+                  checked ? 'border-[#2E5CFF] bg-blue-50/60' : 'border-slate-200 hover:border-slate-300',
+                )}
+              >
+                <input
+                  type="radio"
+                  name="relay_core_label_filter"
+                  value={option.value}
+                  checked={checked}
+                  onChange={() => onCoreFilterChange(option.value)}
+                  className="mt-1 h-4 w-4 border-slate-300 text-[#2E5CFF] focus:ring-[#2E5CFF]"
+                />
+                <span className="min-w-0">
+                  <span className="block text-sm font-medium text-slate-900">{option.label}</span>
+                  <span className="mt-1 block text-xs leading-5 text-slate-500">{option.description}</span>
+                </span>
+              </label>
+            );
+          })}
+        </div>
+
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+          {deepSeekRelayFilterOptions.map((option) => {
+            const checked = option.value === filter;
+            return (
+              <label
+                key={option.value}
+                className={cn(
+                  'flex cursor-pointer gap-3 rounded-md border px-4 py-3 transition-colors',
+                  checked ? 'border-[#2E5CFF] bg-blue-50/60' : 'border-slate-200 hover:border-slate-300',
+                )}
+              >
+                <input
+                  type="radio"
+                  name="deepseek_relay_filter"
+                  value={option.value}
+                  checked={checked}
+                  onChange={() => onFilterChange(option.value)}
+                  className="mt-1 h-4 w-4 border-slate-300 text-[#2E5CFF] focus:ring-[#2E5CFF]"
+                />
+                <span className="min-w-0">
+                  <span className="block text-sm font-medium text-slate-900">{option.label}</span>
+                  <span className="mt-1 block text-xs leading-5 text-slate-500">{option.description}</span>
+                </span>
+              </label>
+            );
+          })}
+        </div>
+
+        {preview && (
+          <div className="rounded-md border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+            <div className="font-medium text-slate-900">已确认接力来源</div>
+            <div className="mt-2 grid grid-cols-1 gap-2 text-xs text-slate-600 sm:grid-cols-3">
+              <div>原始地址池：{preview.source_total}</div>
+              <div>当前筛选命中：{preview.matched_count}</div>
+              <div>来源池：{relaySourcePoolLabel(preview.summary?.source_pool)}</div>
+              <div>DeepSeek 已完成：{preview.completed_count}</div>
+              <div>DeepSeek 未完成：{preview.incomplete_count}</div>
+              <div>系统核心标签：{preview.core_labeled_count}</div>
+            </div>
+            <button
+              type="button"
+              onClick={onClear}
+              className="mt-3 inline-flex h-9 items-center justify-center rounded-md px-3 text-sm font-medium text-slate-500 hover:bg-slate-100"
+            >
+              <X className="mr-2 h-4 w-4" />
+              清除接力来源
+            </button>
+          </div>
+        )}
+
+        {validationMessage && (
+          <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            {validationMessage}
+          </div>
+        )}
       </div>
     </FieldRow>
   );

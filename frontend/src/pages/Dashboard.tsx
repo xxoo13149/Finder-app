@@ -15,8 +15,9 @@ import {
   getRun,
   getSummary,
   getWallets,
-  latestCompletedRun,
+  hasReadableRunResult,
   listRuns,
+  resolveSelectedRunId,
   runDisplayName,
   shortAddress,
   statusLabel,
@@ -41,7 +42,7 @@ export function Dashboard({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
 
-  const selectedRunId = activeRunId || latestCompletedRun(runs)?.run_id;
+  const selectedRunId = resolveSelectedRunId(runs, activeRunId);
 
   useEffect(() => {
     let cancelled = false;
@@ -50,8 +51,11 @@ export function Dashboard({
       .then((items) => {
         if (cancelled) return;
         setRuns(items);
-        const latest = activeRunId || latestCompletedRun(items)?.run_id;
-        if (latest && !activeRunId) onRunSelected(latest);
+        const activeRun = activeRunId ? items.find((item) => item.run_id === activeRunId) : undefined;
+        const nextRunId = resolveSelectedRunId(items, activeRunId);
+        if (nextRunId && (!activeRunId || !activeRun || !hasReadableRunResult(activeRun))) {
+          onRunSelected(nextRunId);
+        }
       })
       .catch((err) => {
         if (!cancelled) setError(err.message);
@@ -88,7 +92,7 @@ export function Dashboard({
       return;
     }
     let cancelled = false;
-    getWallets(selectedRunId, {limit: 500})
+    getWallets(selectedRunId, {limit: 24})
       .then((payload) => {
         if (!cancelled) setPreviewWallets(payload.items || []);
       })

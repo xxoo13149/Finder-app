@@ -30,6 +30,8 @@ RUN_REUSABLE_JSON_FILENAMES = (
     "errors.json",
     "smart_wallet_import_rows.json",
     "smart_wallet_import_summary.json",
+    "relay_import_rows.json",
+    "relay_import_summary.json",
 )
 
 

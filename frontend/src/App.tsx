@@ -1,4 +1,4 @@
-import {useEffect, useState} from 'react';
+import {useCallback, useEffect, useState} from 'react';
 import {Layout} from './components/Layout';
 import {ConsolePreferences, lastRunKey, loadPreferences, preferencesChangedEvent} from './lib/preferences';
 import {Dashboard} from './pages/Dashboard';
@@ -21,6 +21,10 @@ export default function App() {
   const [selectedWallet, setSelectedWallet] = useState<string>();
 
   const navigate = (page: string) => setCurrentPage(page);
+  const handleRunSelected = useCallback((runId: string) => {
+    setActiveRunId((current) => (current === runId ? current : runId));
+    setSelectedWallet(undefined);
+  }, []);
 
   useEffect(() => {
     const syncPreferences = () => setPreferences(loadPreferences());
@@ -48,7 +52,7 @@ export default function App() {
         return (
           <Dashboard
             activeRunId={activeRunId}
-            onRunSelected={setActiveRunId}
+            onRunSelected={handleRunSelected}
             onNavigate={navigate}
             onWalletSelected={(wallet) => {
               setSelectedWallet(wallet);
@@ -70,7 +74,7 @@ export default function App() {
           <TaskRunning
             activeRunId={activeRunId}
             autoRefresh={preferences.autoRefresh}
-            onRunSelected={setActiveRunId}
+            onRunSelected={handleRunSelected}
             onNavigate={navigate}
           />
         );
@@ -79,7 +83,7 @@ export default function App() {
           <WalletList
             activeRunId={activeRunId}
             pageSize={preferences.tablePageSize}
-            onRunSelected={setActiveRunId}
+            onRunSelected={handleRunSelected}
             onWalletSelected={(wallet) => {
               setSelectedWallet(wallet);
               setCurrentPage('wallet_detail');
@@ -92,7 +96,7 @@ export default function App() {
         return (
           <Reports
             activeRunId={activeRunId}
-            onRunSelected={setActiveRunId}
+            onRunSelected={handleRunSelected}
             onNavigate={navigate}
             onWalletSelected={(wallet) => {
               setSelectedWallet(wallet);
@@ -116,7 +120,7 @@ export default function App() {
       case 'settings':
         return <SettingsPage onNavigate={navigate} />;
       default:
-        return <Dashboard activeRunId={activeRunId} onRunSelected={setActiveRunId} onNavigate={navigate} />;
+        return <Dashboard activeRunId={activeRunId} onRunSelected={handleRunSelected} onNavigate={navigate} />;
     }
   };
 

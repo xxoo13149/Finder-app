@@ -547,6 +547,11 @@ def history_record_path(root: Path, wallet: str) -> Path:
     return root / analysis.HISTORY_REGISTRY_DIRNAME / f"{normalized_wallet}.json"
 
 
+def disable_light_first_gate(config: dict[str, Any]) -> dict[str, Any]:
+    config.setdefault("analysis", {})["full_history_core_gate_enabled"] = False
+    return config
+
+
 def seed_history_record(
     root: Path,
     wallet: str,
@@ -766,6 +771,74 @@ class PipelineSmokeTests(unittest.TestCase):
 
         self.assertEqual(enriched[0]["_region"], "NYC")
         self.assertEqual(enriched[0]["_market_date"], "2026-04-25")
+
+    def test_weather_record_uses_record_level_weather_evidence_when_index_misses(self) -> None:
+        empty_index = analysis.WeatherIndex(set(), set(), set(), set(), {})
+
+        self.assertTrue(
+            analysis.is_weather_record(
+                {
+                    "title": "Highest temperature in Austin on May 8?",
+                    "slug": "highest-temperature-in-austin-on-may-8",
+                    "tags": [{"slug": "weather"}],
+                },
+                empty_index,
+            )
+        )
+        self.assertTrue(
+            analysis.is_weather_record(
+                {"eventSlug": "daily-temperature-in-chicago", "conditionId": "missing-cond"},
+                empty_index,
+            )
+        )
+        self.assertFalse(
+            analysis.is_weather_record(
+                {"title": "Bitcoin range by Friday", "tags": [{"slug": "recurring"}]},
+                empty_index,
+            )
+        )
+
+    def test_compute_metrics_counts_record_level_weather_evidence_without_index_match(self) -> None:
+        empty_index = analysis.WeatherIndex(set(), set(), set(), set(), {})
+        snapshot = {
+            "wallet": WALLET,
+            "activity": [],
+            "trades": [
+                {
+                    "title": "Daily temperature in Austin on May 8?",
+                    "slug": "daily-temperature-in-austin-on-may-8",
+                    "tags": [{"slug": "weather"}],
+                    "timestamp": BASE_TS,
+                    "side": "BUY",
+                    "size": "100",
+                    "price": "0.50",
+                    "usdcSize": "50",
+                },
+                {
+                    "title": "Bitcoin range by Friday",
+                    "slug": "bitcoin-range-by-friday",
+                    "timestamp": BASE_TS + 3600,
+                    "side": "BUY",
+                    "size": "100",
+                    "price": "0.50",
+                    "usdcSize": "50",
+                },
+            ],
+            "rewards": [],
+            "positions": [],
+            "closed_positions": [],
+        }
+
+        metrics = analysis.compute_metrics(
+            snapshot=snapshot,
+            leaderboard_entry={"pnl": "100", "vol": "100"},
+            weather_index=empty_index,
+            config=small_config(Path("cache")),
+        )
+
+        self.assertEqual(metrics["weather_trade_count"], 1)
+        self.assertAlmostEqual(metrics["weather_trade_ratio"], 0.5)
+        self.assertAlmostEqual(metrics["weather_notional_ratio"], 0.5)
 
     def test_compute_metrics_covers_weather_ratio_win_rate_cost_and_frequency(self) -> None:
         client = FakePolymarketClient({"use_cache": False})
@@ -1019,7 +1092,7 @@ class PipelineSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             output_dir = temp_path / "out"
-            config = small_config(temp_path / "cache")
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
 
             with ExitStack() as stack:
                 stack.enter_context(patch.object(analysis, "PolymarketClient", FakePolymarketClient))
@@ -1113,6 +1186,9 @@ class PipelineSmokeTests(unittest.TestCase):
                 16.0,
             )
             self.assertTrue(metrics["snapshot_complete"])
+            self.assertNotIn("records", metrics["snapshot_collection_status"]["activity"])
+            self.assertNotIn("records", metrics["snapshot_collection_status"]["trades"])
+            self.assertNotIn("records", wallet_result["operation_audit"]["collection_status"]["activity"])
             self.assertIn("finder_ai", wallet_result)
             self.assertTrue(wallet_result["finder_ai"]["runId"])
             self.assertEqual(wallet_result["finder_ai"]["normalizedAddress"], WALLET)
@@ -1120,7 +1196,7 @@ class PipelineSmokeTests(unittest.TestCase):
             self.assertEqual(wallet_result["finder_ai"]["providerMeta"]["provider"], "deepseek")
             self.assertEqual(
                 wallet_result["finder_ai"]["providerMeta"]["promptVersion"],
-                "finder-weather-brief-v3",
+                "finder-weather-brief-v6",
             )
             self.assertTrue(
                 str(wallet_result["finder_ai"]["providerMeta"]["inputHash"]).startswith("sha256:")
@@ -1215,12 +1291,73 @@ class PipelineSmokeTests(unittest.TestCase):
                 ],
             )
 
+    def test_run_pipeline_compacts_batch_memory_without_dropping_wallet_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
+            config["analysis"]["concurrent_wallets"] = 2
+            config["analysis"]["lightweight_batch_cleanup_enabled"] = True
+
+            cleanup_calls: list[dict[str, Any]] = []
+
+            original_cleanup = analysis.cleanup_completed_analysis_batch
+
+            def cleanup_spy(
+                cleanup_config: dict[str, Any],
+                batch_results: list[dict[str, Any]],
+            ) -> dict[str, Any]:
+                result = original_cleanup(cleanup_config, batch_results)
+                cleanup_calls.append(result)
+                return result
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(analysis, "PolymarketClient", FakePolymarketClient))
+                stack.enter_context(
+                    patch.object(
+                        analysis,
+                        "cleanup_completed_analysis_batch",
+                        side_effect=cleanup_spy,
+                    )
+                )
+                if not hasattr(analysis, "progress"):
+                    stack.enter_context(patch.object(analysis, "progress", lambda *_args, **_kwargs: None, create=True))
+                if not hasattr(analysis, "build_analysis_summary"):
+                    stack.enter_context(
+                        patch.object(
+                            analysis,
+                            "build_analysis_summary",
+                            fallback_analysis_summary,
+                            create=True,
+                        )
+                    )
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+            self.assertEqual(result["selected_wallet_count"], 1)
+            self.assertTrue(cleanup_calls)
+            self.assertEqual(cleanup_calls[-1]["status"], "completed")
+            self.assertGreater(cleanup_calls[-1]["released_result_count"], 0)
+
+            wallet_path = output_dir / "wallets" / f"{WALLET}.json"
+            wallet_result = json.loads(wallet_path.read_text(encoding="utf-8"))
+            self.assertEqual(wallet_result["wallet"], WALLET)
+            self.assertTrue(wallet_result["labels"])
+            self.assertTrue(wallet_result["label_evaluations"])
+            self.assertIn("Weather specialist", wallet_result["selection_record"]["labels"])
+            self.assertIn("High win rate", wallet_result["selection_record"]["labels"])
+            self.assertIn("finder_ai", wallet_result)
+            self.assertIn("structured_materials", wallet_result)
+            self.assertTrue(wallet_result["top_trades"])
+
+            summary = json.loads((output_dir / "analysis_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["wallets_selected"], 1)
+
     def test_run_pipeline_smoke_can_use_graphql_history_provider_without_rest_trades(self) -> None:
         GraphQLHistoryPipelineClient.instances.clear()
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             output_dir = temp_path / "out"
-            config = small_config(temp_path / "cache")
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
             config["wallet_filter"]["min_traded_count"] = 0
             config["history_provider"] = {
                 "enabled": True,
@@ -1262,6 +1399,7 @@ class PipelineSmokeTests(unittest.TestCase):
             wallet_result = json.loads(
                 (output_dir / "wallets" / f"{WALLET}.json").read_text(encoding="utf-8")
             )
+            self.assertTrue(any(label.get("system_core") for label in wallet_result["labels"]))
             metrics = wallet_result["metrics"]
             self.assertTrue(metrics["snapshot_complete"])
             self.assertEqual(metrics["trade_count"], 3)
@@ -1278,7 +1416,7 @@ class PipelineSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             output_dir = temp_path / "out"
-            config = small_config(temp_path / "cache")
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
             config["pagination"] = {"page_size": 1, "max_offset": 10}
 
             with ExitStack() as stack:
@@ -1337,7 +1475,7 @@ class PipelineSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             output_dir = temp_path / "out"
-            config = small_config(temp_path / "cache")
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
             config["pagination"] = {"page_size": 1, "max_offset": 10}
 
             with ExitStack() as stack:
@@ -1390,7 +1528,7 @@ class PipelineSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             output_dir = temp_path / "out"
-            config = small_config(temp_path / "cache")
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
             config["pagination"] = {"page_size": 1, "max_offset": 10}
 
             with ExitStack() as stack:
@@ -1536,7 +1674,7 @@ class PipelineSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             output_dir = temp_path / "out"
-            config = small_config(temp_path / "cache")
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
             captured: dict[str, Any] = {}
 
             def fake_generate(*, payload: dict[str, Any] | None, wallet_result: dict[str, Any]) -> dict[str, Any]:
@@ -1578,7 +1716,7 @@ class PipelineSmokeTests(unittest.TestCase):
 
             self.assertEqual(result["selected_wallet_count"], 1)
             self.assertEqual(captured["normalizedAddress"], WALLET)
-            self.assertEqual(captured["promptVersion"], "finder-weather-brief-v3")
+            self.assertEqual(captured["promptVersion"], "finder-weather-brief-v6")
             self.assertEqual(captured["statusBefore"], "ready")
             self.assertEqual(captured["primarySignalKey"], "high_frequency_region")
             self.assertTrue(str(captured["cacheKey"]).startswith(f"{WALLET}|sha256:"))
@@ -1588,6 +1726,7 @@ class PipelineSmokeTests(unittest.TestCase):
             )
             self.assertEqual(wallet_result["finder_ai"]["aiBriefShort"], "测试短摘要")
             self.assertEqual(wallet_result["finder_ai"]["aiBriefNote"], "这是一个用于测试的 AI 简报。")
+            self.assertTrue(any(label.get("system_core") for label in wallet_result["labels"]))
             self.assertEqual(
                 wallet_result["finder_ai"]["providerMeta"]["generatedAt"],
                 "2026-05-05T00:00:00+00:00",
@@ -1620,11 +1759,180 @@ class PipelineSmokeTests(unittest.TestCase):
                 "2026-05-05T00:00:00+00:00",
             )
 
+    def test_run_pipeline_does_not_generate_finder_ai_for_selected_wallet_without_system_core_label(self) -> None:
+        class NonCorePipelineClient(FakePolymarketClient):
+            def fetch_events_keyset_page(self, **kwargs: Any) -> dict[str, Any]:
+                self.calls.append(("events_keyset", kwargs))
+                return {"events": [], "next_cursor": None}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
+            config["wallet_filter"]["min_weather_trade_ratio"] = 0
+            config["leaderboard"]["auto_extend_to_target"] = False
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(analysis, "PolymarketClient", NonCorePipelineClient))
+                generate_mock = stack.enter_context(
+                    patch.object(
+                        analysis,
+                        "generate_finder_ai_brief",
+                        side_effect=AssertionError("DeepSeek should not be called"),
+                    )
+                )
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+            wallet_result = json.loads(
+                (output_dir / "wallets" / f"{WALLET}.json").read_text(encoding="utf-8")
+            )
+            selected_wallets = json.loads(
+                (output_dir / "selected_wallets.json").read_text(encoding="utf-8")
+            )
+            analysis_summary = json.loads(
+                (output_dir / "analysis_summary.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result["selected_wallet_count"], 1)
+        self.assertFalse(generate_mock.called)
+        self.assertTrue(wallet_result["screening"]["selected"])
+        self.assertFalse(any(label.get("system_core") for label in wallet_result["labels"]))
+        self.assertNotEqual(selected_wallets[0].get("ai_generation_status"), "generated")
+        self.assertEqual(analysis_summary["finder_ai_summary"]["selected_wallets"], 1)
+        self.assertEqual(analysis_summary["finder_ai_summary"]["generated"], 0)
+        self.assertEqual(analysis_summary["finder_ai_summary"]["skipped"], 1)
+
+    def test_run_pipeline_resume_skips_completed_wallets_and_keeps_existing_details(self) -> None:
+        completed_wallet = "0xaaa0000000000000000000000000000000000000"
+        next_wallet = "0xbbb0000000000000000000000000000000000000"
+
+        class ResumeImportClient(FakePolymarketClient):
+            instances: list["ResumeImportClient"] = []
+
+            def fetch_trades_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("trades", kwargs))
+                if kwargs["user"] == completed_wallet:
+                    raise AssertionError("completed wallet should not be fetched again")
+                return super().fetch_trades_page(**kwargs)
+
+            def fetch_activity_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("activity", kwargs))
+                if kwargs["user"] == completed_wallet:
+                    raise AssertionError("completed wallet should not be fetched again")
+                return [{"type": "REWARD", "usdcSize": "12.34"}]
+
+            def fetch_positions_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("positions", kwargs))
+                if kwargs["user"] == completed_wallet:
+                    raise AssertionError("completed wallet should not be fetched again")
+                return []
+
+            def fetch_closed_positions_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("closed_positions", kwargs))
+                if kwargs["user"] == completed_wallet:
+                    raise AssertionError("completed wallet should not be fetched again")
+                return super().fetch_closed_positions_page(**kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            (wallets_dir / f"{completed_wallet}.json").write_text(
+                json.dumps(
+                    {
+                        "wallet": completed_wallet,
+                        "leaderboard_entry": {
+                            "rank": 1,
+                            "proxyWallet": completed_wallet,
+                            "userName": "already-done",
+                            "pnl": 200,
+                            "vol": 2000,
+                        },
+                        "screening": {"wallet": completed_wallet, "selected": True},
+                        "selection_record": {
+                            "wallet": completed_wallet,
+                            "selected": True,
+                            "labels": ["Existing"],
+                        },
+                        "labels": [{"display_name": "Existing"}],
+                        "label_evaluations": [{"key": "high_frequency_region", "matched": True}],
+                        "metrics": {
+                            "leaderboard_pnl": 200,
+                            "leaderboard_volume": 2000,
+                            "weather_notional_ratio": 0.8,
+                            "closed_position_win_rate": 0.7,
+                            "closed_profit_multiple": 2.0,
+                            "trades_per_active_day": 4,
+                            "trade_count": 4,
+                        },
+                        "finder_ai": {
+                            "briefGeneration": {"status": "cached"},
+                            "providerMeta": {"generatedAt": "2026-05-05T00:00:00+00:00"},
+                            "matched": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            import_rows_path = output_dir / "smart_wallet_import_rows.json"
+            import_rows_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "wallet": {"normalizedAddress": completed_wallet},
+                            "userName": "already-done",
+                            "metrics": {"pnl": 200, "volume": 2000},
+                        },
+                        {
+                            "wallet": {"normalizedAddress": next_wallet},
+                            "userName": "resume-next",
+                            "metrics": {"pnl": 180, "volume": 1800},
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (output_dir / "weather_events.json").write_text("[]", encoding="utf-8")
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
+            config["runtime"] = {
+                "resume_existing_output": True,
+                "smart_wallet_library_source_path": str(import_rows_path),
+                "smart_wallet_library_process_all": True,
+            }
+            config["wallet_filter"]["target_count"] = 2
+            config["wallet_filter"]["min_pnl"] = 0
+            config["wallet_filter"]["min_volume"] = 0
+            config["wallet_filter"]["min_traded_count"] = 0
+            config["wallet_filter"]["min_weather_trade_ratio"] = 0
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(analysis, "PolymarketClient", ResumeImportClient))
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+            selected_wallets = json.loads(
+                (output_dir / "selected_wallets.json").read_text(encoding="utf-8")
+            )
+            calls_by_wallet = [
+                kwargs["user"]
+                for name, kwargs in ResumeImportClient.instances[0].calls
+                if name in {"trades", "activity", "positions", "closed_positions"}
+            ]
+            completed_wallet_detail_exists = (output_dir / "wallets" / f"{completed_wallet}.json").exists()
+            next_wallet_detail_exists = (output_dir / "wallets" / f"{next_wallet}.json").exists()
+
+        self.assertEqual(result["selected_wallet_count"], 2)
+        self.assertEqual([row["wallet"] for row in selected_wallets], [completed_wallet, next_wallet])
+        self.assertNotIn(completed_wallet, calls_by_wallet)
+        self.assertIn(next_wallet, calls_by_wallet)
+        self.assertTrue(completed_wallet_detail_exists)
+        self.assertTrue(next_wallet_detail_exists)
+
     def test_run_pipeline_prefilters_wallets_seen_in_history_registry_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             output_dir = temp_path / "out"
-            config = small_config(temp_path / "cache")
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
             config["leaderboard"]["auto_extend_to_target"] = False
             seed_history_record(temp_path, WALLET)
 
@@ -1671,7 +1979,7 @@ class PipelineSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             output_dir = temp_path / "out"
-            config = small_config(temp_path / "cache")
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
             config["wallet_filter"]["include_wallets"] = [WALLET.removeprefix("0x")]
             seed_history_record(temp_path, WALLET, run_count=3, last_status="screened_out")
 
@@ -1842,7 +2150,7 @@ class PipelineSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             output_dir = temp_path / "out"
-            config = small_config(temp_path / "cache")
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
 
             with ExitStack() as stack:
                 stack.enter_context(

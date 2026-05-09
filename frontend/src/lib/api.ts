@@ -17,6 +17,16 @@ export type RunRecord = {
   progress?: Array<{time: string; message: string}>;
   phase?: string;
   percent?: number;
+  selected_wallet_count?: number;
+  wallet_detail_count?: number;
+  active_diagnostics?: {
+    progress_counts?: Record<string, number>;
+    wallets?: Record<string, number>;
+    weather_events?: Record<string, number>;
+    relay_source?: Record<string, unknown>;
+  };
+  resumable?: boolean;
+  summary?: AnalysisSummary;
   files?: ArtifactFile[];
 };
 
@@ -35,6 +45,7 @@ export type AnalysisSummary = {
   wallets_selected?: number;
   wallets_core_labeled?: number;
   finder_ai_summary?: FinderAiRunSummary;
+  diagnostics?: RunDiagnostics;
   errors?: number;
   label_counts?: Record<string, number>;
   averages?: Record<string, number>;
@@ -54,6 +65,43 @@ export type FinderAiRunSummary = {
   needs_review?: number;
   has_conflict?: number;
   latest_generated_at?: string;
+  status_counts?: Record<string, number>;
+  reason_counts?: Record<string, number>;
+};
+
+export type RunDiagnostics = {
+  weather_events?: {
+    indexed?: number | null;
+    max?: number | null;
+    tag_id?: string | number | null;
+    tag_slug?: string;
+    fetch_mode?: string;
+    reused_existing?: boolean;
+    cap_hit?: boolean;
+    stop_reason?: string;
+    fetch_stop_reason?: string;
+    page_count?: number | null;
+    last_page_size?: number | null;
+    terminal_next_cursor_present?: boolean | null;
+    natural_end?: boolean;
+    shortfall_hint?: string;
+    coverage_note?: string;
+    trading_fallback_enabled?: boolean;
+  };
+  core_labels?: {
+    wallets?: number;
+    by_key?: Record<string, number>;
+  };
+  hydration?: {
+    completed?: number;
+    skipped?: number;
+    failed?: number;
+    unknown?: number;
+    status_counts?: Record<string, number>;
+    reason_counts?: Record<string, number>;
+    history_scopes?: Record<string, number>;
+  };
+  finder_ai?: FinderAiRunSummary;
 };
 
 export type WalletRankSummary = {
@@ -102,8 +150,12 @@ export type WalletRow = {
   best_region_positive_return_day_ratio?: number;
   low_chip_cost_trade_ratio?: number;
   labels?: string[];
+  has_core_label?: boolean;
+  core_label_keys?: string[];
   selected?: boolean;
   reasons?: string[];
+  detail_available?: boolean;
+  source?: string;
 };
 
 export type LabelSummary = {
@@ -322,9 +374,19 @@ export type MarketRecord = {
   [key: string]: unknown;
 };
 
-export type AnalysisMode = 'standard' | 'weekly_high_profit' | 'smart_wallet_library_refresh';
+export type AnalysisMode = 'standard' | 'weekly_high_profit' | 'smart_wallet_library_refresh' | 'relay_analysis';
 
 export type ActivityFilterMode = 'all' | 'normal_active' | 'inactive';
+
+export type DeepSeekRelayFilter = 'all' | 'completed' | 'incomplete';
+
+export type RelayCoreLabelFilter = 'all' | 'core' | 'non_core';
+
+export type RelayImportInput = {
+  sourceRunId: string;
+  coreLabelFilter?: RelayCoreLabelFilter;
+  deepSeekFilter?: DeepSeekRelayFilter;
+};
 
 export type CreateRunInput = {
   analysis_mode?: AnalysisMode;
@@ -347,8 +409,36 @@ export type CreateRunInput = {
   enable_chain_validation?: boolean;
   verbose?: boolean;
   chain_api_key_env?: string;
+  wallet_import_payload?: unknown;
+  wallet_import_file_name?: string;
   smart_wallet_import_payload?: unknown;
   smart_wallet_import_file_name?: string;
+  relay_import?: RelayImportInput;
+};
+
+export type RelayImportBuildResult = {
+  payload: unknown;
+  file_name: string;
+  summary: {
+    wallet_count?: number;
+    source_run_id?: string;
+    source_pool?: string;
+    source_total?: number;
+    matched_count?: number;
+    deepseek_completed_count?: number;
+    deepseek_incomplete_count?: number;
+    core_labeled_count?: number;
+    non_core_count?: number;
+    core_label_filter?: RelayCoreLabelFilter;
+    deepseek_filter?: DeepSeekRelayFilter;
+    [key: string]: unknown;
+  };
+  source_total: number;
+  matched_count: number;
+  completed_count: number;
+  incomplete_count: number;
+  core_labeled_count: number;
+  non_core_count: number;
 };
 
 export type Paginated<T> = {
@@ -623,6 +713,30 @@ export async function getWallets(
   return apiJson<Paginated<WalletRow>>(`/api/runs/${encodeURIComponent(runId)}/wallets${suffix}`);
 }
 
+export async function getAllWallets(runId: string, pageSize = 500): Promise<WalletRow[]> {
+  const rows: WalletRow[] = [];
+  let offset = 0;
+  for (;;) {
+    const page = await getWallets(runId, {offset, limit: pageSize});
+    rows.push(...(page.items || []));
+    offset += page.limit || pageSize;
+    if (rows.length >= page.total || !page.items?.length) {
+      break;
+    }
+  }
+  return rows;
+}
+
+export async function buildRelayImportPayload(input: RelayImportInput): Promise<RelayImportBuildResult> {
+  return apiJson<RelayImportBuildResult>(`/api/runs/${encodeURIComponent(input.sourceRunId)}/relay-import`, {
+    method: 'POST',
+    body: JSON.stringify({
+      core_label_filter: input.coreLabelFilter || 'all',
+      deepseek_filter: input.deepSeekFilter || 'all',
+    }),
+  });
+}
+
 export async function getWalletDetail(runId: string, wallet: string): Promise<WalletDetail> {
   return apiJson<WalletDetail>(
     `/api/runs/${encodeURIComponent(runId)}/wallets/${encodeURIComponent(wallet.toLowerCase())}`,
@@ -678,6 +792,13 @@ export async function startRun(input: CreateRunInput): Promise<RunRecord> {
       verbose: input.verbose,
       chain_api_key_env: input.chain_api_key_env,
     },
+    wallet_import:
+      input.wallet_import_payload != null
+        ? {
+            file_name: input.wallet_import_file_name,
+            payload: input.wallet_import_payload,
+          }
+        : undefined,
     smart_wallet_import:
       input.smart_wallet_import_payload != null
         ? {
@@ -685,10 +806,24 @@ export async function startRun(input: CreateRunInput): Promise<RunRecord> {
             payload: input.smart_wallet_import_payload,
           }
         : undefined,
+    relay_import: input.relay_import
+      ? {
+          source_run_id: input.relay_import.sourceRunId,
+          core_label_filter: input.relay_import.coreLabelFilter || 'all',
+          deepseek_filter: input.relay_import.deepSeekFilter || 'all',
+        }
+      : undefined,
   };
   return apiJson<RunRecord>('/api/runs', {
     method: 'POST',
     body: JSON.stringify(body),
+  });
+}
+
+export async function resumeRun(runId: string): Promise<RunRecord> {
+  return apiJson<RunRecord>(`/api/runs/${encodeURIComponent(runId)}/resume`, {
+    method: 'POST',
+    body: JSON.stringify({}),
   });
 }
 
@@ -856,8 +991,37 @@ export function statusLabel(status?: string): string {
 }
 
 export function latestCompletedRun(runs: RunRecord[]): RunRecord | undefined {
-  const readableRuns = runs.filter((run) => !isDiagnosticRun(run.run_id));
-  return readableRuns.find((run) => run.status === 'succeeded') || readableRuns[0] || runs.find((run) => run.status === 'succeeded') || runs[0];
+  const readableRuns = sortRunsForDisplay(runs).filter((run) => !isDiagnosticRun(run.run_id));
+  return readableRuns.find(hasReadableRunResult) || runs.find(hasReadableRunResult) || readableRuns[0] || runs[0];
+}
+
+export function resolveSelectedRunId(runs: RunRecord[], activeRunId?: string): string | undefined {
+  if (activeRunId) {
+    const activeRun = runs.find((run) => run.run_id === activeRunId);
+    if (activeRun && hasReadableRunResult(activeRun)) return activeRunId;
+  }
+  return latestCompletedRun(runs)?.run_id;
+}
+
+export function sortRunsForDisplay(runs: RunRecord[]): RunRecord[] {
+  return [...runs].sort((left, right) => {
+    const rightStamp = runSortTimestamp(right);
+    const leftStamp = runSortTimestamp(left);
+    if (rightStamp !== leftStamp) return rightStamp - leftStamp;
+    const rightRank = runSortRank(right);
+    const leftRank = runSortRank(left);
+    if (rightRank !== leftRank) return rightRank - leftRank;
+    return right.run_id.localeCompare(left.run_id);
+  });
+}
+
+export function hasReadableRunResult(run?: RunRecord): boolean {
+  if (!run) return false;
+  const status = run.status || 'artifact';
+  if (status === 'queued' || status === 'running') return true;
+  if (status === 'failed') return false;
+  if (run.resumable || status === 'succeeded' || status === 'partial') return true;
+  return Number(run.selected_wallet_count || 0) > 0 || Number(run.wallet_detail_count || 0) > 0;
 }
 
 export function isDiagnosticRun(runId?: string): boolean {
@@ -890,6 +1054,20 @@ export function shortAddress(value?: string): string {
   if (!value) return '-';
   if (value.length <= 12) return value;
   return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
+export function shortRunId(value?: string): string {
+  const text = String(value || '').trim();
+  if (!text) return '-';
+  return text.length <= 10 ? text : text.slice(-8);
+}
+
+export function runPickerLabel(
+  run: Pick<RunRecord, 'run_id' | 'created_at' | 'finished_at' | 'status'>,
+  duplicate = false,
+): string {
+  const base = runDisplayName(run);
+  return duplicate ? `${base} · ${shortRunId(run.run_id)}` : base;
 }
 
 export function formatCurrency(value?: number): string {
@@ -941,7 +1119,31 @@ export function formatShortDateTime(value?: string | null): string {
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
+    second: '2-digit',
   });
+}
+
+function runSortTimestamp(run: Pick<RunRecord, 'created_at' | 'finished_at'>): number {
+  return toSortTimestamp(run.finished_at) || toSortTimestamp(run.created_at) || 0;
+}
+
+function runSortRank(run: Pick<RunRecord, 'status'>): number {
+  const status = String(run.status || 'artifact');
+  const ranks: Record<string, number> = {
+    running: 5,
+    queued: 4,
+    partial: 3,
+    succeeded: 2,
+    artifact: 1,
+    failed: 0,
+  };
+  return ranks[status] ?? 1;
+}
+
+function toSortTimestamp(value?: string | null): number {
+  if (!value) return 0;
+  const parsed = new Date(value).getTime();
+  return Number.isNaN(parsed) ? 0 : parsed;
 }
 
 export function finderAiGenerationReasonLabel(

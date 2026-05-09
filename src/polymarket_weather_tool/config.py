@@ -9,6 +9,7 @@ DEFAULT_CONFIG_PATH = Path("configs/default_config.json")
 DEFAULT_ANALYSIS_MODE = "standard"
 WEEKLY_HIGH_PROFIT_MODE = "weekly_high_profit"
 SMART_WALLET_LIBRARY_REFRESH_MODE = "smart_wallet_library_refresh"
+RELAY_ANALYSIS_MODE = "relay_analysis"
 CONFIG_SECTION_KEYS = (
     "api",
     "leaderboard",
@@ -55,6 +56,14 @@ BUILTIN_ANALYSIS_MODE_PRESETS: dict[str, dict[str, Any]] = {
             "activity_filter_mode": "all",
         },
     },
+    RELAY_ANALYSIS_MODE: {
+        "runtime": {
+            "analysis_mode_label": "历史结果接力分析",
+        },
+        "wallet_filter": {
+            "activity_filter_mode": "all",
+        },
+    },
 }
 
 
@@ -75,6 +84,8 @@ def normalize_analysis_mode(value: Any) -> str:
         return WEEKLY_HIGH_PROFIT_MODE
     if normalized == SMART_WALLET_LIBRARY_REFRESH_MODE:
         return SMART_WALLET_LIBRARY_REFRESH_MODE
+    if normalized == RELAY_ANALYSIS_MODE:
+        return RELAY_ANALYSIS_MODE
     return DEFAULT_ANALYSIS_MODE
 
 
