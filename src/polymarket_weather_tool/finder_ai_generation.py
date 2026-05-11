@@ -578,10 +578,31 @@ def cache_path_for_key(cache_key: str) -> Path | None:
 
 def build_prompt_profile_snapshot(wallet_result: Mapping[str, Any]) -> dict[str, Any]:
     profile = safe_mapping(wallet_result.get("profile"))
+    metrics = safe_mapping(wallet_result.get("metrics"))
     average_buy_price = safe_mapping(profile.get("average_buy_price"))
     city_distribution = safe_mapping(profile.get("city_distribution"))
     closed_position_pnl = safe_mapping(profile.get("closed_position_pnl"))
     top_cities = safe_mapping(profile.get("top_cities"))
+    falcon_win_rate = first_non_empty(
+        profile.get("falcon_win_rate"),
+        metrics.get("falcon_win_rate"),
+        metrics.get("display_win_rate"),
+    )
+    falcon_win_rate_window_label = first_non_empty(
+        profile.get("falcon_win_rate_window_label"),
+        metrics.get("falcon_win_rate_window_label"),
+        metrics.get("display_win_rate_window_label"),
+    )
+    falcon_total_pnl = first_non_empty(
+        profile.get("falcon_total_pnl"),
+        metrics.get("falcon_total_pnl"),
+        metrics.get("display_pnl"),
+    )
+    falcon_total_roi = first_non_empty(
+        profile.get("falcon_total_roi"),
+        metrics.get("falcon_total_roi"),
+        metrics.get("display_roi"),
+    )
 
     snapshot = compact_mapping(
         {
@@ -593,6 +614,10 @@ def build_prompt_profile_snapshot(wallet_result: Mapping[str, Any]) -> dict[str,
             "closed_win_rate": closed_position_pnl.get("win_rate"),
             "closed_profit_multiple": closed_position_pnl.get("profit_multiple"),
             "total_realized_pnl": closed_position_pnl.get("total_realized_pnl"),
+            "falcon_win_rate": falcon_win_rate,
+            "falcon_win_rate_window_label": falcon_win_rate_window_label,
+            "falcon_total_pnl": falcon_total_pnl,
+            "falcon_total_roi": falcon_total_roi,
         },
         (
             "weighted_average_buy_price",
@@ -600,9 +625,12 @@ def build_prompt_profile_snapshot(wallet_result: Mapping[str, Any]) -> dict[str,
             "city_count",
             "known_city_trade_count",
             "unknown_city_trade_count",
-            "closed_win_rate",
             "closed_profit_multiple",
             "total_realized_pnl",
+            "falcon_win_rate",
+            "falcon_win_rate_window_label",
+            "falcon_total_pnl",
+            "falcon_total_roi",
         ),
     )
     top_realized = build_prompt_city_leaders(

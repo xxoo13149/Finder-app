@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable, Mapping
 
 
@@ -44,6 +45,10 @@ def history_provider_settings(config: Mapping[str, Any]) -> dict[str, Any]:
             1,
             int(settings.get("max_pages_per_stream", DEFAULT_HISTORY_PROVIDER_MAX_PAGES)),
         ),
+        "operation_stream_concurrency": max(
+            1,
+            int(settings.get("operation_stream_concurrency", 4)),
+        ),
         "token_lookup_chunk_size": max(
             1,
             int(
@@ -53,6 +58,7 @@ def history_provider_settings(config: Mapping[str, Any]) -> dict[str, Any]:
                 )
             ),
         ),
+        "token_lookup_cache_enabled": bool(settings.get("token_lookup_cache_enabled", False)),
         "asset_decimals": max(
             0,
             int(settings.get("asset_decimals", DEFAULT_HISTORY_PROVIDER_ASSET_DECIMALS)),
@@ -140,7 +146,7 @@ def build_full_history_bundle(
     graph_order_fill_asset_id: Callable[..., str],
     convert_order_fills_to_trade_records: Callable[..., list[dict[str, Any]]],
 ) -> dict[str, Any]:
-    if need_trade_history:
+    def fetch_trade_history() -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], bool]:
         order_fills_page = fetch_order_fills(
             wallet=wallet,
             settings=settings,
@@ -165,19 +171,36 @@ def build_full_history_bundle(
         trades_complete = bool(order_fills_page.get("complete", False)) and bool(
             token_lookup_page.get("complete", False)
         )
+        return order_fills_page, token_lookup_page, trade_records, trades_complete
+
+    def fetch_operations() -> tuple[dict[str, Any], bool]:
+        operation_page = fetch_activity_operations(
+            wallet=wallet,
+            settings=settings,
+        )
+        return operation_page, bool(operation_page.get("complete", False))
+
+    operation_future: Future[tuple[dict[str, Any], bool]] | None = None
+    if need_trade_history and need_operations:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            operation_future = executor.submit(fetch_operations)
+            order_fills_page, token_lookup_page, trade_records, trades_complete = fetch_trade_history()
+            operation_page, operations_complete = operation_future.result()
+    elif need_trade_history:
+        order_fills_page, token_lookup_page, trade_records, trades_complete = fetch_trade_history()
+        operation_page = skipped_provider_collection_page("activity_operations")
+        operations_complete = True
+    elif need_operations:
+        order_fills_page = skipped_provider_collection_page("order_fills")
+        token_lookup_page = skipped_provider_collection_page("token_conditions")
+        trade_records = []
+        trades_complete = True
+        operation_page, operations_complete = fetch_operations()
     else:
         order_fills_page = skipped_provider_collection_page("order_fills")
         token_lookup_page = skipped_provider_collection_page("token_conditions")
         trade_records = []
         trades_complete = True
-
-    if need_operations:
-        operation_page = fetch_activity_operations(
-            wallet=wallet,
-            settings=settings,
-        )
-        operations_complete = bool(operation_page.get("complete", False))
-    else:
         operation_page = skipped_provider_collection_page("activity_operations")
         operations_complete = True
 

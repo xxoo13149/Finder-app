@@ -262,7 +262,8 @@ function Stop-ProjectPortListeners {
     foreach ($processId in Get-PortProcessIds -Port $port) {
       if ($processId -and $processId -ne $PID) {
         $commandLine = Get-ProcessCommandLine -ProcessId $processId
-        if ($commandLine -like "*$projectRoot*" -or $commandLine -like '*polymarket_weather_tool.server*') {
+        $managedApiOnPort = $port -eq $apiPort -and (Test-ManagedApi)
+        if ($managedApiOnPort -or $commandLine -like "*$projectRoot*" -or $commandLine -like '*polymarket_weather_tool.server*') {
           Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
         }
         elseif ($IgnoreForeign) {

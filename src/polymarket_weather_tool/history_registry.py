@@ -3,6 +3,7 @@
 import json
 import os
 from dataclasses import dataclass, field
+from http.client import IncompleteRead
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -35,6 +36,12 @@ REGISTRY_RECORD_FIELDS = (
     "run_count",
 )
 REGISTRY_LOCK = Lock()
+CLOUDFLARE_TRANSIENT_ERRORS = (CloudflareD1RequestError, TimeoutError, IncompleteRead, OSError)
+INCOMPLETE_HISTORY_STATUSES = {
+    "selected_pending",
+    "selected_pending_hydration",
+    "hydration_pending",
+}
 
 
 def wallet_history_registry_dir(artifacts_root: Path) -> Path:
@@ -68,6 +75,13 @@ def read_wallet_history_record(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def wallet_history_record_is_complete(record: Mapping[str, Any] | None) -> bool:
+    if not isinstance(record, Mapping) or not record:
+        return False
+    status = str(record.get("last_status") or "").strip().lower()
+    return status not in INCOMPLETE_HISTORY_STATUSES
 
 
 def resolve_history_registry_settings(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -142,8 +156,8 @@ def resolve_history_registry_settings(config: Mapping[str, Any] | None = None) -
             True,
         ),
         "replicate_to_cloudflare": coerce_bool(
-            section.get("replicate_to_cloudflare", True),
-            True,
+            section.get("replicate_to_cloudflare", False),
+            False,
         ),
     }
 
@@ -179,7 +193,7 @@ class HistoryRegistry:
             "backend": str(self.settings["backend"]),
             "primary_backend": primary_backend,
             "cloudflare_configured": bool(self._is_cloudflare_configured()),
-            "replicate_to_cloudflare": bool(self.settings.get("replicate_to_cloudflare", True)),
+            "replicate_to_cloudflare": bool(self.settings.get("replicate_to_cloudflare", False)),
             "read_fallback_enabled": bool(self.settings.get("read_fallback_enabled", True)),
             "read_cloud_fallback_enabled": bool(
                 self.settings.get("read_cloud_fallback_enabled", True)
@@ -202,17 +216,27 @@ class HistoryRegistry:
         if self._should_use_cloudflare():
             try:
                 self._prime_cloudflare_cache()
-                return normalized_wallet in self._records_by_wallet
-            except CloudflareD1RequestError:
+                return wallet_history_record_is_complete(
+                    self._records_by_wallet.get(normalized_wallet)
+                )
+            except CLOUDFLARE_TRANSIENT_ERRORS:
                 if not self._should_fallback_local():
                     raise
         record_path = self.record_path(normalized_wallet)
         if record_path and record_path.exists():
-            return True
+            return wallet_history_record_is_complete(
+                normalize_wallet_history_record(
+                    read_wallet_history_record(record_path),
+                    wallet_fallback=normalized_wallet,
+                )
+            )
         if self._should_read_cloudflare_fallback():
             try:
-                return bool(self._load_cloudflare_record(normalized_wallet))
-            except CloudflareD1RequestError:
+                self._prime_cloudflare_cache()
+                return wallet_history_record_is_complete(
+                    self._records_by_wallet.get(normalized_wallet)
+                )
+            except CLOUDFLARE_TRANSIENT_ERRORS:
                 return False
         return False
 
@@ -410,7 +434,7 @@ class HistoryRegistry:
         return bool(
             self.settings["enabled"]
             and self.settings.get("backend") != "cloudflare"
-            and self.settings.get("replicate_to_cloudflare", True)
+            and self.settings.get("replicate_to_cloudflare", False)
             and self._is_cloudflare_configured()
         )
 
@@ -463,7 +487,7 @@ class HistoryRegistry:
         if self._should_use_cloudflare() or self._should_read_cloudflare_fallback():
             try:
                 record = self._load_cloudflare_record(wallet)
-            except CloudflareD1RequestError:
+            except CLOUDFLARE_TRANSIENT_ERRORS:
                 if not self._should_fallback_local():
                     raise
             else:

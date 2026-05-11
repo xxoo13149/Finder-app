@@ -36,7 +36,14 @@ class ConfigOverrideTests(unittest.TestCase):
         self.assertEqual(config["analysis"]["regional_win_rate_min_trade_count"], 3)
         self.assertTrue(config["analysis"]["lightweight_batch_cleanup_enabled"])
         self.assertTrue(config["analysis"]["gc_after_wallet_batch"])
-        self.assertTrue(config["history_ledger"]["compact_gap_payloads_after_batch"])
+        self.assertEqual(config["analysis"]["finder_ai_concurrency"], 2)
+        self.assertEqual(config["analysis"]["falcon_metrics_concurrency"], 2)
+        self.assertEqual(config["analysis"]["wallet_screening_lookahead_multiplier"], 3)
+        self.assertFalse(config["history_registry"]["replicate_to_cloudflare"])
+        self.assertFalse(config["history_ledger"]["replicate_to_cloudflare"])
+        self.assertFalse(config["history_ledger"]["compact_gap_payloads_after_batch"])
+        self.assertTrue(config["history_ledger"]["compact_gap_payloads_after_run"])
+        self.assertFalse(config["history_ledger"]["persist_screening_snapshots"])
         self.assertEqual(
             label_keys,
             [

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import unittest
 from pathlib import Path
 from typing import Any
@@ -279,6 +280,259 @@ class AuditUpgradeScaffoldTests(unittest.TestCase):
         self.assertEqual([record["type"] for record in snapshot["rewards"]], ["REWARD", "YIELD"])
         self.assertEqual([name for name, _kwargs in client.calls], ["activity", "positions", "closed_positions"])
         self.assertNotIn("size_threshold", client.calls[1][1])
+
+    def test_fetch_wallet_snapshot_continues_full_activity_from_prefetched_page(self) -> None:
+        class PrefetchedActivityContinuationClient(SnapshotFixtureClient):
+            def fetch_activity_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("activity", kwargs))
+                limit = int(kwargs["limit"])
+                offset = int(kwargs["offset"])
+                if offset == 2:
+                    return [
+                        {
+                            "type": "TRADE",
+                            "timestamp": 100,
+                            "transactionHash": "0xt2",
+                            "conditionId": "cond-older",
+                            "eventSlug": "rain-in-nyc",
+                            "slug": "rain-in-nyc-no",
+                            "asset": "asset-older",
+                            "side": "SELL",
+                            "size": "7",
+                            "price": "0.55",
+                            "usdcSize": "3.85",
+                            "title": "NYC rain older",
+                        }
+                    ][:limit]
+                raise AssertionError(f"unexpected offset {offset}")
+
+        client = PrefetchedActivityContinuationClient()
+        config = audit_scaffold_config()
+        config["pagination"] = {"page_size": 2, "max_offset": 10}
+
+        snapshot = fetch_wallet_snapshot(
+            client,  # type: ignore[arg-type]
+            WALLET,
+            config,
+            prefetched_activity_page={
+                "records": [
+                    {
+                        "type": "TRADE",
+                        "timestamp": 300,
+                        "transactionHash": "0xt1",
+                        "conditionId": "cond-recent",
+                        "eventSlug": "rain-in-nyc",
+                        "slug": "rain-in-nyc-yes",
+                        "asset": "asset-recent",
+                        "side": "BUY",
+                        "size": "10",
+                        "price": "0.40",
+                        "usdcSize": "4",
+                        "title": "NYC rain recent",
+                    },
+                    {
+                        "type": "REWARD",
+                        "timestamp": 200,
+                        "transactionHash": "0xr1",
+                        "conditionId": "cond-reward",
+                        "eventSlug": "reward-event",
+                        "slug": "reward-event",
+                        "usdcSize": "1.25",
+                        "title": "Reward",
+                    },
+                ],
+                "page_count": 1,
+                "next_offset": 2,
+            },
+        )
+
+        self.assertSnapshotCoreShape(snapshot)
+        self.assertEqual(
+            [kwargs["offset"] for name, kwargs in client.calls if name == "activity"],
+            [2],
+        )
+        self.assertEqual(len(snapshot["activity"]), 3)
+        self.assertEqual(
+            [record["transactionHash"] for record in snapshot["trades"]],
+            ["0xt1", "0xt2"],
+        )
+        self.assertEqual([record["type"] for record in snapshot["rewards"]], ["REWARD"])
+        self.assertEqual(snapshot["collection_status"]["activity"]["page_count"], 2)
+        self.assertEqual(snapshot["collection_status"]["activity"]["record_count"], 3)
+        self.assertEqual(snapshot["collection_status"]["activity"]["collection_mode"], "aggregate")
+
+    def test_fetch_wallet_snapshot_continues_full_trades_from_prefetched_page(self) -> None:
+        class PrefetchedTradesContinuationClient(SnapshotFixtureClient):
+            def fetch_activity_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("activity", kwargs))
+                limit = int(kwargs["limit"])
+                offset = int(kwargs["offset"])
+                records = [
+                    {"type": "REWARD", "usdcSize": "1.25"},
+                    {"type": "YIELD", "usdcSize": "0.75"},
+                ]
+                return records[offset : offset + limit]
+
+            def fetch_trades_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("trades", kwargs))
+                limit = int(kwargs["limit"])
+                offset = int(kwargs["offset"])
+                if offset == 2:
+                    return [
+                        {
+                            "timestamp": 100,
+                            "transactionHash": "0xt3",
+                            "conditionId": "cond-older",
+                            "eventSlug": "rain-in-nyc",
+                            "slug": "rain-in-nyc-no",
+                            "asset": "asset-older",
+                            "side": "SELL",
+                            "size": "7",
+                            "price": "0.55",
+                            "usdcSize": "3.85",
+                            "title": "NYC rain older",
+                        }
+                    ][:limit]
+                raise AssertionError(f"unexpected offset {offset}")
+
+        client = PrefetchedTradesContinuationClient()
+        config = audit_scaffold_config()
+        config["pagination"] = {"page_size": 2, "max_offset": 10}
+
+        snapshot = fetch_wallet_snapshot(
+            client,  # type: ignore[arg-type]
+            WALLET,
+            config,
+            prefetched_trades_page={
+                "records": [
+                    {
+                        "timestamp": 300,
+                        "transactionHash": "0xt1",
+                        "conditionId": "cond-recent",
+                        "eventSlug": "rain-in-nyc",
+                        "slug": "rain-in-nyc-yes",
+                        "asset": "asset-recent",
+                        "side": "BUY",
+                        "size": "10",
+                        "price": "0.40",
+                        "usdcSize": "4",
+                        "title": "NYC rain recent",
+                    },
+                    {
+                        "timestamp": 200,
+                        "transactionHash": "0xt2",
+                        "conditionId": "cond-mid",
+                        "eventSlug": "rain-in-nyc",
+                        "slug": "rain-in-nyc-flat",
+                        "asset": "asset-mid",
+                        "side": "BUY",
+                        "size": "8",
+                        "price": "0.45",
+                        "usdcSize": "3.6",
+                        "title": "NYC rain mid",
+                    },
+                ],
+                "page_count": 1,
+                "next_offset": 2,
+            },
+        )
+
+        self.assertSnapshotCoreShape(snapshot)
+        self.assertEqual(
+            [kwargs["offset"] for name, kwargs in client.calls if name == "trades"],
+            [2],
+        )
+        self.assertEqual(
+            [record["transactionHash"] for record in snapshot["trades"]],
+            ["0xt1", "0xt2", "0xt3"],
+        )
+        self.assertEqual(snapshot["collection_status"]["trades"]["page_count"], 2)
+        self.assertEqual(snapshot["collection_status"]["trades"]["record_count"], 3)
+        self.assertEqual(snapshot["collection_status"]["trades"]["collection_mode"], "aggregate")
+        self.assertEqual([record["type"] for record in snapshot["rewards"]], ["REWARD", "YIELD"])
+
+    def test_fetch_wallet_snapshot_fetches_auxiliary_pages_concurrently(self) -> None:
+        barrier = threading.Barrier(2)
+
+        class ConcurrentAuxiliaryPagesClient(SnapshotFixtureClient):
+            def fetch_positions_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                barrier.wait(timeout=1)
+                return super().fetch_positions_page(**kwargs)
+
+            def fetch_closed_positions_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                barrier.wait(timeout=1)
+                return super().fetch_closed_positions_page(**kwargs)
+
+        client = ConcurrentAuxiliaryPagesClient()
+
+        snapshot = fetch_wallet_snapshot(
+            client,  # type: ignore[arg-type]
+            WALLET,
+            audit_scaffold_config(),
+        )
+
+        self.assertSnapshotCoreShape(snapshot)
+        call_names = [name for name, _kwargs in client.calls]
+        self.assertIn("positions", call_names)
+        self.assertIn("closed_positions", call_names)
+
+    def test_fetch_wallet_snapshot_overlaps_activity_and_auxiliary_pages(self) -> None:
+        barrier = threading.Barrier(2)
+
+        class ConcurrentActivityAuxiliaryClient(SnapshotFixtureClient):
+            def fetch_activity_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                if kwargs.get("start") is None and not kwargs.get("activity_type"):
+                    barrier.wait(timeout=1)
+                return super().fetch_activity_page(**kwargs)
+
+            def fetch_positions_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                barrier.wait(timeout=1)
+                return super().fetch_positions_page(**kwargs)
+
+        client = ConcurrentActivityAuxiliaryClient()
+
+        snapshot = fetch_wallet_snapshot(
+            client,  # type: ignore[arg-type]
+            WALLET,
+            audit_scaffold_config(),
+        )
+
+        self.assertSnapshotCoreShape(snapshot)
+        call_names = [name for name, _kwargs in client.calls]
+        self.assertIn("activity", call_names)
+        self.assertIn("positions", call_names)
+
+    def test_fetch_wallet_snapshot_overlaps_chain_validation_with_full_snapshot_fetches(self) -> None:
+        barrier = threading.Barrier(2)
+        chain_started = threading.Event()
+
+        class ConcurrentChainValidationClient(SnapshotFixtureClient):
+            def fetch_activity_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                if kwargs.get("start") is None and not kwargs.get("activity_type"):
+                    barrier.wait(timeout=1)
+                return super().fetch_activity_page(**kwargs)
+
+        def fake_chain_validation(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            chain_started.set()
+            barrier.wait(timeout=1)
+            return {"status": "verified", "reason": "parallel chain validation"}
+
+        client = ConcurrentChainValidationClient()
+        config = audit_scaffold_config()
+        config["chain_validation"] = {"enabled": True}
+
+        with patch(
+            "polymarket_weather_tool.analysis.fetch_optional_chain_validation",
+            side_effect=fake_chain_validation,
+        ):
+            snapshot = fetch_wallet_snapshot(
+                client,  # type: ignore[arg-type]
+                WALLET,
+                config,
+            )
+
+        self.assertTrue(chain_started.is_set())
+        self.assertEqual(snapshot["chain_validation"]["status"], "verified")
 
     def test_fetch_wallet_snapshot_recovers_activity_and_trades_from_time_partitions(self) -> None:
         client = PartitionRecoverySnapshotClient()

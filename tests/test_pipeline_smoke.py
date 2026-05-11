@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
 from unittest.mock import patch
 
@@ -971,6 +972,32 @@ class PipelineSmokeTests(unittest.TestCase):
         self.assertEqual(result["evidence"][0]["stakeholder"], WALLET)
         self.assertEqual(result["evidence"][0]["index_set"], 2)
 
+    def test_fetch_optional_chain_validation_overlaps_logs_and_transactions(self) -> None:
+        barrier = threading.Barrier(2)
+
+        class ConcurrentChainClient:
+            def fetch_polygon_logs(self, **kwargs: Any) -> list[dict[str, Any]]:
+                barrier.wait(timeout=1)
+                return []
+
+            def fetch_polygon_transactions(self, **kwargs: Any) -> list[dict[str, Any]]:
+                barrier.wait(timeout=1)
+                return [{"timeStamp": str(BASE_TS - 100), "hash": "0xfirst"}]
+
+        result = analysis.fetch_optional_chain_validation(
+            ConcurrentChainClient(),  # type: ignore[arg-type]
+            WALLET,
+            {
+                "chain_validation": {
+                    "enabled": True,
+                    "api_key": "test-key",
+                }
+            },
+        )
+
+        self.assertEqual(result["status"], "no_split_evidence")
+        self.assertEqual(result["first_transaction_hash"], "0xfirst")
+
     def test_split_player_requires_average_cost_and_chain_evidence(self) -> None:
         config = small_config(Path("cache"))
         config["chain_validation"] = {
@@ -1768,6 +1795,9 @@ class PipelineSmokeTests(unittest.TestCase):
                 analysis_summary["finder_ai_summary"]["latest_generated_at"],
                 "2026-05-05T00:00:00+00:00",
             )
+            self.assertIn("falcon_display", analysis_summary)
+            self.assertIn("falcon_win_rate", analysis_summary["averages"])
+            self.assertIn("falcon_total_roi", analysis_summary["averages"])
 
     def test_run_pipeline_does_not_generate_finder_ai_for_selected_wallet_without_system_core_label(self) -> None:
         class NonCorePipelineClient(FakePolymarketClient):
@@ -1811,6 +1841,1302 @@ class PipelineSmokeTests(unittest.TestCase):
         self.assertEqual(analysis_summary["finder_ai_summary"]["selected_wallets"], 1)
         self.assertEqual(analysis_summary["finder_ai_summary"]["generated"], 0)
         self.assertEqual(analysis_summary["finder_ai_summary"]["skipped"], 1)
+
+    def test_run_pipeline_only_fetches_falcon_metrics_for_selected_wallets(self) -> None:
+        class MixedSelectionClient(FakePolymarketClient):
+            instances: list["MixedSelectionClient"] = []
+
+            def __init__(self, api_config: dict[str, Any]) -> None:
+                super().__init__(api_config)
+                type(self).instances.append(self)
+
+            def fetch_leaderboard_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("leaderboard", kwargs))
+                return [
+                    {
+                        "rank": 1,
+                        "proxyWallet": "0x1110000000000000000000000000000000000000",
+                        "userName": "selected-wallet",
+                        "xUsername": "selected_wallet",
+                        "pnl": "250.50",
+                        "vol": "2400",
+                    },
+                    {
+                        "rank": 2,
+                        "proxyWallet": "0x2220000000000000000000000000000000000000",
+                        "userName": "screened-wallet",
+                        "xUsername": "screened_wallet",
+                        "pnl": "230.00",
+                        "vol": "2200",
+                    },
+                ]
+
+            def fetch_trades_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("trades", kwargs))
+                wallet = str(kwargs.get("user") or "")
+                if wallet == "0x2220000000000000000000000000000000000000":
+                    return [
+                        {
+                            "asset": "non-weather",
+                            "side": "BUY",
+                            "title": "Sports market",
+                            "outcome": "Yes",
+                            "eventId": "sports-event",
+                            "eventSlug": "sports-event",
+                            "conditionId": "sports-condition",
+                            "slug": "sports-market",
+                            "timestamp": BASE_TS,
+                            "size": "100",
+                            "price": "0.40",
+                            "usdcSize": "40",
+                        }
+                    ]
+                return super().fetch_trades_page(**kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
+            config["wallet_filter"]["target_count"] = 1
+            falcon_calls: list[str] = []
+
+            def fake_falcon(wallet: str, **_kwargs: Any) -> dict[str, Any]:
+                falcon_calls.append(wallet)
+                return {
+                    "wallet": wallet,
+                    "total_pnl": 321.0,
+                    "total_roi": 0.42,
+                    "win_rate": 0.6,
+                    "win_rate_source": "falcon_wallet_360",
+                    "win_rate_window_label": "Falcon 15d",
+                    "metric_source": "falcon",
+                }
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(analysis, "PolymarketClient", MixedSelectionClient))
+                stack.enter_context(
+                    patch.object(analysis, "falcon_display_metrics_for_wallet", side_effect=fake_falcon)
+                )
+                if not hasattr(analysis, "progress"):
+                    stack.enter_context(
+                        patch.object(analysis, "progress", lambda *_args, **_kwargs: None, create=True)
+                    )
+                if not hasattr(analysis, "build_analysis_summary"):
+                    stack.enter_context(
+                        patch.object(
+                            analysis,
+                            "build_analysis_summary",
+                            fallback_analysis_summary,
+                            create=True,
+                        )
+                    )
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+            self.assertEqual(result["selected_wallet_count"], 1)
+            self.assertEqual(falcon_calls, ["0x1110000000000000000000000000000000000000"])
+            wallet_result = json.loads(
+                (output_dir / "wallets" / "0x1110000000000000000000000000000000000000.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(wallet_result["selection_record"]["display_pnl"], 321.0)
+            self.assertEqual(wallet_result["metrics"]["falcon_total_pnl"], 321.0)
+            self.assertIn("structured_materials", wallet_result)
+            self.assertIn("finder_ai", wallet_result)
+
+    def test_run_pipeline_keeps_selected_wallet_order_stable_when_finder_ai_finishes_out_of_order(self) -> None:
+        wallet_fast = "0x1110000000000000000000000000000000000000"
+        wallet_slow = "0x2220000000000000000000000000000000000000"
+        releases: dict[str, threading.Event] = {
+            wallet_fast: threading.Event(),
+            wallet_slow: threading.Event(),
+        }
+
+        class MultiWalletClient(FakePolymarketClient):
+            instances: list["MultiWalletClient"] = []
+
+            def __init__(self, api_config: dict[str, Any]) -> None:
+                super().__init__(api_config)
+                type(self).instances.append(self)
+
+            def fetch_leaderboard_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("leaderboard", kwargs))
+                return [
+                    {
+                        "rank": 1,
+                        "proxyWallet": wallet_fast,
+                        "userName": "first-wallet",
+                        "xUsername": "first_wallet",
+                        "pnl": "250.50",
+                        "vol": "2400",
+                    },
+                    {
+                        "rank": 2,
+                        "proxyWallet": wallet_slow,
+                        "userName": "second-wallet",
+                        "xUsername": "second_wallet",
+                        "pnl": "230.00",
+                        "vol": "2200",
+                    },
+                ]
+
+        def fake_generate(*, payload: dict[str, Any] | None, wallet_result: dict[str, Any]) -> dict[str, Any]:
+            finder_ai = json.loads(json.dumps(payload or {}, ensure_ascii=False))
+            wallet = str(wallet_result.get("wallet") or "")
+            if wallet == wallet_fast:
+                releases[wallet_slow].wait(timeout=1)
+            finder_ai["aiBriefShort"] = f"brief-{wallet[-4:]}"
+            finder_ai["aiBriefNote"] = f"note-{wallet[-4:]}"
+            finder_ai.setdefault("providerMeta", {})["generatedAt"] = "2026-05-05T00:00:00+00:00"
+            finder_ai.setdefault("briefGeneration", {})["status"] = "generated"
+            finder_ai["briefGeneration"]["reason"] = "generated"
+            releases[wallet].set()
+            return finder_ai
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
+            config["analysis"]["concurrent_wallets"] = 2
+            config["analysis"]["finder_ai_concurrency"] = 2
+            config["wallet_filter"]["target_count"] = 2
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(analysis, "PolymarketClient", MultiWalletClient))
+                stack.enter_context(patch.object(analysis, "generate_finder_ai_brief", fake_generate))
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+            selected_wallets = json.loads(
+                (output_dir / "selected_wallets.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result["selected_wallet_count"], 2)
+        self.assertEqual(
+            [row["wallet"] for row in selected_wallets],
+            [wallet_fast, wallet_slow],
+        )
+
+    def test_run_pipeline_flushes_selected_wallets_json_once_per_batch(self) -> None:
+        wallet_fast = "0x1110000000000000000000000000000000000000"
+        wallet_slow = "0x2220000000000000000000000000000000000000"
+        releases: dict[str, threading.Event] = {
+            wallet_fast: threading.Event(),
+            wallet_slow: threading.Event(),
+        }
+
+        class MultiWalletClient(FakePolymarketClient):
+            def fetch_leaderboard_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("leaderboard", kwargs))
+                return [
+                    {
+                        "rank": 1,
+                        "proxyWallet": wallet_fast,
+                        "userName": "first-wallet",
+                        "xUsername": "first_wallet",
+                        "pnl": "250.50",
+                        "vol": "2400",
+                    },
+                    {
+                        "rank": 2,
+                        "proxyWallet": wallet_slow,
+                        "userName": "second-wallet",
+                        "xUsername": "second_wallet",
+                        "pnl": "230.00",
+                        "vol": "2200",
+                    },
+                ]
+
+        def fake_generate(*, payload: dict[str, Any] | None, wallet_result: dict[str, Any]) -> dict[str, Any]:
+            finder_ai = json.loads(json.dumps(payload or {}, ensure_ascii=False))
+            wallet = str(wallet_result.get("wallet") or "")
+            if wallet == wallet_fast:
+                releases[wallet_slow].wait(timeout=1)
+            finder_ai["aiBriefShort"] = f"brief-{wallet[-4:]}"
+            finder_ai["aiBriefNote"] = f"note-{wallet[-4:]}"
+            finder_ai.setdefault("providerMeta", {})["generatedAt"] = "2026-05-05T00:00:00+00:00"
+            finder_ai.setdefault("briefGeneration", {})["status"] = "generated"
+            finder_ai["briefGeneration"]["reason"] = "generated"
+            releases[wallet].set()
+            return finder_ai
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
+            config["analysis"]["concurrent_wallets"] = 2
+            config["analysis"]["finder_ai_concurrency"] = 2
+            config["wallet_filter"]["target_count"] = 2
+
+            original_write_json = analysis.write_json
+            selected_wallets_write_payloads: list[list[dict[str, Any]]] = []
+
+            def write_json_spy(path: Path, data: Any) -> None:
+                if path.name == "selected_wallets.json":
+                    selected_wallets_write_payloads.append(json.loads(json.dumps(data, ensure_ascii=False)))
+                original_write_json(path, data)
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(analysis, "PolymarketClient", MultiWalletClient))
+                stack.enter_context(patch.object(analysis, "generate_finder_ai_brief", fake_generate))
+                stack.enter_context(patch.object(analysis, "write_json", side_effect=write_json_spy))
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+        self.assertEqual(result["selected_wallet_count"], 2)
+        self.assertGreaterEqual(len(selected_wallets_write_payloads), 2)
+        self.assertEqual(selected_wallets_write_payloads[0], [])
+        self.assertFalse(
+            any(len(payload) == 1 for payload in selected_wallets_write_payloads[1:]),
+        )
+        self.assertEqual(
+            [row["wallet"] for row in selected_wallets_write_payloads[1]],
+            [wallet_fast, wallet_slow],
+        )
+        self.assertEqual(
+            [row["wallet"] for row in selected_wallets_write_payloads[-1]],
+            [wallet_fast, wallet_slow],
+        )
+
+    def test_run_pipeline_processes_next_screening_batch_while_full_hydration_is_pending(self) -> None:
+        wallet_first = "0x1110000000000000000000000000000000000000"
+        wallet_second = "0x2220000000000000000000000000000000000000"
+        second_batch_started = threading.Event()
+        hydration_saw_second_batch: list[bool] = []
+        analyzed_wallets: list[str] = []
+        completion_wallets: list[str] = []
+
+        class TwoWalletClient(FakePolymarketClient):
+            def fetch_leaderboard_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("leaderboard", kwargs))
+                return [
+                    {
+                        "rank": 1,
+                        "proxyWallet": wallet_first,
+                        "userName": "first-wallet",
+                        "xUsername": "first_wallet",
+                        "pnl": "250.50",
+                        "vol": "2400",
+                    },
+                    {
+                        "rank": 2,
+                        "proxyWallet": wallet_second,
+                        "userName": "second-wallet",
+                        "xUsername": "second_wallet",
+                        "pnl": "230.00",
+                        "vol": "2200",
+                    },
+                ]
+
+        def deferred_wallet_result(entry: dict[str, Any]) -> dict[str, Any]:
+            wallet = analysis.normalize_address(entry["proxyWallet"])
+            return {
+                "wallet": wallet,
+                "leaderboard_entry": dict(entry),
+                "screening": {
+                    "wallet": wallet,
+                    "selected": True,
+                    "trade_count": 1,
+                    "weather_trade_count": 1,
+                    "reasons": [],
+                },
+                "selection_record": {"wallet": wallet, "selected": True},
+                "labels": [{"key": "high_frequency_region", "system_core": True}],
+                "label_evaluations": [{"key": "high_frequency_region", "matched": True}],
+                "metrics": {"trade_count": 1},
+                "deep_hydration": {
+                    "status": "deferred",
+                    "reason": "scheduled_after_screening_batch",
+                },
+            }
+
+        def fake_iter_analyze_wallet_batch_results(**kwargs: Any) -> Iterator[tuple[int, dict[str, Any]]]:
+            self.assertTrue(kwargs["defer_full_hydration"])
+            entry = kwargs["leaderboard_entries"][0]
+            wallet = analysis.normalize_address(entry["proxyWallet"])
+            analyzed_wallets.append(wallet)
+            if wallet == wallet_second:
+                second_batch_started.set()
+            yield 0, {
+                "wallet": wallet,
+                "wallet_result": deferred_wallet_result(entry),
+                "snapshot": {
+                    "wallet": wallet,
+                    "activity": [],
+                    "trades": [],
+                    "rewards": [],
+                    "positions": [],
+                    "closed_positions": [],
+                    "collection_status": {},
+                    "snapshot_scope": "screening",
+                },
+                "leaderboard_entry": dict(entry),
+            }
+
+        def fake_complete_deferred_selected_wallet_result(**kwargs: Any) -> dict[str, Any]:
+            wallet_result = json.loads(json.dumps(kwargs["wallet_result"], ensure_ascii=False))
+            wallet = wallet_result["wallet"]
+            completion_wallets.append(wallet)
+            if wallet == wallet_first:
+                hydration_saw_second_batch.append(second_batch_started.wait(timeout=1))
+            wallet_result["deep_hydration"] = {"status": "completed", "snapshot_scope": "full"}
+            wallet_result["finder_ai"] = {
+                "aiBriefShort": f"brief-{wallet[-4:]}",
+                "briefGeneration": {"status": "generated", "reason": "generated"},
+            }
+            wallet_result["selection_record"]["has_core_label"] = True
+            wallet_result["selection_record"]["core_label_keys"] = ["high_frequency_region"]
+            snapshot = dict(kwargs["snapshot"])
+            snapshot["snapshot_scope"] = "full"
+            return {"wallet_result": wallet_result, "snapshot": snapshot}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            config = small_config(temp_path / "cache")
+            config["leaderboard"]["fetch_limit"] = 2
+            config["leaderboard"]["page_size"] = 2
+            config["wallet_filter"]["target_count"] = 2
+            config["analysis"]["concurrent_wallets"] = 1
+            config["analysis"]["full_hydration_concurrency"] = 1
+            config["analysis"]["defer_selected_wallet_full_hydration"] = True
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(analysis, "PolymarketClient", TwoWalletClient))
+                stack.enter_context(
+                    patch.object(
+                        analysis,
+                        "iter_analyze_wallet_batch_results",
+                        side_effect=fake_iter_analyze_wallet_batch_results,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        analysis,
+                        "complete_deferred_selected_wallet_result",
+                        side_effect=fake_complete_deferred_selected_wallet_result,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        analysis,
+                        "build_analysis_summary",
+                        return_value={"wallets_selected": 2},
+                    )
+                )
+                stack.enter_context(patch.object(analysis, "build_report", return_value="report"))
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+            selected_wallets = json.loads(
+                (output_dir / "selected_wallets.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result["selected_wallet_count"], 2)
+        self.assertEqual(analyzed_wallets, [wallet_first, wallet_second])
+        self.assertEqual(completion_wallets, [wallet_first, wallet_second])
+        self.assertEqual(hydration_saw_second_batch, [True])
+        self.assertEqual([row["wallet"] for row in selected_wallets], [wallet_first, wallet_second])
+
+    def test_run_pipeline_starts_completed_batch_hydration_before_slow_peer_finishes(self) -> None:
+        wallet_slow = "0x1110000000000000000000000000000000000000"
+        wallet_fast = "0x2220000000000000000000000000000000000000"
+        fast_hydration_started = threading.Event()
+        slow_saw_fast_hydration: list[bool] = []
+        analyzed_wallets: list[str] = []
+        completion_wallets: list[str] = []
+
+        class TwoWalletClient(FakePolymarketClient):
+            def fetch_leaderboard_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("leaderboard", kwargs))
+                return [
+                    {
+                        "rank": 1,
+                        "proxyWallet": wallet_slow,
+                        "userName": "slow-wallet",
+                        "xUsername": "slow_wallet",
+                        "pnl": "250.50",
+                        "vol": "2400",
+                    },
+                    {
+                        "rank": 2,
+                        "proxyWallet": wallet_fast,
+                        "userName": "fast-wallet",
+                        "xUsername": "fast_wallet",
+                        "pnl": "230.00",
+                        "vol": "2200",
+                    },
+                ]
+
+        def deferred_wallet_result(entry: dict[str, Any]) -> dict[str, Any]:
+            wallet = analysis.normalize_address(entry["proxyWallet"])
+            return {
+                "wallet": wallet,
+                "leaderboard_entry": dict(entry),
+                "screening": {
+                    "wallet": wallet,
+                    "selected": True,
+                    "trade_count": 1,
+                    "weather_trade_count": 1,
+                    "reasons": [],
+                },
+                "selection_record": {"wallet": wallet, "selected": True},
+                "labels": [{"key": "high_frequency_region", "system_core": True}],
+                "label_evaluations": [{"key": "high_frequency_region", "matched": True}],
+                "metrics": {"trade_count": 1},
+                "deep_hydration": {
+                    "status": "deferred",
+                    "reason": "scheduled_after_screening_batch",
+                },
+            }
+
+        def fake_analyze_leaderboard_entry(**kwargs: Any) -> dict[str, Any]:
+            entry = kwargs["leaderboard_entry"]
+            wallet = analysis.normalize_address(entry["proxyWallet"])
+            analyzed_wallets.append(wallet)
+            if wallet == wallet_slow:
+                slow_saw_fast_hydration.append(fast_hydration_started.wait(timeout=1))
+            return {
+                "wallet": wallet,
+                "wallet_result": deferred_wallet_result(entry),
+                "snapshot": {
+                    "wallet": wallet,
+                    "activity": [],
+                    "trades": [],
+                    "rewards": [],
+                    "positions": [],
+                    "closed_positions": [],
+                    "collection_status": {},
+                    "snapshot_scope": "screening",
+                },
+                "leaderboard_entry": dict(entry),
+            }
+
+        def fake_complete_deferred_selected_wallet_result(**kwargs: Any) -> dict[str, Any]:
+            wallet_result = json.loads(json.dumps(kwargs["wallet_result"], ensure_ascii=False))
+            wallet = wallet_result["wallet"]
+            completion_wallets.append(wallet)
+            if wallet == wallet_fast:
+                fast_hydration_started.set()
+            wallet_result["deep_hydration"] = {"status": "completed", "snapshot_scope": "full"}
+            wallet_result["selection_record"]["has_core_label"] = True
+            wallet_result["selection_record"]["core_label_keys"] = ["high_frequency_region"]
+            snapshot = dict(kwargs["snapshot"])
+            snapshot["snapshot_scope"] = "full"
+            return {
+                "wallet_result": wallet_result,
+                "snapshot": snapshot,
+                "finder_ai_pending": False,
+                "finalized": True,
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            config = small_config(temp_path / "cache")
+            config["leaderboard"]["fetch_limit"] = 2
+            config["leaderboard"]["page_size"] = 2
+            config["wallet_filter"]["target_count"] = 2
+            config["analysis"]["concurrent_wallets"] = 2
+            config["analysis"]["full_hydration_concurrency"] = 2
+            config["analysis"]["defer_selected_wallet_full_hydration"] = True
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(analysis, "PolymarketClient", TwoWalletClient))
+                stack.enter_context(
+                    patch.object(
+                        analysis,
+                        "analyze_leaderboard_entry",
+                        side_effect=fake_analyze_leaderboard_entry,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        analysis,
+                        "complete_deferred_selected_wallet_result",
+                        side_effect=fake_complete_deferred_selected_wallet_result,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        analysis,
+                        "build_analysis_summary",
+                        return_value={"wallets_selected": 2},
+                    )
+                )
+                stack.enter_context(patch.object(analysis, "build_report", return_value="report"))
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+            selected_wallets = json.loads(
+                (output_dir / "selected_wallets.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result["selected_wallet_count"], 2)
+        self.assertIn(wallet_fast, completion_wallets)
+        self.assertEqual(slow_saw_fast_hydration, [True])
+        self.assertCountEqual(analyzed_wallets, [wallet_slow, wallet_fast])
+        self.assertEqual([row["wallet"] for row in selected_wallets], [wallet_slow, wallet_fast])
+
+    def test_run_pipeline_lookahead_keeps_screening_workers_filled_without_extra_concurrency(self) -> None:
+        wallets = [
+            "0x1110000000000000000000000000000000000000",
+            "0x2220000000000000000000000000000000000000",
+            "0x3330000000000000000000000000000000000000",
+            "0x4440000000000000000000000000000000000000",
+        ]
+        slow_started = threading.Event()
+        lookahead_started = threading.Event()
+        active_count = 0
+        max_active_count = 0
+        active_lock = threading.Lock()
+        started_wallets: list[str] = []
+        history_writes: list[tuple[str, str]] = []
+
+        class LookaheadClient(FakePolymarketClient):
+            def fetch_leaderboard_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("leaderboard", kwargs))
+                return [
+                    {
+                        "rank": index + 1,
+                        "proxyWallet": wallet,
+                        "userName": f"wallet-{index}",
+                        "xUsername": f"wallet_{index}",
+                        "pnl": "250.50",
+                        "vol": "2400",
+                    }
+                    for index, wallet in enumerate(wallets)
+                ]
+
+        def selected_result(entry: dict[str, Any], selected: bool) -> dict[str, Any]:
+            wallet = analysis.normalize_address(entry["proxyWallet"])
+            return {
+                "wallet": wallet,
+                "leaderboard_entry": dict(entry),
+                "screening": {
+                    "wallet": wallet,
+                    "selected": selected,
+                    "trade_count": 1,
+                    "weather_trade_count": 1 if selected else 0,
+                    "reasons": [],
+                },
+                "selection_record": {"wallet": wallet, "selected": selected},
+                "labels": [{"key": "high_frequency_region", "system_core": True}] if selected else [],
+                "label_evaluations": [{"key": "high_frequency_region", "matched": True}] if selected else [],
+                "metrics": {"trade_count": 1},
+                "deep_hydration": {"status": "skipped", "reason": "unit_test"},
+            }
+
+        def fake_analyze_leaderboard_entry(**kwargs: Any) -> dict[str, Any]:
+            nonlocal active_count, max_active_count
+            entry = kwargs["leaderboard_entry"]
+            wallet = analysis.normalize_address(entry["proxyWallet"])
+            with active_lock:
+                active_count += 1
+                max_active_count = max(max_active_count, active_count)
+                started_wallets.append(wallet)
+            try:
+                if wallet == wallets[0]:
+                    slow_started.set()
+                    self.assertTrue(lookahead_started.wait(timeout=1))
+                if wallet == wallets[2]:
+                    lookahead_started.set()
+                return {
+                    "wallet": wallet,
+                    "wallet_result": selected_result(entry, wallet in {wallets[0], wallets[1]}),
+                    "snapshot": {
+                        "wallet": wallet,
+                        "activity": [],
+                        "trades": [],
+                        "rewards": [],
+                        "positions": [],
+                        "closed_positions": [],
+                        "collection_status": {},
+                        "snapshot_scope": "screening",
+                    },
+                    "leaderboard_entry": dict(entry),
+                    "history_record_status": "selected_pending" if wallet in {wallets[0], wallets[1]} else "screened_out",
+                }
+            finally:
+                with active_lock:
+                    active_count -= 1
+
+        def fake_write_wallet_history_record(**kwargs: Any) -> None:
+            history_writes.append((kwargs["wallet"], kwargs["status"]))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            config = small_config(temp_path / "cache")
+            config["leaderboard"]["fetch_limit"] = 4
+            config["leaderboard"]["page_size"] = 4
+            config["wallet_filter"]["target_count"] = 2
+            config["analysis"]["concurrent_wallets"] = 2
+            config["analysis"]["wallet_screening_lookahead_multiplier"] = 2
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(analysis, "PolymarketClient", LookaheadClient))
+                stack.enter_context(
+                    patch.object(
+                        analysis,
+                        "analyze_leaderboard_entry",
+                        side_effect=fake_analyze_leaderboard_entry,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        analysis,
+                        "write_wallet_history_record",
+                        side_effect=fake_write_wallet_history_record,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        analysis,
+                        "build_analysis_summary",
+                        return_value={"wallets_selected": 2},
+                    )
+                )
+                stack.enter_context(patch.object(analysis, "build_report", return_value="report"))
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+            selected_wallets = json.loads(
+                (output_dir / "selected_wallets.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result["selected_wallet_count"], 2)
+        self.assertTrue(slow_started.is_set())
+        self.assertTrue(lookahead_started.is_set())
+        self.assertIn(wallets[2], started_wallets)
+        self.assertLessEqual(max_active_count, 2)
+        self.assertEqual([row["wallet"] for row in selected_wallets], wallets[:2])
+        self.assertEqual({wallet for wallet, _status in history_writes}, set(wallets[:2]))
+        self.assertEqual(
+            {status for _wallet, status in history_writes},
+            {"selected_pending", "selected"},
+        )
+
+    def test_deferred_completion_applies_deepseek_gate_after_hydration_relabel(self) -> None:
+        wallet = "0xabc1230000000000000000000000000000000000"
+        lightweight_wallet_result = {
+            "wallet": wallet,
+            "screening": {"wallet": wallet, "selected": True, "reasons": []},
+            "selection_record": {"wallet": wallet, "selected": True},
+            "labels": [{"key": "high_frequency_region", "system_core": True}],
+            "label_evaluations": [{"key": "high_frequency_region", "matched": True}],
+            "metrics": {"trade_count": 1},
+        }
+        hydrated_wallet_result = {
+            "wallet": wallet,
+            "screening": {"wallet": wallet, "selected": True, "reasons": []},
+            "selection_record": {"wallet": wallet, "selected": True},
+            "labels": [],
+            "label_evaluations": [],
+            "metrics": {"trade_count": 1},
+            "deep_hydration": {"status": "completed", "snapshot_scope": "full"},
+        }
+        snapshot = {"wallet": wallet, "snapshot_scope": "screening"}
+        full_snapshot = {"wallet": wallet, "snapshot_scope": "full"}
+
+        def identity_enrich(**kwargs: Any) -> dict[str, Any]:
+            return kwargs["wallet_result"]
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    analysis,
+                    "hydrate_selected_wallet_result_full_history",
+                    return_value=(hydrated_wallet_result, full_snapshot),
+                )
+            )
+            stack.enter_context(patch.object(analysis, "enrich_wallet_result_artifacts", side_effect=identity_enrich))
+            stack.enter_context(
+                patch.object(
+                    analysis,
+                    "generate_finder_ai_for_wallet_result",
+                    side_effect=AssertionError("DeepSeek should use post-hydration core gate"),
+                )
+            )
+            with analysis.ThreadPoolExecutor(max_workers=1) as ai_executor:
+                result = analysis.complete_deferred_selected_wallet_result(
+                    client=object(),  # type: ignore[arg-type]
+                    leaderboard_entry={"proxyWallet": wallet},
+                    wallet_result=lightweight_wallet_result,
+                    snapshot=snapshot,
+                    weather_index=analysis.WeatherIndex(set(), set(), set(), set(), {}),
+                    config=small_config(Path("cache")),
+                    ai_executor=ai_executor,
+                )
+
+        final_wallet_result = result["wallet_result"]
+        self.assertFalse(result["finder_ai_pending"])
+        self.assertFalse(result["finalized"])
+        self.assertFalse(final_wallet_result["selection_record"]["has_core_label"])
+        self.assertEqual(final_wallet_result["selection_record"]["core_label_keys"], [])
+        self.assertNotIn("finder_ai", final_wallet_result)
+
+    def test_selected_wallet_prefetches_falcon_during_deferred_hydration(self) -> None:
+        wallet = "0xabc1230000000000000000000000000000000000"
+        lightweight_wallet_result = {
+            "wallet": wallet,
+            "screening": {"wallet": wallet, "selected": True, "reasons": []},
+            "selection_record": {"wallet": wallet, "selected": True},
+            "labels": [{"key": "high_frequency_region", "system_core": True}],
+            "label_evaluations": [{"key": "high_frequency_region", "matched": True}],
+            "metrics": {"trade_count": 1},
+            "deep_hydration": {
+                "status": "deferred",
+                "reason": "scheduled_after_screening_batch",
+            },
+        }
+        hydrated_wallet_result = {
+            "wallet": wallet,
+            "screening": {"wallet": wallet, "selected": True, "reasons": []},
+            "selection_record": {"wallet": wallet, "selected": True},
+            "labels": [{"key": "high_frequency_region", "system_core": True}],
+            "label_evaluations": [{"key": "high_frequency_region", "matched": True}],
+            "metrics": {"trade_count": 1},
+            "deep_hydration": {"status": "completed", "snapshot_scope": "full"},
+        }
+        snapshot = {
+            "wallet": wallet,
+            "activity": [],
+            "trades": [],
+            "rewards": [],
+            "positions": [],
+            "closed_positions": [],
+            "collection_status": {},
+            "snapshot_scope": "screening",
+        }
+        full_snapshot = dict(snapshot)
+        full_snapshot["snapshot_scope"] = "full"
+        falcon_started = threading.Event()
+        hydration_started = threading.Event()
+        hydration_saw_falcon_started: list[bool] = []
+
+        def fake_fetch_falcon(wallet_arg: str, _config: dict[str, Any]) -> dict[str, Any]:
+            self.assertEqual(wallet_arg, wallet)
+            falcon_started.set()
+            hydration_started.wait(timeout=1)
+            return {
+                "wallet": wallet,
+                "total_pnl": 321.0,
+                "total_roi": 0.42,
+                "win_rate": 0.6,
+                "win_rate_source": "falcon_wallet_360",
+                "win_rate_window_label": "Falcon 15d",
+                "metric_source": "falcon",
+            }
+
+        def fake_hydrate(**_kwargs: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+            hydration_started.set()
+            hydration_saw_falcon_started.append(falcon_started.wait(timeout=1))
+            return hydrated_wallet_result, full_snapshot
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    analysis,
+                    "fetch_falcon_metrics_for_selected_wallet",
+                    side_effect=fake_fetch_falcon,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    analysis,
+                    "falcon_display_metrics_for_wallet",
+                    side_effect=AssertionError("Falcon metrics should be reused from the prefetch future"),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    analysis,
+                    "hydrate_selected_wallet_result_full_history",
+                    side_effect=fake_hydrate,
+                )
+            )
+            with analysis.ThreadPoolExecutor(max_workers=1) as falcon_executor:
+                with analysis.ThreadPoolExecutor(max_workers=1) as completion_executor:
+                    with analysis.ThreadPoolExecutor(max_workers=1) as ai_executor:
+                        pending = analysis.start_selected_wallet_pending_result(
+                            client=object(),  # type: ignore[arg-type]
+                            batch_index=0,
+                            batch_result={
+                                "wallet": wallet,
+                                "wallet_result": lightweight_wallet_result,
+                                "snapshot": snapshot,
+                                "leaderboard_entry": {"proxyWallet": wallet},
+                            },
+                            selected_completion_executor=completion_executor,
+                            falcon_executor=falcon_executor,
+                            ai_executor=ai_executor,
+                            weather_index=analysis.WeatherIndex(set(), set(), set(), set(), {}),
+                            config=small_config(Path("cache")),
+                        )
+                        self.assertIsNotNone(pending.completion_future)
+                        completed = pending.completion_future.result(timeout=2)
+
+        final_wallet_result = completed["wallet_result"]
+        key_metrics = {
+            str(item.get("key")): item.get("value")
+            for item in final_wallet_result["finder_ai"]["keyMetrics"]
+            if isinstance(item, dict)
+        }
+        self.assertEqual(hydration_saw_falcon_started, [True])
+        self.assertEqual(final_wallet_result["selection_record"]["display_pnl"], 321.0)
+        self.assertEqual(final_wallet_result["metrics"]["falcon_total_pnl"], 321.0)
+        self.assertEqual(key_metrics["pnl"], 321.0)
+
+    def test_flush_schedules_deferred_deepseek_without_blocking_hydration_result(self) -> None:
+        wallet = "0xabc1230000000000000000000000000000000000"
+        wallet_result = {
+            "wallet": wallet,
+            "screening": {"wallet": wallet, "selected": True, "reasons": []},
+            "selection_record": {"wallet": wallet, "selected": True},
+            "labels": [{"key": "high_frequency_region", "system_core": True}],
+            "label_evaluations": [{"key": "high_frequency_region", "matched": True}],
+            "metrics": {"trade_count": 1},
+        }
+        snapshot = {
+            "wallet": wallet,
+            "activity": [],
+            "trades": [],
+            "rewards": [],
+            "positions": [],
+            "closed_positions": [],
+            "collection_status": {},
+            "snapshot_scope": "full",
+        }
+        completion_future: analysis.Future[dict[str, Any]] = analysis.Future()
+        completion_future.set_result(
+            {
+                "wallet_result": wallet_result,
+                "snapshot": snapshot,
+                "finder_ai_pending": True,
+                "finalized": False,
+            }
+        )
+        ai_future: analysis.Future[dict[str, Any]] = analysis.Future()
+
+        class FakeAiExecutor:
+            submitted = False
+
+            def submit(self, *args: Any, **kwargs: Any) -> analysis.Future[dict[str, Any]]:
+                self.submitted = True
+                return ai_future
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir()
+            selected_wallets: list[dict[str, Any]] = []
+            wallet_results: list[dict[str, Any]] = []
+            pending = [
+                analysis.PendingSelectedWalletResult(
+                    sequence=0,
+                    wallet=wallet,
+                    wallet_result=wallet_result,
+                    snapshot=snapshot,
+                    completion_future=completion_future,
+                )
+            ]
+            config = small_config(output_dir / "cache")
+            config["runtime"] = {"progress_log_path": str(output_dir / "progress.log")}
+            fake_executor = FakeAiExecutor()
+
+            flushed = analysis.flush_pending_selected_wallet_results(
+                pending_wallets=pending,
+                selected_wallets=selected_wallets,
+                wallet_results=wallet_results,
+                wallets_dir=wallets_dir,
+                output_dir=output_dir,
+                config=config,
+                weather_index=analysis.WeatherIndex(set(), set(), set(), set(), {}),
+                target_count=1,
+                ai_executor=fake_executor,  # type: ignore[arg-type]
+            )
+
+            self.assertFalse(flushed)
+            self.assertTrue(fake_executor.submitted)
+            self.assertEqual(len(pending), 1)
+            self.assertFalse(selected_wallets)
+
+            ai_future.set_result(
+                {
+                    "aiBriefShort": "brief",
+                    "briefGeneration": {"status": "generated", "reason": "generated"},
+                }
+            )
+            flushed = analysis.flush_pending_selected_wallet_results(
+                pending_wallets=pending,
+                selected_wallets=selected_wallets,
+                wallet_results=wallet_results,
+                wallets_dir=wallets_dir,
+                output_dir=output_dir,
+                config=config,
+                weather_index=analysis.WeatherIndex(set(), set(), set(), set(), {}),
+                target_count=1,
+                ai_executor=fake_executor,  # type: ignore[arg-type]
+            )
+
+            detail = json.loads((wallets_dir / f"{wallet}.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(flushed)
+        self.assertEqual(len(selected_wallets), 1)
+        self.assertEqual(detail["finder_ai"]["aiBriefShort"], "brief")
+
+    def test_waiting_flush_schedules_deepseek_for_completed_hydration_out_of_order(self) -> None:
+        wallet_slow = "0x1110000000000000000000000000000000000000"
+        wallet_fast = "0x2220000000000000000000000000000000000000"
+
+        def wallet_result(wallet: str) -> dict[str, Any]:
+            return {
+                "wallet": wallet,
+                "screening": {"wallet": wallet, "selected": True, "reasons": []},
+                "selection_record": {"wallet": wallet, "selected": True},
+                "labels": [{"key": "high_frequency_region", "system_core": True}],
+                "label_evaluations": [{"key": "high_frequency_region", "matched": True}],
+                "metrics": {"trade_count": 1},
+            }
+
+        def snapshot(wallet: str) -> dict[str, Any]:
+            return {
+                "wallet": wallet,
+                "activity": [],
+                "trades": [],
+                "rewards": [],
+                "positions": [],
+                "closed_positions": [],
+                "collection_status": {},
+                "snapshot_scope": "full",
+            }
+
+        completion_slow: analysis.Future[dict[str, Any]] = analysis.Future()
+        completion_fast: analysis.Future[dict[str, Any]] = analysis.Future()
+        ai_futures: dict[str, analysis.Future[dict[str, Any]]] = {}
+        fast_ai_submitted = threading.Event()
+        slow_ai_submitted = threading.Event()
+
+        class FakeAiExecutor:
+            def submit(self, *args: Any, **kwargs: Any) -> analysis.Future[dict[str, Any]]:
+                submitted_wallet_result = args[1]
+                wallet = str(submitted_wallet_result["wallet"])
+                future: analysis.Future[dict[str, Any]] = analysis.Future()
+                ai_futures[wallet] = future
+                if wallet == wallet_fast:
+                    fast_ai_submitted.set()
+                if wallet == wallet_slow:
+                    slow_ai_submitted.set()
+                return future
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir()
+            selected_wallets: list[dict[str, Any]] = []
+            wallet_results: list[dict[str, Any]] = []
+            pending = [
+                analysis.PendingSelectedWalletResult(
+                    sequence=0,
+                    wallet=wallet_slow,
+                    wallet_result=wallet_result(wallet_slow),
+                    snapshot=snapshot(wallet_slow),
+                    completion_future=completion_slow,
+                ),
+                analysis.PendingSelectedWalletResult(
+                    sequence=1,
+                    wallet=wallet_fast,
+                    wallet_result=wallet_result(wallet_fast),
+                    snapshot=snapshot(wallet_fast),
+                    completion_future=completion_fast,
+                ),
+            ]
+            config = small_config(output_dir / "cache")
+            config["runtime"] = {"progress_log_path": str(output_dir / "progress.log")}
+            result: dict[str, Any] = {}
+            done = threading.Event()
+
+            def run_flush() -> None:
+                try:
+                    result["flushed"] = analysis.flush_pending_selected_wallet_results(
+                        pending_wallets=pending,
+                        selected_wallets=selected_wallets,
+                        wallet_results=wallet_results,
+                        wallets_dir=wallets_dir,
+                        output_dir=output_dir,
+                        config=config,
+                        weather_index=analysis.WeatherIndex(set(), set(), set(), set(), {}),
+                        target_count=2,
+                        ai_executor=FakeAiExecutor(),  # type: ignore[arg-type]
+                        wait=True,
+                    )
+                except BaseException as exc:  # pragma: no cover - surfaced by assertion below
+                    result["error"] = exc
+                finally:
+                    done.set()
+
+            thread = threading.Thread(target=run_flush)
+            thread.start()
+            completion_fast.set_result(
+                {
+                    "wallet_result": wallet_result(wallet_fast),
+                    "snapshot": snapshot(wallet_fast),
+                    "finder_ai_pending": True,
+                    "finalized": False,
+                }
+            )
+
+            self.assertTrue(fast_ai_submitted.wait(timeout=1))
+            self.assertFalse(slow_ai_submitted.is_set())
+            self.assertFalse(done.is_set())
+
+            completion_slow.set_result(
+                {
+                    "wallet_result": wallet_result(wallet_slow),
+                    "snapshot": snapshot(wallet_slow),
+                    "finder_ai_pending": True,
+                    "finalized": False,
+                }
+            )
+            self.assertTrue(slow_ai_submitted.wait(timeout=1))
+            ai_futures[wallet_fast].set_result(
+                {
+                    "aiBriefShort": "brief-fast",
+                    "briefGeneration": {"status": "generated", "reason": "generated"},
+                }
+            )
+            ai_futures[wallet_slow].set_result(
+                {
+                    "aiBriefShort": "brief-slow",
+                    "briefGeneration": {"status": "generated", "reason": "generated"},
+                }
+            )
+            self.assertTrue(done.wait(timeout=1))
+            thread.join(timeout=1)
+
+        self.assertNotIn("error", result)
+        self.assertTrue(result["flushed"])
+        self.assertEqual([row["wallet"] for row in selected_wallets], [wallet_slow, wallet_fast])
+
+    def test_run_pipeline_reuses_recent_activity_screening_page_for_full_hydration(self) -> None:
+        class RecentActivityReuseClient(FakePolymarketClient):
+            instances: list["RecentActivityReuseClient"] = []
+
+            def __init__(self, api_config: dict[str, Any]) -> None:
+                super().__init__(api_config)
+                type(self).instances.append(self)
+
+            def fetch_activity_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("activity", kwargs))
+                if kwargs.get("offset") == 0 and kwargs.get("start") is None and kwargs.get("end") is None:
+                    return [
+                        {
+                            "type": "TRADE",
+                            "asset": "rain-yes",
+                            "side": "BUY",
+                            "title": "NYC rain",
+                            "outcome": "Yes",
+                            "eventId": "weather-event-1",
+                            "eventSlug": "rain-in-nyc",
+                            "conditionId": "cond-weather-yes",
+                            "slug": "rain-in-nyc-yes",
+                            "timestamp": BASE_TS,
+                            "size": "100",
+                            "price": "0.40",
+                            "usdcSize": "40",
+                            "transactionHash": "0xtx-1",
+                        },
+                        {
+                            "type": "TRADE",
+                            "asset": "rain-yes",
+                            "side": "SELL",
+                            "title": "NYC rain",
+                            "outcome": "Yes",
+                            "eventId": "weather-event-1",
+                            "eventSlug": "rain-in-nyc",
+                            "conditionId": "cond-weather-yes",
+                            "slug": "rain-in-nyc-yes",
+                            "timestamp": BASE_TS + 48 * 3600,
+                            "size": "50",
+                            "price": "0.70",
+                            "usdcSize": "35",
+                            "transactionHash": "0xtx-2",
+                        },
+                        {
+                            "type": "TRADE",
+                            "asset": "snow-no",
+                            "side": "BUY",
+                            "title": "Boston snow",
+                            "outcome": "No",
+                            "eventId": "other-event",
+                            "eventSlug": "snow-in-boston",
+                            "conditionId": "cond-other",
+                            "slug": "snow-in-boston-no",
+                            "timestamp": BASE_TS + 72 * 3600,
+                            "size": "100",
+                            "price": "1.00",
+                            "usdcSize": "100",
+                            "transactionHash": "0xtx-3",
+                        },
+                        {
+                            "type": "TRADE",
+                            "asset": "rain-yes-late",
+                            "side": "BUY",
+                            "title": "NYC rain",
+                            "outcome": "Yes",
+                            "eventSlug": "rain-in-nyc",
+                            "conditionId": "cond-weather-yes",
+                            "timestamp": BASE_TS + 96 * 3600,
+                            "size": "50",
+                            "price": "0.50",
+                            "usdcSize": "25",
+                            "transactionHash": "0xtx-4",
+                        },
+                    ]
+                return super().fetch_activity_page(**kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
+            config["analysis"]["screening_window_first"] = False
+            config["analysis"]["recent_activity_screening_snapshot_enabled"] = True
+            config["analysis"]["hydrate_selected_wallet_full_history"] = True
+            config["pagination"] = {"page_size": 10, "max_offset": 0}
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(analysis, "PolymarketClient", RecentActivityReuseClient)
+                )
+                if not hasattr(analysis, "progress"):
+                    stack.enter_context(
+                        patch.object(analysis, "progress", lambda *_args, **_kwargs: None, create=True)
+                    )
+                if not hasattr(analysis, "build_analysis_summary"):
+                    stack.enter_context(
+                        patch.object(
+                            analysis,
+                            "build_analysis_summary",
+                            fallback_analysis_summary,
+                            create=True,
+                        )
+                    )
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+            client = RecentActivityReuseClient.instances[0]
+            activity_zero_calls = [
+                kwargs
+                for name, kwargs in client.calls
+                if name == "activity"
+                and kwargs.get("offset") == 0
+                and kwargs.get("start") is None
+                and kwargs.get("end") is None
+            ]
+
+        self.assertEqual(result["selected_wallet_count"], 1)
+        self.assertEqual(len(activity_zero_calls), 1)
+
+    def test_analyze_leaderboard_entry_uses_full_activity_after_screening_window(self) -> None:
+        class ScreeningTradesReuseClient(FakePolymarketClient):
+            instances: list["ScreeningTradesReuseClient"] = []
+
+            def __init__(self, api_config: dict[str, Any]) -> None:
+                super().__init__(api_config)
+                type(self).instances.append(self)
+                self.screening_trade = {
+                    "asset": "rain-yes",
+                    "side": "BUY",
+                    "title": "NYC rain",
+                    "outcome": "Yes",
+                    "eventId": "weather-event-1",
+                    "eventSlug": "rain-in-nyc",
+                    "conditionId": "cond-weather-yes",
+                    "slug": "rain-in-nyc-yes",
+                    "timestamp": BASE_TS,
+                    "size": "100",
+                    "price": "0.40",
+                    "usdcSize": "40",
+                    "transactionHash": "0xtx-screening",
+                    "type": "TRADE",
+                }
+                self.full_only_trade = {
+                    "asset": "rain-yes-older",
+                    "side": "SELL",
+                    "title": "NYC rain",
+                    "outcome": "Yes",
+                    "eventId": "weather-event-1",
+                    "eventSlug": "rain-in-nyc",
+                    "conditionId": "cond-weather-yes",
+                    "slug": "rain-in-nyc-yes",
+                    "timestamp": BASE_TS - 2 * 24 * 3600,
+                    "size": "50",
+                    "price": "0.60",
+                    "usdcSize": "30",
+                    "transactionHash": "0xtx-full-only",
+                    "type": "TRADE",
+                }
+
+            def fetch_activity_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("activity", kwargs))
+                start = kwargs.get("start")
+                end = kwargs.get("end")
+                limit = int(kwargs["limit"])
+                offset = int(kwargs["offset"])
+                if start is not None and end is not None:
+                    records = [
+                        record
+                        for record in (self.screening_trade, self.full_only_trade)
+                        if int(record["timestamp"]) >= int(start) and int(record["timestamp"]) <= int(end)
+                    ]
+                    records.sort(key=lambda record: int(record["timestamp"]), reverse=True)
+                    return [dict(record) for record in records[offset : offset + limit]]
+                if offset == 0:
+                    return [{"type": "REWARD", "usdcSize": "12.34", "timestamp": BASE_TS + 3600}]
+                raise_terminal_http_400("activity", limit=limit, offset=offset)
+
+            def fetch_trades_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(("trades", kwargs))
+                limit = int(kwargs["limit"])
+                offset = int(kwargs["offset"])
+                records = [dict(self.screening_trade), dict(self.full_only_trade)]
+                return records[offset : offset + limit]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
+            config["leaderboard"]["time_period"] = "DAY"
+            config["analysis"]["current_datetime"] = (BASE_DT + timedelta(hours=1)).isoformat()
+            config["analysis"]["screening_window_first"] = True
+            config["analysis"]["recent_activity_screening_snapshot_enabled"] = False
+            config["analysis"]["hydrate_selected_wallet_full_history"] = True
+            config["pagination"] = {"page_size": 1, "max_offset": 1}
+            config["wallet_filter"]["min_traded_count"] = 1
+
+            client = ScreeningTradesReuseClient(config["api"])
+            weather_index = analysis.build_weather_index(
+                client.fetch_events_keyset_page(limit=1)["events"]
+            )
+            leaderboard_entry = client.fetch_leaderboard_page(
+                category="WEATHER",
+                time_period="DAY",
+                order_by="PNL",
+                limit=1,
+                offset=0,
+            )[0]
+
+            result = analysis.analyze_leaderboard_entry(
+                client=client,
+                leaderboard_entry=leaderboard_entry,
+                weather_index=weather_index,
+                config=config,
+            )
+
+            trades_calls = [kwargs for name, kwargs in client.calls if name == "trades"]
+            wallet_result = result["wallet_result"]
+
+        self.assertIn("wallet_result", result)
+        self.assertEqual(wallet_result["deep_hydration"]["status"], "completed")
+        self.assertEqual(trades_calls, [])
+        self.assertEqual(wallet_result["raw_counts"]["trade_count"], 2)
+        self.assertEqual(wallet_result["raw_counts"]["activity_count"], 3)
+        self.assertEqual(wallet_result["screening"]["trade_count"], 1)
+        self.assertEqual(wallet_result["metrics"]["screening_trade_count"], 1)
 
     def test_run_pipeline_resume_skips_completed_wallets_and_keeps_existing_details(self) -> None:
         completed_wallet = "0xaaa0000000000000000000000000000000000000"
@@ -1939,6 +3265,170 @@ class PipelineSmokeTests(unittest.TestCase):
         self.assertIn(next_wallet, calls_by_wallet)
         self.assertTrue(completed_wallet_detail_exists)
         self.assertTrue(next_wallet_detail_exists)
+
+    def test_run_pipeline_resume_uses_lightweight_index_before_final_wallet_reload(self) -> None:
+        completed_wallet = "0xaaa0000000000000000000000000000000000000"
+        next_wallet = "0xbbb0000000000000000000000000000000000000"
+
+        class ResumeImportClient(FakePolymarketClient):
+            def fetch_trades_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                if kwargs["user"] == completed_wallet:
+                    raise AssertionError("completed wallet should not be fetched again")
+                return super().fetch_trades_page(**kwargs)
+
+            def fetch_activity_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                if kwargs["user"] == completed_wallet:
+                    raise AssertionError("completed wallet should not be fetched again")
+                return [{"type": "REWARD", "usdcSize": "12.34"}]
+
+            def fetch_positions_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                if kwargs["user"] == completed_wallet:
+                    raise AssertionError("completed wallet should not be fetched again")
+                return []
+
+            def fetch_closed_positions_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                if kwargs["user"] == completed_wallet:
+                    raise AssertionError("completed wallet should not be fetched again")
+                return super().fetch_closed_positions_page(**kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            completed_payload = {
+                "wallet": completed_wallet,
+                "leaderboard_entry": {
+                    "rank": 1,
+                    "proxyWallet": completed_wallet,
+                    "userName": "already-done",
+                    "pnl": 200,
+                    "vol": 2000,
+                },
+                "screening": {"wallet": completed_wallet, "selected": True},
+                "selection_record": {
+                    "wallet": completed_wallet,
+                    "selected": True,
+                    "labels": ["Existing"],
+                },
+                "labels": [{"display_name": "Existing"}],
+                "label_evaluations": [{"key": "high_frequency_region", "matched": True}],
+                "metrics": {
+                    "leaderboard_pnl": 200,
+                    "leaderboard_volume": 2000,
+                    "wallet_win_rate": 0.7,
+                    "weather_notional_ratio": 0.8,
+                    "closed_position_win_rate": 0.7,
+                    "closed_position_sample_win_rate": 0.7,
+                    "closed_profit_multiple": 2.0,
+                    "trades_per_active_day": 4,
+                    "trade_count": 4,
+                },
+                "finder_ai": {
+                    "briefGeneration": {"status": "cached"},
+                    "providerMeta": {"generatedAt": "2026-05-05T00:00:00+00:00"},
+                    "matched": True,
+                },
+            }
+            completed_wallet_path = wallets_dir / f"{completed_wallet}.json"
+            completed_wallet_path.write_text(json.dumps(completed_payload), encoding="utf-8")
+            (output_dir / "selected_wallets.json").write_text(
+                json.dumps([completed_payload["selection_record"]]),
+                encoding="utf-8",
+            )
+            (output_dir / "screening_records.json").write_text(
+                json.dumps([completed_payload["screening"]]),
+                encoding="utf-8",
+            )
+            import_rows_path = output_dir / "smart_wallet_import_rows.json"
+            import_rows_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "wallet": {"normalizedAddress": completed_wallet},
+                            "userName": "already-done",
+                            "metrics": {"pnl": 200, "volume": 2000},
+                        },
+                        {
+                            "wallet": {"normalizedAddress": next_wallet},
+                            "userName": "resume-next",
+                            "metrics": {"pnl": 180, "volume": 1800},
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (output_dir / "weather_events.json").write_text("[]", encoding="utf-8")
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
+            config["runtime"] = {
+                "resume_existing_output": True,
+                "smart_wallet_library_source_path": str(import_rows_path),
+                "smart_wallet_library_process_all": True,
+            }
+            config["wallet_filter"]["target_count"] = 2
+            config["wallet_filter"]["min_pnl"] = 0
+            config["wallet_filter"]["min_volume"] = 0
+            config["wallet_filter"]["min_traded_count"] = 0
+            config["wallet_filter"]["min_weather_trade_ratio"] = 0
+
+            original_read_json_file = analysis.read_json_file
+            completed_wallet_reads: list[Path] = []
+
+            def read_json_file_spy(path: Path) -> dict[str, Any]:
+                if path == completed_wallet_path:
+                    completed_wallet_reads.append(path)
+                return original_read_json_file(path)
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(analysis, "PolymarketClient", ResumeImportClient))
+                stack.enter_context(patch.object(analysis, "read_json_file", side_effect=read_json_file_spy))
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+        self.assertEqual(result["selected_wallet_count"], 2)
+        self.assertEqual(len(completed_wallet_reads), 1)
+
+    def test_resume_index_backfills_completed_detail_missing_from_batch_flush(self) -> None:
+        wallet_existing = "0xaaa0000000000000000000000000000000000000"
+        wallet_missing = "0xbbb0000000000000000000000000000000000000"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "out"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            for wallet in (wallet_existing, wallet_missing):
+                (wallets_dir / f"{wallet}.json").write_text(
+                    json.dumps(
+                        {
+                            "wallet": wallet,
+                            "screening": {"wallet": wallet, "selected": True},
+                            "selection_record": {"wallet": wallet, "selected": True},
+                            "metrics": {"leaderboard_pnl": 100, "trade_count": 3},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            (output_dir / "selected_wallets.json").write_text(
+                json.dumps([{"wallet": wallet_existing, "selected": True}]),
+                encoding="utf-8",
+            )
+            (output_dir / "screening_records.json").write_text(
+                json.dumps([{"wallet": wallet_existing, "selected": True}]),
+                encoding="utf-8",
+            )
+
+            selected_wallets, screening_records, completed_wallets = (
+                analysis.load_existing_wallet_resume_index(output_dir)
+            )
+
+        self.assertEqual(completed_wallets, {wallet_existing, wallet_missing})
+        self.assertEqual(
+            [row["wallet"] for row in selected_wallets],
+            [wallet_existing, wallet_missing],
+        )
+        self.assertEqual(
+            [row["wallet"] for row in screening_records],
+            [wallet_existing, wallet_missing],
+        )
 
     def test_run_pipeline_prefilters_wallets_seen_in_history_registry_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2202,6 +3692,51 @@ class PipelineSmokeTests(unittest.TestCase):
             leaderboard_calls = [
                 kwargs
                 for name, kwargs in ExtendingLeaderboardClient.instances[0].calls
+                if name == "leaderboard"
+            ]
+            self.assertEqual(
+                [(call["offset"], call["limit"]) for call in leaderboard_calls],
+                [(0, 1), (1, 1)],
+            )
+
+    def test_run_pipeline_stops_auto_extend_when_next_page_repeats_wallets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "out"
+            config = disable_light_first_gate(small_config(temp_path / "cache"))
+            config["wallet_filter"]["target_count"] = 2
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(analysis, "PolymarketClient", FakePolymarketClient))
+                if not hasattr(analysis, "progress"):
+                    stack.enter_context(
+                        patch.object(
+                            analysis,
+                            "progress",
+                            lambda *_args, **_kwargs: None,
+                            create=True,
+                        )
+                    )
+                if not hasattr(analysis, "build_analysis_summary"):
+                    stack.enter_context(
+                        patch.object(
+                            analysis,
+                            "build_analysis_summary",
+                            fallback_analysis_summary,
+                            create=True,
+                        )
+                    )
+                result = analysis.run_pipeline(config=config, output_dir=output_dir)
+
+            self.assertEqual(result["selected_wallet_count"], 1)
+            leaderboard_rows = json.loads(
+                (output_dir / "leaderboard.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(leaderboard_rows), 1)
+
+            leaderboard_calls = [
+                kwargs
+                for name, kwargs in FakePolymarketClient.instances[-1].calls
                 if name == "leaderboard"
             ]
             self.assertEqual(

@@ -267,11 +267,15 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
   };
 
   const updateAnalysisMode = (value: AnalysisMode) => {
-    setForm((current) => ({
-      ...current,
-      analysis_mode: value,
-      activity_filter_mode: value === 'relay_analysis' ? 'all' : current.activity_filter_mode,
-    }));
+    setForm((current) => {
+      const modeDefaults = config ? configToForm(config, value) : {...fallbackForm, analysis_mode: value};
+      return {
+        ...modeDefaults,
+        name: current.name,
+        analysis_mode: value,
+        activity_filter_mode: value === 'relay_analysis' ? 'all' : modeDefaults.activity_filter_mode,
+      };
+    });
     setSmartWalletImport({});
     setRelayImportPreview(undefined);
     setMessage(undefined);
@@ -681,37 +685,63 @@ export function NewTask({onRunCreated}: {onRunCreated: (runId: string) => void})
   );
 }
 
-function configToForm(config: Record<string, any>): FormState {
+function configToForm(config: Record<string, any>, analysisMode: AnalysisMode = 'standard'): FormState {
+  const resolvedConfig = configForAnalysisMode(config, analysisMode);
   return {
     ...fallbackForm,
-    analysis_mode: 'standard',
-    activity_filter_mode: String(config.wallet_filter?.activity_filter_mode || fallbackForm.activity_filter_mode)
+    analysis_mode: analysisMode,
+    activity_filter_mode: String(resolvedConfig.wallet_filter?.activity_filter_mode || fallbackForm.activity_filter_mode)
       .trim()
       .toLowerCase() as ActivityFilterMode,
-    target_count: Number(config.wallet_filter?.target_count ?? fallbackForm.target_count),
-    min_pnl: Number(config.wallet_filter?.min_pnl ?? fallbackForm.min_pnl),
-    max_pnl: Number(config.wallet_filter?.max_pnl ?? fallbackForm.max_pnl),
-    min_volume: Number(config.wallet_filter?.min_volume ?? fallbackForm.min_volume),
-    max_volume: Number(config.wallet_filter?.max_volume ?? fallbackForm.max_volume),
-    min_traded_count: Number(config.wallet_filter?.min_traded_count ?? fallbackForm.min_traded_count),
-    max_traded_count: Number(config.wallet_filter?.max_traded_count ?? fallbackForm.max_traded_count),
+    target_count: Number(resolvedConfig.wallet_filter?.target_count ?? fallbackForm.target_count),
+    min_pnl: Number(resolvedConfig.wallet_filter?.min_pnl ?? fallbackForm.min_pnl),
+    max_pnl: Number(resolvedConfig.wallet_filter?.max_pnl ?? fallbackForm.max_pnl),
+    min_volume: Number(resolvedConfig.wallet_filter?.min_volume ?? fallbackForm.min_volume),
+    max_volume: Number(resolvedConfig.wallet_filter?.max_volume ?? fallbackForm.max_volume),
+    min_traded_count: Number(resolvedConfig.wallet_filter?.min_traded_count ?? fallbackForm.min_traded_count),
+    max_traded_count: Number(resolvedConfig.wallet_filter?.max_traded_count ?? fallbackForm.max_traded_count),
     min_weather_trade_ratio: Number(
-      config.wallet_filter?.min_weather_trade_ratio ?? fallbackForm.min_weather_trade_ratio,
+      resolvedConfig.wallet_filter?.min_weather_trade_ratio ?? fallbackForm.min_weather_trade_ratio,
     ),
-    fetch_limit: Number(config.leaderboard?.fetch_limit ?? fallbackForm.fetch_limit),
-    max_weather_events: Number(config.weather?.max_events ?? fallbackForm.max_weather_events),
-    max_wallet_offset: Number(config.pagination?.max_offset ?? fallbackForm.max_wallet_offset),
-    concurrent_wallets: Number(config.analysis?.concurrent_wallets ?? fallbackForm.concurrent_wallets),
-    use_cache: Boolean(config.api?.use_cache ?? fallbackForm.use_cache),
-    enable_chain_validation: Boolean(config.chain_validation?.enabled ?? fallbackForm.enable_chain_validation),
-    verbose: Boolean(config.runtime?.verbose ?? config.logging?.verbose ?? fallbackForm.verbose),
+    fetch_limit: Number(resolvedConfig.leaderboard?.fetch_limit ?? fallbackForm.fetch_limit),
+    max_weather_events: Number(resolvedConfig.weather?.max_events ?? fallbackForm.max_weather_events),
+    max_wallet_offset: Number(resolvedConfig.pagination?.max_offset ?? fallbackForm.max_wallet_offset),
+    concurrent_wallets: Number(resolvedConfig.analysis?.concurrent_wallets ?? fallbackForm.concurrent_wallets),
+    use_cache: Boolean(resolvedConfig.api?.use_cache ?? fallbackForm.use_cache),
+    enable_chain_validation: Boolean(resolvedConfig.chain_validation?.enabled ?? fallbackForm.enable_chain_validation),
+    verbose: Boolean(resolvedConfig.runtime?.verbose ?? resolvedConfig.logging?.verbose ?? fallbackForm.verbose),
   };
+}
+
+function configForAnalysisMode(config: Record<string, any>, analysisMode: AnalysisMode): Record<string, any> {
+  if (analysisMode === 'standard') {
+    return config;
+  }
+  const modeConfig = config.analysis_modes?.[analysisMode];
+  if (!isRecord(modeConfig)) {
+    return config;
+  }
+  return mergeConfigSections(config, modeConfig);
+}
+
+function mergeConfigSections(base: Record<string, any>, patch: Record<string, any>): Record<string, any> {
+  const merged = structuredClone(base);
+  for (const [key, value] of Object.entries(patch)) {
+    if (isRecord(value) && isRecord(merged[key])) {
+      merged[key] = mergeConfigSections(merged[key], value);
+    } else {
+      merged[key] = structuredClone(value);
+    }
+  }
+  return merged;
 }
 
 function applyFormToConfig(config: Record<string, any>, form: FormState): Record<string, any> {
   const next = structuredClone(config);
-  next.wallet_filter = {
-    ...(next.wallet_filter || {}),
+  const target = configTargetForForm(next, form.analysis_mode);
+
+  target.wallet_filter = {
+    ...(target.wallet_filter || {}),
     target_count: form.target_count,
     min_pnl: form.min_pnl,
     max_pnl: form.max_pnl,
@@ -722,14 +752,23 @@ function applyFormToConfig(config: Record<string, any>, form: FormState): Record
     min_weather_trade_ratio: form.min_weather_trade_ratio,
     activity_filter_mode: form.activity_filter_mode,
   };
-  next.leaderboard = {...(next.leaderboard || {}), fetch_limit: form.fetch_limit};
-  next.weather = {...(next.weather || {}), max_events: form.max_weather_events};
-  next.pagination = {...(next.pagination || {}), max_offset: form.max_wallet_offset};
-  next.analysis = {...(next.analysis || {}), concurrent_wallets: form.concurrent_wallets};
-  next.api = {...(next.api || {}), use_cache: form.use_cache};
-  next.chain_validation = {...(next.chain_validation || {}), enabled: form.enable_chain_validation};
-  next.runtime = {...(next.runtime || {}), verbose: form.verbose};
+  target.leaderboard = {...(target.leaderboard || {}), fetch_limit: form.fetch_limit};
+  target.weather = {...(target.weather || {}), max_events: form.max_weather_events};
+  target.pagination = {...(target.pagination || {}), max_offset: form.max_wallet_offset};
+  target.analysis = {...(target.analysis || {}), concurrent_wallets: form.concurrent_wallets};
+  target.api = {...(target.api || {}), use_cache: form.use_cache};
+  target.chain_validation = {...(target.chain_validation || {}), enabled: form.enable_chain_validation};
+  target.runtime = {...(target.runtime || {}), verbose: form.verbose};
   return next;
+}
+
+function configTargetForForm(config: Record<string, any>, analysisMode: AnalysisMode): Record<string, any> {
+  if (analysisMode !== 'weekly_high_profit') {
+    return config;
+  }
+  config.analysis_modes = {...(config.analysis_modes || {})};
+  config.analysis_modes.weekly_high_profit = {...(config.analysis_modes.weekly_high_profit || {})};
+  return config.analysis_modes.weekly_high_profit;
 }
 
 function isPositiveNumber(value: number): boolean {

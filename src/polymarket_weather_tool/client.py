@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -11,6 +12,7 @@ import time
 import urllib.parse
 import urllib.request
 import zipfile
+from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -21,6 +23,7 @@ from urllib.error import HTTPError, URLError
 
 DATA_API_BASE = "https://data-api.polymarket.com"
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+REQUEST_RETRYABLE_EXCEPTIONS = (HTTPError, URLError, TimeoutError, http.client.IncompleteRead)
 LEADERBOARD_TIME_PERIOD_ALIASES = {
     "1D": "DAY",
 }
@@ -42,6 +45,15 @@ class RequestFailureSummary:
     status_code: int | None
     reason: str
     retry_after_seconds: float | None = None
+
+
+@dataclass
+class RequestBucketState:
+    condition: threading.Condition
+    last_request_started: float = 0.0
+    cooldown_until: float = 0.0
+    retryable_failure_streak: int = 0
+    cooldown_generation: int = 0
 
 
 class PolymarketRequestError(RuntimeError):
@@ -111,10 +123,11 @@ class PolymarketClient:
         self.cache_ttl = int(api_config.get("cache_ttl_seconds", 1800))
         self.cache_dir = Path(api_config.get("cache_dir", ".cache/polymarket-weather-tool"))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._request_lock = threading.Lock()
-        self._last_request_started = 0.0
-        self._cooldown_until = 0.0
-        self._retryable_failure_streak = 0
+        self._request_buckets_lock = threading.Lock()
+        self._request_buckets: dict[str, RequestBucketState] = {}
+        self._request_context = threading.local()
+        self._inflight_requests_lock = threading.Lock()
+        self._inflight_requests: dict[str, Future[bytes]] = {}
 
     def fetch_leaderboard_page(
         self,
@@ -393,10 +406,10 @@ class PolymarketClient:
         for attempt in range(retry_limit + 1):
             try:
                 payload = self._request_json(url)
-                self._clear_retryable_failure_state()
+                self._clear_retryable_failure_state(url)
                 self._write_cache(url, payload)
                 return payload
-            except (HTTPError, URLError, TimeoutError) as exc:
+            except REQUEST_RETRYABLE_EXCEPTIONS as exc:
                 last_error = exc
                 last_summary = summarize_request_failure(exc)
                 failures.append(last_summary)
@@ -412,6 +425,7 @@ class PolymarketClient:
                     retry_after_seconds=last_summary.retry_after_seconds,
                 )
                 self._set_retryable_cooldown(
+                    url=url,
                     path=path,
                     params=normalized_params,
                     delay_seconds=retry_sleep_seconds,
@@ -447,9 +461,9 @@ class PolymarketClient:
         for attempt in range(retry_limit + 1):
             try:
                 payload = self._request_json_via_post(url, body=body)
-                self._clear_retryable_failure_state()
+                self._clear_retryable_failure_state(url)
                 return payload
-            except (HTTPError, URLError, TimeoutError) as exc:
+            except REQUEST_RETRYABLE_EXCEPTIONS as exc:
                 last_error = exc
                 last_summary = summarize_request_failure(exc)
                 failures.append(last_summary)
@@ -465,6 +479,7 @@ class PolymarketClient:
                     retry_after_seconds=last_summary.retry_after_seconds,
                 )
                 self._set_retryable_cooldown(
+                    url=url,
                     path=path,
                     params=normalized_params,
                     delay_seconds=retry_sleep_seconds,
@@ -501,9 +516,9 @@ class PolymarketClient:
         for attempt in range(retry_limit + 1):
             try:
                 payload = self._request_bytes(url, accept=accept)
-                self._clear_retryable_failure_state()
+                self._clear_retryable_failure_state(url)
                 return payload
-            except (HTTPError, URLError, TimeoutError) as exc:
+            except REQUEST_RETRYABLE_EXCEPTIONS as exc:
                 last_error = exc
                 last_summary = summarize_request_failure(exc)
                 failures.append(last_summary)
@@ -519,6 +534,7 @@ class PolymarketClient:
                     retry_after_seconds=last_summary.retry_after_seconds,
                 )
                 self._set_retryable_cooldown(
+                    url=url,
                     path=path,
                     params=normalized_params,
                     delay_seconds=retry_sleep_seconds,
@@ -551,15 +567,54 @@ class PolymarketClient:
         accept: str,
         data: bytes | None = None,
     ) -> bytes:
-        with self._request_lock:
-            now = time.monotonic()
-            wait_for = max(
-                self.request_delay - (now - self._last_request_started),
-                self._cooldown_until - now,
-            )
-            if wait_for > 0:
-                time.sleep(wait_for)
-            self._last_request_started = time.monotonic()
+        inflight_key = self._request_inflight_key(url=url, accept=accept, data=data)
+        with self._inflight_requests_lock:
+            inflight = self._inflight_requests.get(inflight_key)
+            if inflight is None:
+                inflight = Future()
+                self._inflight_requests[inflight_key] = inflight
+                is_leader = True
+            else:
+                is_leader = False
+        if not is_leader:
+            return inflight.result()
+
+        try:
+            payload = self._perform_request_bytes(url, accept=accept, data=data)
+        except Exception as exc:
+            inflight.set_exception(exc)
+            raise
+        else:
+            inflight.set_result(payload)
+            return payload
+        finally:
+            with self._inflight_requests_lock:
+                if self._inflight_requests.get(inflight_key) is inflight:
+                    del self._inflight_requests[inflight_key]
+
+    def _perform_request_bytes(
+        self,
+        url: str,
+        *,
+        accept: str,
+        data: bytes | None = None,
+    ) -> bytes:
+        bucket_key = self._request_bucket_key(url)
+        bucket = self._request_bucket_for_key(bucket_key)
+        with bucket.condition:
+            while True:
+                now = time.monotonic()
+                earliest_start = max(
+                    bucket.last_request_started + self.request_delay,
+                    bucket.cooldown_until,
+                )
+                wait_for = max(0.0, earliest_start - now)
+                if wait_for > 0:
+                    bucket.condition.wait(timeout=wait_for)
+                    continue
+                bucket.last_request_started = now
+                self._record_request_start_generation(bucket_key, bucket.cooldown_generation)
+                break
 
         request = urllib.request.Request(
             url,
@@ -572,6 +627,11 @@ class PolymarketClient:
         )
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             return response.read()
+
+    @staticmethod
+    def _request_inflight_key(*, url: str, accept: str, data: bytes | None) -> str:
+        data_digest = hashlib.sha256(data or b"").hexdigest()
+        return f"{accept}\n{url}\n{data_digest}"
 
     def _resolve_retry_limit(self, *, path: str, params: dict[str, Any]) -> int:
         offset = self._param_int(params, "offset")
@@ -603,16 +663,18 @@ class PolymarketClient:
     def _set_retryable_cooldown(
         self,
         *,
+        url: str,
         path: str,
         params: dict[str, Any],
         delay_seconds: float,
     ) -> None:
         if delay_seconds <= 0 and self.cooldown_after_retryable_failure <= 0:
             return
-        with self._request_lock:
-            self._retryable_failure_streak += 1
+        bucket = self._request_bucket(url)
+        with bucket.condition:
+            bucket.retryable_failure_streak += 1
             cooldown_seconds = self.cooldown_after_retryable_failure * (
-                2 ** max(0, self._retryable_failure_streak - 1)
+                2 ** max(0, bucket.retryable_failure_streak - 1)
             )
             if self._param_int(params, "offset") == 0 and path in COLLECTION_ENDPOINT_PATHS:
                 cooldown_seconds *= self.page_zero_backoff_multiplier
@@ -620,18 +682,73 @@ class PolymarketClient:
                 self.cooldown_max_seconds,
                 max(delay_seconds, cooldown_seconds),
             )
-            self._cooldown_until = max(self._cooldown_until, time.monotonic() + cooldown_seconds)
+            bucket.cooldown_until = max(bucket.cooldown_until, time.monotonic() + cooldown_seconds)
+            bucket.cooldown_generation += 1
+            bucket.condition.notify_all()
 
-    def _clear_retryable_failure_state(self) -> None:
-        with self._request_lock:
-            self._retryable_failure_streak = 0
-            self._cooldown_until = 0.0
+    def _clear_retryable_failure_state(self, url: str) -> None:
+        bucket_key = self._request_bucket_key(url)
+        request_generation = self._pop_request_start_generation(bucket_key)
+        bucket = self._request_bucket_for_key(bucket_key)
+        with bucket.condition:
+            if (
+                request_generation is not None
+                and bucket.cooldown_generation != request_generation
+            ):
+                return
+            bucket.retryable_failure_streak = 0
+            bucket.cooldown_until = 0.0
+            bucket.condition.notify_all()
+
+    def _request_bucket(self, url: str) -> RequestBucketState:
+        bucket_key = self._request_bucket_key(url)
+        return self._request_bucket_for_key(bucket_key)
+
+    def _request_bucket_for_key(self, bucket_key: str) -> RequestBucketState:
+        with self._request_buckets_lock:
+            bucket = self._request_buckets.get(bucket_key)
+            if bucket is None:
+                bucket = RequestBucketState(condition=threading.Condition())
+                self._request_buckets[bucket_key] = bucket
+            return bucket
+
+    def _record_request_start_generation(self, bucket_key: str, generation: int) -> None:
+        generations = getattr(self._request_context, "bucket_generations", None)
+        if not isinstance(generations, dict):
+            generations = {}
+            self._request_context.bucket_generations = generations
+        generations[bucket_key] = int(generation)
+
+    def _pop_request_start_generation(self, bucket_key: str) -> int | None:
+        generations = getattr(self._request_context, "bucket_generations", None)
+        if not isinstance(generations, dict):
+            return None
+        generation = generations.pop(bucket_key, None)
+        return int(generation) if generation is not None else None
+
+    @staticmethod
+    def _request_bucket_key(url: str) -> str:
+        parsed = urllib.parse.urlparse(url)
+        scheme = (parsed.scheme or "https").lower()
+        netloc = (parsed.netloc or "").lower()
+        path = (parsed.path or "/").rstrip("/").lower() or "/"
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        module = str((query.get("module") or [""])[0]).strip().lower()
+        action = str((query.get("action") or [""])[0]).strip().lower()
+        if module or action:
+            suffix_parts = [path]
+            if module:
+                suffix_parts.append(f"module={module}")
+            if action:
+                suffix_parts.append(f"action={action}")
+            path = "#".join(suffix_parts)
+        return f"{scheme}://{netloc}{path}"
 
     @staticmethod
     def _is_retryable_exception(exc: Exception) -> bool:
         if isinstance(exc, HTTPError):
             return exc.code == 429 or exc.code >= 500
-        return isinstance(exc, (URLError, TimeoutError))
+        return isinstance(exc, (URLError, TimeoutError, http.client.IncompleteRead))
 
     @staticmethod
     def _param_int(params: dict[str, Any], key: str, default: int = 0) -> int:
@@ -769,6 +886,12 @@ def summarize_request_failure(exc: Exception) -> RequestFailureSummary:
             error_type="timeout",
             status_code=None,
             reason=normalize_request_reason(str(exc) or "timed out"),
+        )
+    if isinstance(exc, http.client.IncompleteRead):
+        return RequestFailureSummary(
+            error_type="incomplete_read",
+            status_code=None,
+            reason=normalize_request_reason(str(exc) or "incomplete response body"),
         )
     if isinstance(exc, URLError):
         return RequestFailureSummary(

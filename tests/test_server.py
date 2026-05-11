@@ -33,6 +33,7 @@ from polymarket_weather_tool.server import (
     prepare_import_wallet_source_for_run,
     public_run_record,
     read_run_summary,
+    relay_import_row_from_wallet_row,
     run_prunable_paths,
     resume_existing_run,
     selected_wallet_rows,
@@ -492,6 +493,54 @@ class ServerConfigTests(unittest.TestCase):
             1,
         )
 
+    def test_read_run_summary_keeps_generated_finder_ai_eligible_without_gate_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "completed-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            wallet = "0xaaa0000000000000000000000000000000000000"
+            (output_dir / "analysis_summary.json").write_text(
+                json.dumps(
+                    {
+                        "wallets_selected": 1,
+                        "finder_ai_summary": {
+                            "selected_wallets": 1,
+                            "finder_ai_present": 1,
+                            "eligible": 1,
+                            "generated": 1,
+                            "cached": 0,
+                            "fallback": 0,
+                            "failed": 0,
+                            "skipped": 0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (wallets_dir / f"{wallet}.json").write_text(
+                json.dumps(
+                    {
+                        "wallet": wallet,
+                        "selection_record": {"wallet": wallet, "selected": True},
+                        "finder_ai": {
+                            "briefGeneration": {
+                                "status": "generated",
+                                "reason": "generated",
+                                "gate": {},
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = read_run_summary(output_dir)
+
+        diagnostics = summary["diagnostics"]
+        self.assertEqual(diagnostics["finder_ai"]["eligible"], 1)
+        self.assertEqual(diagnostics["finder_ai"]["generated"], 1)
+        self.assertEqual(diagnostics["finder_ai"]["status_counts"]["generated"], 1)
+
     def test_read_run_summary_uses_lightweight_core_counts_for_large_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "partial-run"
@@ -874,6 +923,93 @@ class ServerConfigTests(unittest.TestCase):
         self.assertEqual(record["selected_wallet_count"], 1)
         self.assertEqual(record["wallet_detail_count"], 2)
 
+    def test_public_run_record_exposes_active_hydration_deepseek_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifacts_root = root / "artifacts"
+            output_dir = artifacts_root / "active-run"
+            output_dir.mkdir(parents=True)
+            wallet = "0xaaa0000000000000000000000000000000000000"
+            second_wallet = "0xbbb0000000000000000000000000000000000000"
+            (output_dir / "resolved_config.json").write_text("{}", encoding="utf-8")
+            (output_dir / "selected_wallets.json").write_text("[]", encoding="utf-8")
+            (output_dir / "progress.log").write_text(
+                "\n".join(
+                    [
+                        "2026-05-08T17:40:00+00:00\tAnalyzing wallets 1-2 of 2",
+                        f"2026-05-08T17:40:10+00:00\tFull hydration started: {wallet}",
+                        f"2026-05-08T17:42:15+00:00\tFull hydration completed: {wallet} (22 trades)",
+                        f"2026-05-08T17:42:20+00:00\tFull hydration skipped: {second_wallet} (no core label)",
+                        f"2026-05-08T17:42:25+00:00\tDeepSeek started: {wallet}",
+                        f"2026-05-08T17:43:05+00:00\tDeepSeek generated: {wallet}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            record = public_run_record(
+                ServerState(root=root, artifacts_root=artifacts_root),
+                "active-run",
+                include_files=False,
+            )
+
+        diagnostics = record["active_diagnostics"]
+        self.assertEqual(diagnostics["current_stage"]["key"], "deepseek_generated")
+        self.assertEqual(diagnostics["current_stage"]["wallet"], wallet)
+        self.assertEqual(diagnostics["hydration"]["started"], 1)
+        self.assertEqual(diagnostics["hydration"]["completed"], 1)
+        self.assertEqual(diagnostics["hydration"]["skipped"], 1)
+        self.assertEqual(diagnostics["hydration"]["last_status"], "skipped")
+        self.assertEqual(diagnostics["deepseek"]["started"], 1)
+        self.assertEqual(diagnostics["deepseek"]["finished"], 1)
+        self.assertEqual(diagnostics["deepseek"]["generated"], 1)
+        self.assertEqual(diagnostics["deepseek"]["last_status"], "generated")
+        self.assertEqual(diagnostics["recent_slow_steps"][0]["kind"], "hydration")
+        self.assertEqual(diagnostics["recent_slow_steps"][0]["duration_seconds"], 125)
+
+    def test_public_run_record_parses_wallet_trace_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifacts_root = root / "artifacts"
+            output_dir = artifacts_root / "trace-run"
+            output_dir.mkdir(parents=True)
+            wallet = "0xaaa0000000000000000000000000000000000000"
+            trace = {
+                "wallet": wallet,
+                "stage": "screening",
+                "status": "selected",
+                "total_seconds": 182.4,
+                "probe_seconds": 0.4,
+                "snapshot_seconds": 178.2,
+                "analyze_seconds": 3.1,
+                "snapshot_scope": "screening_window",
+                "activity_pages": 14,
+                "activity_records": 6342,
+                "activity_mode": "partition_recovery",
+                "trades_mode": "activity_projection",
+            }
+            (output_dir / "resolved_config.json").write_text("{}", encoding="utf-8")
+            (output_dir / "selected_wallets.json").write_text("[]", encoding="utf-8")
+            (output_dir / "progress.log").write_text(
+                "2026-05-08T17:40:00+00:00\tWallet trace: "
+                + json.dumps(trace, separators=(",", ":")),
+                encoding="utf-8",
+            )
+
+            record = public_run_record(
+                ServerState(root=root, artifacts_root=artifacts_root),
+                "trace-run",
+                include_files=False,
+            )
+
+        diagnostics = record["active_diagnostics"]
+        self.assertEqual(diagnostics["current_stage"]["key"], "wallet_trace_selected")
+        self.assertEqual(diagnostics["current_stage"]["wallet"], wallet)
+        self.assertEqual(diagnostics["recent_slow_steps"][0]["kind"], "wallet_trace")
+        self.assertEqual(diagnostics["recent_slow_steps"][0]["label"], "Wallet screening")
+        self.assertEqual(diagnostics["recent_slow_steps"][0]["duration_seconds"], 182)
+        self.assertIn("activity=14p/6342r", diagnostics["recent_slow_steps"][0]["detail"])
+
     def test_public_run_record_tolerates_non_array_selected_wallets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -920,6 +1056,104 @@ class ServerConfigTests(unittest.TestCase):
 
         self.assertEqual(summary["wallets_selected"], 1)
         self.assertEqual(summary["wallets_core_labeled"], 0)
+        self.assertEqual(summary["falcon_display"]["win_rate_source"], "falcon_wallet_360")
+        self.assertEqual(summary["falcon_display"]["win_rate_window_label"], "Falcon 15d")
+
+    def test_read_run_summary_uses_resolved_falcon_window_label(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "artifacts" / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            wallet = "0xaaa0000000000000000000000000000000000000"
+            (output_dir / "selected_wallets.json").write_text(
+                json.dumps([{"wallet": wallet, "selected": True}]),
+                encoding="utf-8",
+            )
+            (output_dir / "resolved_config.json").write_text(
+                json.dumps({"falcon": {"win_rate_window_days": 7}}),
+                encoding="utf-8",
+            )
+            (wallets_dir / f"{wallet}.json").write_text(
+                json.dumps({"wallet": wallet}),
+                encoding="utf-8",
+            )
+
+            summary = read_run_summary(output_dir)
+
+        self.assertEqual(summary["falcon_display"]["win_rate_source"], "falcon_wallet_360")
+        self.assertEqual(summary["falcon_display"]["win_rate_window_label"], "Falcon 7d")
+
+    def test_selected_wallet_rows_preserve_original_metrics_when_falcon_overlay_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "artifacts" / "partial-run"
+            wallets_dir = output_dir / "wallets"
+            wallets_dir.mkdir(parents=True)
+            wallet = "0xaaa0000000000000000000000000000000000000"
+            (output_dir / "selected_wallets.json").write_text(
+                json.dumps([{"wallet": wallet, "selected": True, "pnl": 12.5, "wallet_win_rate": 0.71}]),
+                encoding="utf-8",
+            )
+            (output_dir / "resolved_config.json").write_text("{}", encoding="utf-8")
+            (wallets_dir / f"{wallet}.json").write_text(
+                json.dumps(
+                    {
+                        "wallet": wallet,
+                        "selection_record": {"wallet": wallet, "selected": True, "pnl": 12.5, "wallet_win_rate": 0.71},
+                        "metrics": {"leaderboard_pnl": 12.5, "wallet_win_rate": 0.71, "closed_position_win_rate": 0.44},
+                        "profile": {"closed_position_pnl": {"win_rate": 0.44}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "polymarket_weather_tool.server.falcon_display_metrics_for_wallet",
+                return_value={
+                    "total_pnl": 345.6,
+                    "total_roi": 0.84,
+                    "win_rate": 0.58,
+                    "win_rate_source": "falcon_wallet_360",
+                    "win_rate_window_label": "Falcon 15d",
+                    "metric_source": "falcon",
+                },
+            ):
+                rows = selected_wallet_rows(output_dir)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["pnl"], 12.5)
+        self.assertEqual(rows[0]["wallet_win_rate"], 0.71)
+        self.assertEqual(rows[0]["display_pnl"], 345.6)
+        self.assertEqual(rows[0]["display_win_rate"], 0.58)
+        self.assertEqual(rows[0]["falcon_total_pnl"], 345.6)
+        self.assertEqual(rows[0]["falcon_win_rate"], 0.58)
+
+    def test_relay_import_payload_includes_falcon_display_metrics(self) -> None:
+        row = {
+            "wallet": "0xaaa0000000000000000000000000000000000000",
+            "user_name": "wallet-a",
+            "display_pnl": 345.6,
+            "display_roi": 0.84,
+            "display_win_rate": 0.58,
+            "display_win_rate_source": "falcon_wallet_360",
+            "display_win_rate_window_label": "Falcon 15d",
+            "falcon_total_pnl": 345.6,
+            "falcon_total_roi": 0.84,
+            "falcon_win_rate": 0.58,
+            "falcon_win_rate_source": "falcon_wallet_360",
+            "falcon_win_rate_window_label": "Falcon 15d",
+            "labels": ["Weather specialist"],
+        }
+
+        payload = relay_import_row_from_wallet_row(row)
+
+        self.assertIsNotNone(payload)
+        metrics = payload["metrics"]
+        self.assertEqual(metrics["display_pnl"], 345.6)
+        self.assertEqual(metrics["display_roi"], 0.84)
+        self.assertEqual(metrics["display_win_rate"], 0.58)
+        self.assertEqual(metrics["falcon_total_pnl"], 345.6)
+        self.assertEqual(metrics["falcon_total_roi"], 0.84)
+        self.assertEqual(metrics["falcon_win_rate"], 0.58)
 
     def test_paginated_selected_wallet_rows_reads_only_requested_detail_page(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

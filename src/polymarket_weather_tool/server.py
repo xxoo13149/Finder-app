@@ -33,6 +33,7 @@ from .config import (
     load_config,
 )
 from .env import load_project_env
+from .falcon_client import falcon_display_metrics_for_wallet, falcon_settings, falcon_win_rate_window_label
 from .finder_ai_contract import compact_finder_ai_result
 from .history_registry import create_history_registry, list_wallet_history_records
 from .labels import CORE_LABEL_KEYS
@@ -80,6 +81,10 @@ SELECTED_WALLET_SNAPSHOT_LOCK = threading.Lock()
 FULL_DETAIL_LIST_WALLET_LIMIT = 50
 DIAGNOSTIC_DETAIL_WALLET_LIMIT = 20
 DIAGNOSTIC_DETAIL_TOTAL_BYTES_LIMIT = 25 * 1024 * 1024
+
+
+def current_utc_date_string() -> str:
+    return datetime.now(UTC).date().isoformat()
 
 
 @dataclass
@@ -375,6 +380,8 @@ def build_finder_ai_summary_from_rows(rows: list[dict[str, Any]]) -> dict[str, A
             summary["failed"] += 1
         else:
             summary["skipped"] += 1
+        if status in {"generated", "cached", "fallback", "failed"} or row_core_label_keys(row):
+            summary["eligible"] += 1
         if row.get("ai_needs_review"):
             summary["needs_review"] += 1
         if row.get("ai_has_conflict"):
@@ -428,6 +435,16 @@ def wallet_rank_summary(row: Mapping[str, Any]) -> dict[str, Any]:
             "user_name": row.get("user_name") or row.get("userName") or row.get("username"),
             "x_username": row.get("x_username") or row.get("xUsername"),
             "pnl": row.get("pnl"),
+            "display_pnl": row.get("display_pnl"),
+            "display_roi": row.get("display_roi"),
+            "display_win_rate": row.get("display_win_rate"),
+            "display_win_rate_source": row.get("display_win_rate_source"),
+            "display_win_rate_window_label": row.get("display_win_rate_window_label"),
+            "falcon_total_pnl": row.get("falcon_total_pnl"),
+            "falcon_total_roi": row.get("falcon_total_roi"),
+            "falcon_win_rate": row.get("falcon_win_rate"),
+            "falcon_win_rate_source": row.get("falcon_win_rate_source"),
+            "falcon_win_rate_window_label": row.get("falcon_win_rate_window_label"),
             "closed_profit_multiple": row.get("closed_profit_multiple"),
             "closed_position_win_rate": row.get("closed_position_win_rate"),
             "closed_position_sample_win_rate": row.get("closed_position_sample_win_rate"),
@@ -462,10 +479,9 @@ def build_lightweight_summary(output_dir: Path) -> dict[str, Any]:
         if str(label).strip()
     )
     average_keys = (
+        "falcon_total_roi",
+        "falcon_win_rate",
         "weather_notional_ratio",
-        "wallet_win_rate",
-        "closed_position_win_rate",
-        "closed_position_sample_win_rate",
         "closed_profit_multiple",
         "trades_per_active_day",
     )
@@ -481,7 +497,13 @@ def build_lightweight_summary(output_dir: Path) -> dict[str, Any]:
     ]
     top_by_pnl = sorted(
         pnl_rows,
-        key=lambda row: numeric_value(row.get("pnl")) if numeric_value(row.get("pnl")) is not None else float("-inf"),
+        key=lambda row: (
+            numeric_value(row.get("display_pnl"))
+            if numeric_value(row.get("display_pnl")) is not None
+            else numeric_value(row.get("falcon_total_pnl"))
+            if numeric_value(row.get("falcon_total_pnl")) is not None
+            else float("-inf")
+        ),
         reverse=True,
     )[:10]
     top_by_frequency = sorted(
@@ -785,16 +807,16 @@ def run_finder_ai_diagnostics(details: list[dict[str, Any]], fallback_summary: M
             if isinstance(brief_generation.get("gate"), Mapping)
             else {}
         )
-        if gate.get("eligible"):
-            eligible += 1
         status = text_value(brief_generation.get("status")) or "missing_status"
+        if gate.get("eligible") or status in {"generated", "cached", "fallback"}:
+            eligible += 1
         reason = text_value(brief_generation.get("reason"))
         status_counts[status] += 1
         if reason:
             reason_counts[reason] += 1
     if present:
         summary["finder_ai_present"] = present
-        summary["eligible"] = eligible
+        summary["eligible"] = max(int(summary.get("eligible") or 0), eligible)
     summary["status_counts"] = dict(status_counts)
     summary["reason_counts"] = dict(reason_counts)
     return summary
@@ -877,6 +899,14 @@ def read_run_summary(output_dir: Path) -> dict[str, Any]:
     for key in ("label_counts", "averages", "top_wallets_by_pnl", "top_wallets_by_frequency", "finder_ai_summary"):
         if key not in summary:
             summary[key] = lightweight[key]
+    config = read_run_resolved_config(output_dir)
+    falcon_label = falcon_win_rate_window_label(falcon_settings(config))
+    summary["falcon_display"] = {
+        "total_pnl_source": "falcon_lifetime",
+        "total_roi_source": "falcon_lifetime",
+        "win_rate_source": "falcon_wallet_360",
+        "win_rate_window_label": falcon_label,
+    }
     summary["diagnostics"] = run_pipeline_diagnostics(output_dir, summary)
     return summary
 
@@ -1035,6 +1065,16 @@ def relay_import_row_from_wallet_row(row: Mapping[str, Any]) -> dict[str, Any] |
             key: value
             for key, value in {
                 "pnl": row.get("pnl"),
+                "display_pnl": row.get("display_pnl"),
+                "display_roi": row.get("display_roi"),
+                "display_win_rate": row.get("display_win_rate"),
+                "display_win_rate_source": row.get("display_win_rate_source"),
+                "display_win_rate_window_label": row.get("display_win_rate_window_label"),
+                "falcon_total_pnl": row.get("falcon_total_pnl"),
+                "falcon_total_roi": row.get("falcon_total_roi"),
+                "falcon_win_rate": row.get("falcon_win_rate"),
+                "falcon_win_rate_source": row.get("falcon_win_rate_source"),
+                "falcon_win_rate_window_label": row.get("falcon_win_rate_window_label"),
                 "volume": row.get("volume"),
                 "trade_count": row.get("trade_count"),
                 "weather_trade_ratio": row.get("weather_trade_ratio"),
@@ -1085,6 +1125,16 @@ def relay_import_row_from_leaderboard_entry(entry: Mapping[str, Any]) -> dict[st
             key: value
             for key, value in {
                 "pnl": entry.get("pnl"),
+                "display_pnl": entry.get("display_pnl"),
+                "display_roi": entry.get("display_roi"),
+                "display_win_rate": entry.get("display_win_rate"),
+                "display_win_rate_source": entry.get("display_win_rate_source"),
+                "display_win_rate_window_label": entry.get("display_win_rate_window_label"),
+                "falcon_total_pnl": entry.get("falcon_total_pnl"),
+                "falcon_total_roi": entry.get("falcon_total_roi"),
+                "falcon_win_rate": entry.get("falcon_win_rate"),
+                "falcon_win_rate_source": entry.get("falcon_win_rate_source"),
+                "falcon_win_rate_window_label": entry.get("falcon_win_rate_window_label"),
                 "volume": entry.get("vol") or entry.get("volume"),
             }.items()
             if value not in (None, "")
@@ -1192,6 +1242,16 @@ def relay_candidate_import_row(
         metrics = dict(row.get("metrics")) if isinstance(row.get("metrics"), Mapping) else {}
         for key in (
             "pnl",
+            "display_pnl",
+            "display_roi",
+            "display_win_rate",
+            "display_win_rate_source",
+            "display_win_rate_window_label",
+            "falcon_total_pnl",
+            "falcon_total_roi",
+            "falcon_win_rate",
+            "falcon_win_rate_source",
+            "falcon_win_rate_window_label",
             "volume",
             "trade_count",
             "weather_trade_ratio",
@@ -1519,12 +1579,112 @@ def first_mapping(*values: Any) -> Mapping[str, Any]:
     return {}
 
 
+def apply_falcon_metrics_to_row(row: Mapping[str, Any], falcon_metrics: Mapping[str, Any] | None) -> dict[str, Any]:
+    payload = dict(row)
+    if not isinstance(falcon_metrics, Mapping):
+        return payload
+
+    falcon_total_pnl = falcon_metrics.get("total_pnl")
+    falcon_total_roi = falcon_metrics.get("total_roi")
+    falcon_win_rate = falcon_metrics.get("win_rate")
+    falcon_win_rate_source = text_value(falcon_metrics.get("win_rate_source"))
+    falcon_win_rate_window_label = text_value(falcon_metrics.get("win_rate_window_label"))
+
+    payload["falcon_total_pnl"] = falcon_total_pnl
+    payload["falcon_total_roi"] = falcon_total_roi
+    payload["falcon_win_rate"] = falcon_win_rate
+    payload["falcon_win_rate_source"] = falcon_win_rate_source
+    payload["falcon_win_rate_window_label"] = falcon_win_rate_window_label
+    payload["falcon_metric_source"] = text_value(falcon_metrics.get("metric_source")) or "falcon"
+
+    if falcon_total_pnl is not None:
+        payload["display_pnl"] = falcon_total_pnl
+    if falcon_win_rate is not None:
+        payload["display_win_rate"] = falcon_win_rate
+        payload["display_win_rate_source"] = falcon_win_rate_source or "falcon"
+        payload["display_win_rate_window_label"] = falcon_win_rate_window_label
+    if falcon_total_roi is not None:
+        payload["display_roi"] = falcon_total_roi
+    return payload
+
+
+def apply_falcon_metrics_to_wallet_detail(
+    output_dir: Path,
+    detail: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = dict(detail)
+    wallet = finder_wallet_address(first_mapping(payload.get("selection_record")), payload)
+    if not wallet:
+        wallet = text_value(payload.get("wallet")).lower()
+    if not normalized_wallet_file_name(wallet):
+        return payload
+
+    config = read_run_resolved_config(output_dir)
+    falcon_metrics = falcon_display_metrics_for_wallet(
+        wallet,
+        config=config,
+        now_date=current_utc_date_string(),
+    )
+    if not falcon_metrics:
+        return payload
+
+    metrics = first_mapping(payload.get("metrics"))
+    next_metrics = dict(metrics)
+    next_metrics["falcon_metrics"] = dict(falcon_metrics)
+    next_metrics["falcon_total_pnl"] = falcon_metrics.get("total_pnl")
+    next_metrics["falcon_total_roi"] = falcon_metrics.get("total_roi")
+    next_metrics["falcon_win_rate"] = falcon_metrics.get("win_rate")
+    next_metrics["falcon_win_rate_source"] = falcon_metrics.get("win_rate_source")
+    next_metrics["falcon_win_rate_window_label"] = falcon_metrics.get("win_rate_window_label")
+    next_metrics["falcon_metric_source"] = falcon_metrics.get("metric_source") or "falcon"
+    if falcon_metrics.get("total_pnl") is not None:
+        next_metrics["display_pnl"] = falcon_metrics.get("total_pnl")
+    if falcon_metrics.get("total_roi") is not None:
+        next_metrics["display_roi"] = falcon_metrics.get("total_roi")
+    if falcon_metrics.get("win_rate") is not None:
+        next_metrics["display_win_rate"] = falcon_metrics.get("win_rate")
+        next_metrics["display_win_rate_source"] = falcon_metrics.get("win_rate_source") or "falcon"
+        next_metrics["display_win_rate_window_label"] = falcon_metrics.get("win_rate_window_label") or ""
+    payload["metrics"] = next_metrics
+
+    selection = first_mapping(payload.get("selection_record"))
+    if selection:
+        payload["selection_record"] = apply_falcon_metrics_to_row(selection, falcon_metrics)
+    screening = first_mapping(payload.get("screening"))
+    if screening:
+        payload["screening"] = apply_falcon_metrics_to_row(screening, falcon_metrics)
+
+    profile = first_mapping(payload.get("profile"))
+    if profile:
+        next_profile = dict(profile)
+        closed_position_pnl = (
+            dict(next_profile.get("closed_position_pnl"))
+            if isinstance(next_profile.get("closed_position_pnl"), Mapping)
+            else {}
+        )
+        if falcon_metrics.get("win_rate") is not None:
+            next_profile["falcon_win_rate"] = falcon_metrics.get("win_rate")
+            next_profile["falcon_win_rate_source"] = falcon_metrics.get("win_rate_source")
+            next_profile["falcon_win_rate_window_label"] = falcon_metrics.get("win_rate_window_label")
+        if falcon_metrics.get("total_pnl") is not None:
+            next_profile["falcon_total_pnl"] = falcon_metrics.get("total_pnl")
+        if falcon_metrics.get("total_roi") is not None:
+            next_profile["falcon_total_roi"] = falcon_metrics.get("total_roi")
+        if closed_position_pnl:
+            next_profile["closed_position_pnl"] = closed_position_pnl
+        payload["profile"] = next_profile
+
+    payload["falcon_metrics"] = dict(falcon_metrics)
+    return payload
+
+
 def wallet_row_from_detail(detail: Mapping[str, Any], fallback_wallet: str = "") -> dict[str, Any]:
     selection = first_mapping(detail.get("selection_record"))
     screening = first_mapping(detail.get("screening"))
     leaderboard_entry = first_mapping(detail.get("leaderboard_entry"))
     profile = first_mapping(detail.get("profile"))
     metrics = first_mapping(detail.get("metrics"))
+    falcon_metrics = first_mapping(detail.get("falcon_metrics"), metrics.get("falcon_metrics"))
 
     wallet = finder_wallet_address(selection, detail) or finder_wallet_address(screening, detail)
     if not wallet:
@@ -1557,9 +1717,20 @@ def wallet_row_from_detail(detail: Mapping[str, Any], fallback_wallet: str = "")
             or text_value(profile.get("xUsername"))
             or text_value(profile.get("x_username"))
         )
+    row = apply_falcon_metrics_to_row(row, falcon_metrics)
     for key, source_key in (
         ("pnl", "pnl"),
         ("pnl", "leaderboard_pnl"),
+        ("display_pnl", "display_pnl"),
+        ("display_roi", "display_roi"),
+        ("display_win_rate", "display_win_rate"),
+        ("display_win_rate_source", "display_win_rate_source"),
+        ("display_win_rate_window_label", "display_win_rate_window_label"),
+        ("falcon_total_pnl", "falcon_total_pnl"),
+        ("falcon_total_roi", "falcon_total_roi"),
+        ("falcon_win_rate", "falcon_win_rate"),
+        ("falcon_win_rate_source", "falcon_win_rate_source"),
+        ("falcon_win_rate_window_label", "falcon_win_rate_window_label"),
         ("volume", "volume"),
         ("trade_count", "trade_count"),
         ("weather_trade_ratio", "weather_trade_ratio"),
@@ -1615,6 +1786,7 @@ def wallet_detail_rows(output_dir: Path) -> list[dict[str, Any]]:
         detail = read_json_file(wallet_path, {}) or {}
         if not isinstance(detail, Mapping):
             continue
+        detail = apply_falcon_metrics_to_wallet_detail(output_dir, detail)
         row = wallet_row_from_detail(detail, fallback_wallet=fallback_wallet)
         if normalized_wallet_file_name(str(row.get("wallet") or "")):
             rows.append(row)
@@ -1641,6 +1813,7 @@ def wallet_detail_row_for_wallet(output_dir: Path, wallet: str) -> dict[str, Any
     detail = read_json_file(wallet_path, {}) or {}
     if not isinstance(detail, Mapping):
         return None
+    detail = apply_falcon_metrics_to_wallet_detail(output_dir, detail)
     row = wallet_row_from_detail(detail, fallback_wallet=normalized)
     if not normalized_wallet_file_name(str(row.get("wallet") or "")):
         return None
@@ -1693,6 +1866,11 @@ def compact_wallet_row_for_index(row: Mapping[str, Any], *, source: str | None =
             "closed_position_sample_win_rate",
             "wallet_win_rate",
             "wallet_win_rate_source",
+            "falcon_total_pnl",
+            "falcon_total_roi",
+            "falcon_win_rate",
+            "falcon_win_rate_source",
+            "falcon_win_rate_window_label",
             "closed_profit_multiple",
             "median_trade_notional",
             "trades_per_active_day",
@@ -2467,6 +2645,22 @@ def progress_view(rows: list[dict[str, str]], status: str) -> dict[str, Any]:
             end = int(match.group(2))
             total = max(1, int(match.group(3)))
             percent = min(96, 42 + round((end / total) * 52))
+    elif "Full hydration started" in message:
+        percent = 72
+    elif "Full hydration" in message:
+        percent = 78
+    elif "DeepSeek started" in message:
+        percent = 86
+    elif message.startswith("DeepSeek "):
+        percent = 90
+    elif message.startswith("Wallet trace:"):
+        percent = wallet_trace_progress_percent(message)
+    elif "Wallet completed" in message:
+        match = re.search(r"Wallet completed (\d+) of (\d+)", message)
+        if match:
+            completed = int(match.group(1))
+            total = max(1, int(match.group(2)))
+            percent = min(98, 55 + round((completed / total) * 40))
     return {"phase": phase, "percent": percent}
 
 
@@ -2508,6 +2702,371 @@ def parse_progress_counts(rows: list[dict[str, str]]) -> dict[str, int]:
     return counts
 
 
+def parse_progress_datetime(value: str | None) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def progress_duration_seconds(started_at: datetime | None, finished_at: datetime | None) -> int | None:
+    if started_at is None or finished_at is None:
+        return None
+    return max(0, int(round((finished_at - started_at).total_seconds())))
+
+
+def parse_wallet_trace_message(message: str) -> dict[str, Any] | None:
+    trace = re.match(r"^Wallet trace:\s+(\{.*\})\s*$", message)
+    if not trace:
+        return None
+    try:
+        payload = json.loads(trace.group(1))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def wallet_trace_progress_percent(message: str) -> int:
+    payload = parse_wallet_trace_message(message) or {}
+    stage = str(payload.get("stage") or "").strip().lower()
+    if stage == "deepseek":
+        return 90
+    if stage == "full_hydration":
+        return 78
+    return 58
+
+
+def wallet_trace_label(stage: str) -> str:
+    labels = {
+        "trade_probe": "Trade probe",
+        "screening": "Wallet screening",
+        "full_hydration": "Full hydration",
+        "deepseek": "DeepSeek",
+    }
+    return labels.get(stage, stage.replace("_", " ").strip().title() or "Wallet trace")
+
+
+def wallet_trace_duration_seconds(payload: Mapping[str, Any]) -> int | None:
+    raw = payload.get("duration_seconds")
+    if raw is None:
+        raw = payload.get("total_seconds")
+    try:
+        return max(0, int(round(float(raw))))
+    except (TypeError, ValueError):
+        return None
+
+
+def wallet_trace_detail(payload: Mapping[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("status", "snapshot_scope", "activity_mode", "trades_mode"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            parts.append(f"{key}={value}")
+    activity_pages = payload.get("activity_pages")
+    activity_records = payload.get("activity_records")
+    if activity_pages not in (None, "") or activity_records not in (None, ""):
+        parts.append(f"activity={activity_pages or 0}p/{activity_records or 0}r")
+    for key in ("probe_seconds", "snapshot_seconds", "fetch_seconds", "analyze_seconds"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            parts.append(f"{key}={value}s")
+    error_type = payload.get("error_type")
+    if error_type:
+        parts.append(f"error={error_type}")
+    return " · ".join(parts)
+
+
+def progress_wallet_step_event(row: Mapping[str, str]) -> dict[str, Any] | None:
+    message = str(row.get("message") or "")
+    trace_payload = parse_wallet_trace_message(message)
+    if trace_payload is not None:
+        stage = str(trace_payload.get("stage") or "wallet_trace").strip().lower()
+        return {
+            "kind": "wallet_trace",
+            "label": wallet_trace_label(stage),
+            "status": str(trace_payload.get("status") or "completed"),
+            "wallet": str(trace_payload.get("wallet") or ""),
+            "detail": wallet_trace_detail(trace_payload),
+            "duration_seconds": wallet_trace_duration_seconds(trace_payload),
+            "time": row.get("time") or "",
+            "message": message,
+        }
+
+    hydration = re.match(r"^Full hydration (started|completed|skipped|failed):\s+(\S+)(?:\s+\((.*?)\))?$", message)
+    if hydration:
+        return {
+            "kind": "hydration",
+            "label": "Full hydration",
+            "status": hydration.group(1),
+            "wallet": hydration.group(2),
+            "detail": hydration.group(3) or "",
+            "time": row.get("time") or "",
+            "message": message,
+        }
+
+    deepseek_started = re.match(r"^DeepSeek started:\s+(\S+)$", message)
+    if deepseek_started:
+        return {
+            "kind": "deepseek",
+            "label": "DeepSeek",
+            "status": "started",
+            "wallet": deepseek_started.group(1),
+            "detail": "",
+            "time": row.get("time") or "",
+            "message": message,
+        }
+
+    deepseek = re.match(r"^DeepSeek ([^:]+):\s+(\S+)(?:\s+\((.*?)\))?$", message)
+    if deepseek:
+        status = deepseek.group(1).strip().lower().replace(" ", "_").replace("-", "_")
+        if status == "started":
+            return None
+        return {
+            "kind": "deepseek",
+            "label": "DeepSeek",
+            "status": status,
+            "wallet": deepseek.group(2),
+            "detail": deepseek.group(3) or "",
+            "time": row.get("time") or "",
+            "message": message,
+        }
+    return None
+
+
+def progress_stage_label(event: Mapping[str, Any]) -> str:
+    kind = str(event.get("kind") or "")
+    status = str(event.get("status") or "")
+    if kind == "hydration":
+        labels = {
+            "started": "Full hydration 正在补全历史",
+            "completed": "Full hydration 已完成",
+            "skipped": "Full hydration 已跳过",
+            "failed": "Full hydration 失败",
+        }
+        return labels.get(status, "Full hydration")
+    if kind == "deepseek":
+        labels = {
+            "started": "DeepSeek 正在生成摘要",
+            "generated": "DeepSeek 已生成摘要",
+            "cached": "DeepSeek 命中缓存",
+            "fallback": "DeepSeek 已使用本地兜底",
+            "needs_review": "DeepSeek 需要复核",
+            "failed": "DeepSeek 失败",
+            "completed": "DeepSeek 已完成",
+        }
+        return labels.get(status, f"DeepSeek {status}")
+    if kind == "wallet_trace":
+        return str(event.get("label") or "Wallet trace")
+    return str(event.get("message") or "")
+
+
+def progress_current_stage(rows: list[dict[str, str]]) -> dict[str, Any]:
+    if not rows:
+        return {"key": "queued", "label": "等待任务启动", "message": "", "time": ""}
+
+    latest = rows[-1]
+    event = progress_wallet_step_event(latest)
+    if event:
+        status = str(event.get("status") or "")
+        kind = str(event.get("kind") or "")
+        return {
+            "key": f"{kind}_{status}",
+            "label": progress_stage_label(event),
+            "status": status,
+            "wallet": event.get("wallet") or "",
+            "detail": event.get("detail") or "",
+            "message": event.get("message") or "",
+            "time": event.get("time") or "",
+        }
+
+    message = str(latest.get("message") or "")
+    label = message
+    key = "progress"
+    batch = re.search(r"Analyzing wallets (\d+)-(\d+) of (\d+)", message)
+    if "Fetching leaderboard" in message:
+        key = "fetching_leaderboard"
+        label = "正在抓取排行榜"
+    elif "Fetched" in message and "leaderboard" in message:
+        key = "leaderboard_fetched"
+        label = message
+    elif "Fetching weather events" in message:
+        key = "fetching_weather_events"
+        label = "正在抓取天气事件"
+    elif "Indexed" in message and "weather" in message:
+        key = "weather_events_indexed"
+        label = message
+    elif batch:
+        key = "analyzing_wallets"
+        label = f"正在分析钱包 {batch.group(1)}-{batch.group(2)} / {batch.group(3)}"
+    elif "Wallet completed" in message:
+        key = "wallet_completed"
+        label = message
+    elif "Wallet failed" in message:
+        key = "wallet_failed"
+        label = message
+    return {
+        "key": key,
+        "label": label,
+        "message": message,
+        "time": latest.get("time") or "",
+    }
+
+
+def progress_step_diagnostics(rows: list[dict[str, str]]) -> dict[str, Any]:
+    hydration_counts: Counter[str] = Counter()
+    deepseek_counts: Counter[str] = Counter()
+    status_counts: dict[str, Counter[str]] = {
+        "hydration": Counter(),
+        "deepseek": Counter(),
+    }
+    open_steps: dict[tuple[str, str], dict[str, Any]] = {}
+    slow_steps: list[dict[str, Any]] = []
+    last_events: dict[str, dict[str, Any]] = {}
+    terminal_statuses = {
+        "hydration": {"completed", "skipped", "failed"},
+        "deepseek": {"generated", "cached", "fallback", "needs_review", "failed", "completed"},
+    }
+
+    for row in rows:
+        event = progress_wallet_step_event(row)
+        if not event:
+            continue
+        kind = str(event.get("kind") or "")
+        status = str(event.get("status") or "")
+        wallet = str(event.get("wallet") or "")
+        when = parse_progress_datetime(str(event.get("time") or ""))
+        last_events[kind] = dict(event)
+
+        if kind == "wallet_trace":
+            duration = event.get("duration_seconds")
+            if duration is not None:
+                slow_steps.append(
+                    {
+                        "kind": kind,
+                        "label": str(event.get("label") or "Wallet trace"),
+                        "wallet": wallet,
+                        "status": status,
+                        "detail": event.get("detail") or "",
+                        "started_at": "",
+                        "finished_at": event.get("time") or "",
+                        "duration_seconds": duration,
+                    }
+                )
+            continue
+
+        if kind == "hydration":
+            hydration_counts[status] += 1
+            status_counts[kind][status] += 1
+        elif kind == "deepseek":
+            deepseek_counts[status] += 1
+            if status != "started":
+                status_counts[kind][status] += 1
+
+        step_key = (kind, wallet)
+        if status == "started":
+            open_steps[step_key] = {
+                "kind": kind,
+                "label": str(event.get("label") or kind),
+                "wallet": wallet,
+                "started_at": event.get("time") or "",
+                "started": when,
+            }
+            continue
+
+        if status in terminal_statuses.get(kind, set()):
+            started = open_steps.pop(step_key, None)
+            if started and when is not None:
+                duration = progress_duration_seconds(started.get("started"), when)
+                if duration is not None:
+                    slow_steps.append(
+                        {
+                            "kind": kind,
+                            "label": started.get("label") or str(event.get("label") or kind),
+                            "wallet": wallet,
+                            "status": status,
+                            "detail": event.get("detail") or "",
+                            "started_at": started.get("started_at") or "",
+                            "finished_at": event.get("time") or "",
+                            "duration_seconds": duration,
+                        }
+                    )
+
+    now = datetime.now(UTC)
+    for step in open_steps.values():
+        duration = progress_duration_seconds(step.get("started"), now)
+        if duration is None:
+            continue
+        slow_steps.append(
+            {
+                "kind": step.get("kind") or "",
+                "label": step.get("label") or "",
+                "wallet": step.get("wallet") or "",
+                "status": "in_progress",
+                "started_at": step.get("started_at") or "",
+                "finished_at": None,
+                "duration_seconds": duration,
+            }
+        )
+
+    def last_payload(kind: str) -> dict[str, str]:
+        event = last_events.get(kind) or {}
+        return {
+            "last_status": str(event.get("status") or ""),
+            "last_wallet": str(event.get("wallet") or ""),
+            "last_at": str(event.get("time") or ""),
+            "last_detail": str(event.get("detail") or ""),
+        }
+
+    hydration_open = sum(1 for kind, _wallet in open_steps if kind == "hydration")
+    deepseek_open = sum(1 for kind, _wallet in open_steps if kind == "deepseek")
+    deepseek_finished = sum(
+        deepseek_counts.get(status, 0)
+        for status in terminal_statuses["deepseek"]
+    )
+    slow_steps = sorted(
+        slow_steps,
+        key=lambda item: (
+            int(item.get("duration_seconds") or 0),
+            str(item.get("finished_at") or item.get("started_at") or ""),
+        ),
+        reverse=True,
+    )[:5]
+
+    return {
+        "hydration": {
+            "started": hydration_counts.get("started", 0),
+            "completed": hydration_counts.get("completed", 0),
+            "skipped": hydration_counts.get("skipped", 0),
+            "failed": hydration_counts.get("failed", 0),
+            "in_progress": hydration_open,
+            "status_counts": dict(status_counts["hydration"]),
+            **last_payload("hydration"),
+        },
+        "deepseek": {
+            "started": deepseek_counts.get("started", 0),
+            "finished": deepseek_finished,
+            "generated": deepseek_counts.get("generated", 0),
+            "cached": deepseek_counts.get("cached", 0),
+            "fallback": deepseek_counts.get("fallback", 0),
+            "needs_review": deepseek_counts.get("needs_review", 0),
+            "failed": deepseek_counts.get("failed", 0),
+            "completed": deepseek_counts.get("completed", 0),
+            "in_progress": deepseek_open,
+            "status_counts": dict(status_counts["deepseek"]),
+            **last_payload("deepseek"),
+        },
+        "recent_slow_steps": slow_steps,
+    }
+
+
 def active_relay_source_summary(output_dir: Path) -> dict[str, Any]:
     summary = read_json_file(output_dir / RELAY_IMPORT_SUMMARY_FILENAME, {}) or {}
     if not isinstance(summary, Mapping):
@@ -2534,10 +3093,12 @@ def active_relay_source_summary(output_dir: Path) -> dict[str, Any]:
 
 def active_run_diagnostics(output_dir: Path, progress_rows: list[dict[str, str]]) -> dict[str, Any]:
     counts = parse_progress_counts(progress_rows)
+    step_diagnostics = progress_step_diagnostics(progress_rows)
     details = wallet_detail_count(output_dir)
     selected = selected_wallet_count(output_dir)
     diagnostics = {
         "progress_counts": counts,
+        "current_stage": progress_current_stage(progress_rows),
         "wallets": {
             "selected_snapshot": selected,
             "detail_files": details,
@@ -2552,6 +3113,9 @@ def active_run_diagnostics(output_dir: Path, progress_rows: list[dict[str, str]]
         "weather_events": {
             "indexed_from_log": counts["indexed_weather_events"],
         },
+        "hydration": step_diagnostics["hydration"],
+        "deepseek": step_diagnostics["deepseek"],
+        "recent_slow_steps": step_diagnostics["recent_slow_steps"],
     }
     relay_summary = active_relay_source_summary(output_dir)
     if relay_summary:
@@ -3922,6 +4486,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             if payload is None:
                 self.send_error_json(HTTPStatus.NOT_FOUND, "wallet not found")
                 return
+            if isinstance(payload, Mapping):
+                payload = apply_falcon_metrics_to_wallet_detail(output_dir, payload)
             self.send_json(payload)
             return
         if parts[1:] == ["report"]:

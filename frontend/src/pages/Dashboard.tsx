@@ -22,6 +22,7 @@ import {
   shortAddress,
   statusLabel,
   statusTone,
+  walletDisplayPnl,
 } from '../lib/api';
 
 export function Dashboard({
@@ -118,16 +119,21 @@ export function Dashboard({
     () =>
       [...previewWallets]
         .filter(hasFinderAiPreview)
-        .sort((left, right) => Number(right.pnl || 0) - Number(left.pnl || 0))
+        .sort((left, right) => Number(walletDisplayPnl(right) || 0) - Number(walletDisplayPnl(left) || 0))
         .slice(0, 10)
         .map(toFinderAiPreviewItem),
     [previewWallets],
   );
+  const falconAverageWinRate = averages.falcon_win_rate;
   const stats = [
     {title: '排行榜记录', value: formatNumber(summary?.leaderboard_rows_fetched), trend: '最近运行'},
     {title: '已筛选钱包', value: formatNumber(summary?.wallets_screened), trend: '本次分析'},
     {title: '入选钱包', value: formatNumber(summary?.wallets_selected), trend: `${summary?.errors || 0} 个错误`},
-    {title: '平均正收益率', value: formatPercent(averages.wallet_win_rate ?? averages.closed_position_win_rate), trend: '交易日正收益'},
+    {
+      title: '平均胜率',
+      value: formatPercent(falconAverageWinRate),
+      trend: falconAverageWinRate != null ? summary?.falcon_display?.win_rate_window_label || 'Falcon 标准口径' : 'Falcon 数据缺失',
+    },
   ];
 
   if (loading && !selectedRunId) {
@@ -262,7 +268,7 @@ export function Dashboard({
                           <div className="truncate font-mono text-xs text-slate-500">{shortAddress(wallet.wallet)}</div>
                         </div>
                       </td>
-                      <td className="whitespace-nowrap px-2 py-2.5 text-right text-sm text-slate-600">{formatCurrency(wallet.pnl)}</td>
+                      <td className="whitespace-nowrap px-2 py-2.5 text-right text-sm text-slate-600">{formatCurrency(walletDisplayPnl(wallet))}</td>
                     </tr>
                   ))}
                   {!topWallets.length && (

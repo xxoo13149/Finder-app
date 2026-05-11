@@ -18,6 +18,8 @@ import {
   runDisplayName,
   shortAddress,
   syncSmartProImport,
+  walletDisplayPnl,
+  walletDisplayWinRate,
 } from '../lib/api';
 import {cn} from '../lib/utils';
 
@@ -303,11 +305,11 @@ export function WalletList({
                         {aiBriefShort && <div className="mt-1 max-w-[320px] truncate text-xs text-slate-500">{aiBriefShort}</div>}
                       </div>
                     </Cell>
-                    <Cell align="right">{formatCurrency(wallet.pnl)}</Cell>
+                    <Cell align="right">{formatCurrency(walletDisplayPnl(wallet))}</Cell>
                     <Cell align="right">{formatCurrency(wallet.volume)}</Cell>
                     <Cell align="right">{formatNumber(wallet.trade_count)}</Cell>
                     <Cell align="right">{formatPercent(wallet.weather_notional_ratio)}</Cell>
-                    <Cell align="right">{formatPercent(wallet.wallet_win_rate ?? wallet.closed_position_win_rate)}</Cell>
+                    <Cell align="right">{formatPercent(walletDisplayWinRate(wallet))}</Cell>
                     <Cell>{wallet.main_region || wallet.dominant_region || '-'}</Cell>
                     <Cell align="right">{formatMultiple(wallet.highest_burst ?? wallet.max_region_daily_profit_multiple)}</Cell>
                     <Cell>{wallet.recent_evidence_date || wallet.highest_burst_date || '-'}</Cell>

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import http.client
 import io
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.parse
 import zipfile
@@ -17,6 +19,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from polymarket_weather_tool.client import (
     PolymarketClient,
     PolymarketRequestError,
+    RequestBucketState,
     parse_accounting_snapshot_zip,
 )
 
@@ -91,6 +94,31 @@ class ControlledGraphQLClient(PolymarketClient):
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+class RecordingCondition:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.wait_calls: list[float | None] = []
+        self.notify_count = 0
+        self.last_request_started = 0.0
+        self.cooldown_until = 0.0
+        self.retryable_failure_streak = 0
+
+    def __enter__(self) -> "RecordingCondition":
+        self.lock.acquire()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        self.lock.release()
+        return False
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.wait_calls.append(timeout)
+        return True
+
+    def notify_all(self) -> None:
+        self.notify_count += 1
 
 
 def accounting_snapshot_zip() -> bytes:
@@ -184,6 +212,24 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(error.retryable)
         self.assertEqual(error.error_type, "transport_error")
         self.assertIn("connection reset", error.reason)
+
+    def test_get_json_retries_incomplete_read(self) -> None:
+        client = ControlledClient(
+            [http.client.IncompleteRead(b"", 10), [{"id": "ok"}]],
+            api_config={"retry_count": 1},
+        )
+
+        with patch("polymarket_weather_tool.client.time.sleep", return_value=None):
+            payload = client.fetch_leaderboard_page(
+                category="WEATHER",
+                time_period="ALL",
+                order_by="PNL",
+                limit=1,
+                offset=0,
+            )
+
+        self.assertEqual(payload, [{"id": "ok"}])
+        self.assertEqual(len(client.requested_urls), 2)
 
     def test_parse_accounting_snapshot_zip_reads_positions_and_equity_csv(self) -> None:
         payload = parse_accounting_snapshot_zip(accounting_snapshot_zip())
@@ -280,6 +326,285 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(error.retryable)
         self.assertIn("status=503", str(error))
         self.assertIn("https://example.com/subgraph", error.params["endpoint_url"])
+
+    def test_request_bytes_waits_outside_lock(self) -> None:
+        client = PolymarketClient(
+            {
+                "use_cache": False,
+                "request_delay_seconds": 0.2,
+                "retry_backoff_seconds": 0,
+                "retry_jitter_seconds": 0,
+                "cooldown_after_retryable_failure_seconds": 0,
+            }
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        class DummyResponse:
+            def __enter__(self) -> "DummyResponse":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b"[]"
+
+        def fake_urlopen(_request: object, timeout: float) -> DummyResponse:
+            entered.set()
+            release.wait(timeout=1)
+            return DummyResponse()
+
+        with patch("polymarket_weather_tool.client.urllib.request.urlopen", side_effect=fake_urlopen):
+            first = threading.Thread(target=lambda: client.fetch_activity_page(user="0xabc", limit=1, offset=0))
+            first.start()
+            self.assertTrue(entered.wait(timeout=1))
+
+            second_done = threading.Event()
+            second = threading.Thread(
+                target=lambda: (client.fetch_activity_page(user="0xdef", limit=1, offset=0), second_done.set())
+            )
+            second.start()
+            second.join(timeout=0.05)
+
+            self.assertTrue(second.is_alive())
+
+            release.set()
+            first.join(timeout=1)
+            second.join(timeout=1)
+            self.assertTrue(second_done.is_set())
+
+    def test_request_bucket_key_isolated_by_endpoint_family(self) -> None:
+        client = PolymarketClient({"use_cache": False})
+
+        data_bucket = client._request_bucket("https://data-api.polymarket.com/activity?user=0xabc")
+        trades_bucket = client._request_bucket("https://data-api.polymarket.com/trades?user=0xdef")
+        positions_bucket = client._request_bucket("https://data-api.polymarket.com/positions?user=0xghi")
+        gamma_bucket = client._request_bucket("https://gamma-api.polymarket.com/events?limit=10")
+        graph_bucket = client._request_bucket("https://example.com/subgraph")
+
+        self.assertIs(client._request_bucket("https://data-api.polymarket.com/activity?user=0xzzz"), data_bucket)
+        self.assertIsNot(data_bucket, trades_bucket)
+        self.assertIsNot(data_bucket, positions_bucket)
+        self.assertIsNot(trades_bucket, positions_bucket)
+        self.assertIsNot(data_bucket, gamma_bucket)
+        self.assertIsNot(data_bucket, graph_bucket)
+        self.assertIsNot(gamma_bucket, graph_bucket)
+
+    def test_set_retryable_cooldown_and_clear_apply_per_bucket(self) -> None:
+        client = PolymarketClient(
+            {
+                "use_cache": False,
+                "request_delay_seconds": 0,
+                "retry_backoff_seconds": 0,
+                "retry_jitter_seconds": 0,
+                "cooldown_after_retryable_failure_seconds": 2,
+            }
+        )
+
+        data_url = "https://data-api.polymarket.com/activity?user=0xabc&limit=1&offset=0"
+        gamma_url = "https://gamma-api.polymarket.com/events?limit=10"
+
+        client._set_retryable_cooldown(
+            url=data_url,
+            path="/activity",
+            params={"offset": 0},
+            delay_seconds=1.5,
+        )
+        data_bucket = client._request_bucket(data_url)
+        gamma_bucket = client._request_bucket(gamma_url)
+
+        self.assertGreater(data_bucket.cooldown_until, 0.0)
+        self.assertEqual(data_bucket.retryable_failure_streak, 1)
+        self.assertEqual(gamma_bucket.cooldown_until, 0.0)
+        self.assertEqual(gamma_bucket.retryable_failure_streak, 0)
+
+        client._clear_retryable_failure_state(data_url)
+
+        self.assertEqual(data_bucket.cooldown_until, 0.0)
+        self.assertEqual(data_bucket.retryable_failure_streak, 0)
+        self.assertEqual(gamma_bucket.cooldown_until, 0.0)
+        self.assertEqual(gamma_bucket.retryable_failure_streak, 0)
+
+    def test_set_retryable_cooldown_does_not_leak_between_data_api_endpoint_families(self) -> None:
+        client = PolymarketClient(
+            {
+                "use_cache": False,
+                "request_delay_seconds": 0,
+                "retry_backoff_seconds": 0,
+                "retry_jitter_seconds": 0,
+                "cooldown_after_retryable_failure_seconds": 2,
+            }
+        )
+
+        activity_url = "https://data-api.polymarket.com/activity?user=0xabc&limit=1&offset=0"
+        trades_url = "https://data-api.polymarket.com/trades?user=0xabc&limit=1&offset=0"
+
+        client._set_retryable_cooldown(
+            url=activity_url,
+            path="/activity",
+            params={"offset": 0},
+            delay_seconds=1.5,
+        )
+        activity_bucket = client._request_bucket(activity_url)
+        trades_bucket = client._request_bucket(trades_url)
+
+        self.assertGreater(activity_bucket.cooldown_until, 0.0)
+        self.assertEqual(activity_bucket.retryable_failure_streak, 1)
+        self.assertEqual(trades_bucket.cooldown_until, 0.0)
+        self.assertEqual(trades_bucket.retryable_failure_streak, 0)
+
+    def test_success_from_older_inflight_request_does_not_clear_newer_cooldown(self) -> None:
+        client = PolymarketClient(
+            {
+                "use_cache": False,
+                "request_delay_seconds": 0,
+                "retry_backoff_seconds": 0,
+                "retry_jitter_seconds": 0,
+                "cooldown_after_retryable_failure_seconds": 2,
+            }
+        )
+        url = "https://data-api.polymarket.com/activity?user=0xabc&limit=1&offset=0"
+        bucket_key = client._request_bucket_key(url)
+        client._record_request_start_generation(bucket_key, 0)
+
+        client._set_retryable_cooldown(
+            url=url,
+            path="/activity",
+            params={"offset": 0},
+            delay_seconds=1.5,
+        )
+        bucket = client._request_bucket(url)
+        cooldown_until = bucket.cooldown_until
+
+        client._clear_retryable_failure_state(url)
+
+        self.assertEqual(bucket.retryable_failure_streak, 1)
+        self.assertEqual(bucket.cooldown_until, cooldown_until)
+        self.assertEqual(bucket.cooldown_generation, 1)
+
+    def test_request_bucket_key_isolated_by_chain_module_and_action(self) -> None:
+        client = PolymarketClient({"use_cache": False})
+
+        tx_bucket = client._request_bucket(
+            "https://api.etherscan.io/v2/api?module=account&action=txlist&address=0xabc"
+        )
+        logs_bucket = client._request_bucket(
+            "https://api.etherscan.io/v2/api?module=logs&action=getLogs&address=0xabc"
+        )
+        other_tx_bucket = client._request_bucket(
+            "https://api.etherscan.io/v2/api?module=account&action=txlist&address=0xdef"
+        )
+
+        self.assertIs(tx_bucket, other_tx_bucket)
+        self.assertIsNot(tx_bucket, logs_bucket)
+
+    def test_request_bucket_key_isolated_by_graphql_endpoint_path(self) -> None:
+        client = PolymarketClient({"use_cache": False})
+
+        subgraph_bucket = client._request_bucket("https://example.com/subgraph")
+        alt_subgraph_bucket = client._request_bucket("https://example.com/subgraph-v2")
+
+        self.assertIsNot(subgraph_bucket, alt_subgraph_bucket)
+
+    def test_request_bytes_waits_for_bucket_cooldown_before_dispatch(self) -> None:
+        client = PolymarketClient(
+            {
+                "use_cache": False,
+                "request_delay_seconds": 0,
+                "retry_backoff_seconds": 0,
+                "retry_jitter_seconds": 0,
+                "cooldown_after_retryable_failure_seconds": 0,
+            }
+        )
+        url = "https://data-api.polymarket.com/activity?user=0xabc&limit=1&offset=0"
+        bucket = client._request_bucket(url)
+        condition = RecordingCondition()
+        bucket_state = RequestBucketState(condition=condition, cooldown_until=15.0)
+        client._request_buckets[client._request_bucket_key(url)] = bucket_state
+
+        monotonic_values = iter([10.0, 15.0])
+
+        class DummyResponse:
+            def __enter__(self) -> "DummyResponse":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b"[]"
+
+        with patch("polymarket_weather_tool.client.time.monotonic", side_effect=lambda: next(monotonic_values)):
+            with patch(
+                "polymarket_weather_tool.client.urllib.request.urlopen",
+                return_value=DummyResponse(),
+            ):
+                payload = client._request_bytes(url, accept="application/json")
+
+        self.assertEqual(payload, b"[]")
+        self.assertTrue(condition.wait_calls)
+        self.assertAlmostEqual(condition.wait_calls[0] or 0.0, 5.0)
+        self.assertEqual(bucket_state.last_request_started, 15.0)
+
+    def test_request_bytes_coalesces_identical_inflight_requests(self) -> None:
+        client = PolymarketClient(
+            {
+                "use_cache": False,
+                "request_delay_seconds": 0,
+                "retry_backoff_seconds": 0,
+                "retry_jitter_seconds": 0,
+                "cooldown_after_retryable_failure_seconds": 0,
+            }
+        )
+        url = "https://data-api.polymarket.com/activity?user=0xabc&limit=1&offset=0"
+        entered = threading.Event()
+        release = threading.Event()
+        call_count = 0
+        call_count_lock = threading.Lock()
+
+        class DummyResponse:
+            def __enter__(self) -> "DummyResponse":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b"[1]"
+
+        def fake_urlopen(_request: object, timeout: float) -> DummyResponse:
+            nonlocal call_count
+            with call_count_lock:
+                call_count += 1
+            entered.set()
+            release.wait(timeout=1)
+            return DummyResponse()
+
+        results: list[bytes] = []
+        errors: list[BaseException] = []
+
+        def fetch() -> None:
+            try:
+                results.append(client._request_bytes(url, accept="application/json"))
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch("polymarket_weather_tool.client.urllib.request.urlopen", side_effect=fake_urlopen):
+            first = threading.Thread(target=fetch)
+            second = threading.Thread(target=fetch)
+            first.start()
+            self.assertTrue(entered.wait(timeout=1))
+            second.start()
+            second.join(timeout=0.05)
+            self.assertTrue(second.is_alive())
+            release.set()
+            first.join(timeout=1)
+            second.join(timeout=1)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [b"[1]", b"[1]"])
+        self.assertEqual(call_count, 1)
 
 
 if __name__ == "__main__":

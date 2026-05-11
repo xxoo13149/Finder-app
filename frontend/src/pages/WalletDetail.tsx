@@ -14,6 +14,9 @@ import {
   getWalletDetail,
   getWallets,
   shortAddress,
+  walletDisplayPnl,
+  walletDisplayWinRate,
+  walletDisplayWinRateLabel,
 } from '../lib/api';
 import {Sparkles} from 'lucide-react';
 import {Cell as PieSliceCell} from 'recharts';
@@ -166,8 +169,12 @@ export function WalletDetail({
       {error && <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
-        <Stat title="总盈亏" value={formatCurrency(numberValue(selection.pnl ?? metrics.leaderboard_pnl))} up />
-        <Stat title="正收益率" value={formatPercent(numberValue(selection.wallet_win_rate ?? metrics.wallet_win_rate ?? selection.closed_position_win_rate ?? metrics.closed_position_win_rate))} up />
+        <Stat title="总盈亏" value={formatCurrency(numberValue(walletDisplayPnl(selection) ?? numberValue(metrics.display_pnl ?? metrics.falcon_total_pnl)))} up />
+        <Stat
+          title={walletDisplayWinRateLabel(selection) || 'Falcon 胜率'}
+          value={formatPercent(numberValue(walletDisplayWinRate(selection) ?? numberValue(metrics.display_win_rate ?? metrics.falcon_win_rate)))}
+          up
+        />
         <Stat title="中位交易额" value={formatCurrency(numberValue(selection.median_trade_notional ?? metrics.median_trade_notional))} />
         <Stat
           title="天气占比"

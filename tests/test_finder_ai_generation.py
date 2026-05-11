@@ -184,6 +184,16 @@ def build_wallet_result() -> dict[str, Any]:
                 "headline": "Structured headline from summary",
             }
         },
+        "metrics": {
+            "falcon_total_pnl": 345.6,
+            "falcon_total_roi": 0.84,
+            "falcon_win_rate": 0.58,
+            "falcon_win_rate_window_label": "Falcon 15d",
+            "display_pnl": 345.6,
+            "display_roi": 0.84,
+            "display_win_rate": 0.58,
+            "display_win_rate_window_label": "Falcon 15d",
+        },
         "profile": {
             "average_buy_price": {
                 "weighted_average_price": 0.38,
@@ -431,6 +441,15 @@ class FinderAiGenerationTests(unittest.TestCase):
         self.assertEqual(prompt_context["keyMetrics"][0]["key"], "weather_trade_ratio")
         self.assertEqual(prompt_context["gate"]["strongEvidenceCount"], 1)
         self.assertEqual(prompt_context["updatedAt"], payload["layeredInput"]["L0"]["updatedAt"])
+
+    def test_build_prompt_profile_snapshot_keeps_closed_win_rate_and_exposes_falcon_metrics(self) -> None:
+        snapshot = finder_ai_generation.build_prompt_profile_snapshot(build_wallet_result())
+
+        self.assertNotIn("closed_win_rate", snapshot)
+        self.assertEqual(float(snapshot["falcon_win_rate"]), 0.58)
+        self.assertEqual(snapshot["falcon_win_rate_window_label"], "Falcon 15d")
+        self.assertEqual(float(snapshot["falcon_total_pnl"]), 345.6)
+        self.assertEqual(float(snapshot["falcon_total_roi"]), 0.84)
 
     def test_postprocess_preserves_concrete_chinese_provider_brief(self) -> None:
         payload = build_payload()

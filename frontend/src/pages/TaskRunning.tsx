@@ -2,6 +2,7 @@ import {CheckCircle2, FileText, List, PlayCircle, RefreshCcw, XCircle} from 'luc
 import {useCallback, useEffect, useMemo, useState} from 'react';
 import {RunPicker} from '../components/RunPicker';
 import {
+  ActiveSlowStep,
   AnalysisSummary,
   RunDiagnostics,
   RunRecord,
@@ -19,6 +20,9 @@ import {
 } from '../lib/api';
 
 type PipelineError = {wallet?: string; error?: string; type?: string; message?: string};
+type ActiveDiagnostics = NonNullable<RunRecord['active_diagnostics']>;
+type ActiveStepDiagnostics = NonNullable<ActiveDiagnostics['hydration']>;
+type ActiveProgressStage = NonNullable<ActiveDiagnostics['current_stage']>;
 
 export function TaskRunning({
   activeRunId,
@@ -121,6 +125,11 @@ export function TaskRunning({
   const activeDiagnostics = run?.active_diagnostics;
   const activeWallets = activeDiagnostics?.wallets || {};
   const activeRelaySource = activeDiagnostics?.relay_source || {};
+  const activeStage = activeDiagnostics?.current_stage;
+  const activeHydration = activeDiagnostics?.hydration;
+  const activeDeepSeek = activeDiagnostics?.deepseek;
+  const recentSlowSteps = activeDiagnostics?.recent_slow_steps || [];
+  const activeCandidateProgress = activeCandidateProgressCount(activeWallets);
 
   const progress = Math.max(0, Math.min(100, run?.percent ?? 0));
   const logs = run?.progress || [];
@@ -128,6 +137,8 @@ export function TaskRunning({
   const isComplete = run?.status === 'succeeded';
   const isFailed = run?.status === 'failed';
   const canResume = Boolean(run?.resumable || selectedRun?.resumable);
+  const displayPhase = activeStage?.label || run?.phase || '等待 API 状态';
+  const stageHint = formatStageHint(activeStage, recentSlowSteps[0]);
 
   const handleResume = async () => {
     if (!selectedRunId || resuming) return;
@@ -174,12 +185,12 @@ export function TaskRunning({
       },
       {
         label: 'DeepSeek',
-        value: formatIndexedMax((finderAiSummary?.generated || 0) + (finderAiSummary?.cached || 0), finderAiSummary?.eligible),
+        value: formatDeepSeekStat(activeDeepSeek, finderAiSummary),
         tone: 'text-indigo-700',
       },
       {label: '错误数', value: String(errors.length || run?.result?.errors?.length || 0), tone: 'text-red-600'},
     ],
-    [activeSummary, coreLabels, errors.length, finderAiSummary, progress, run, weatherEvents],
+    [activeDeepSeek, activeSummary, coreLabels, errors.length, finderAiSummary, progress, run, weatherEvents],
   );
 
   if (loading && !selectedRunId) {
@@ -223,7 +234,8 @@ export function TaskRunning({
           <div className="mb-2 flex items-end justify-between">
             <div>
               <div className="mb-1 text-sm font-medium text-slate-500">当前阶段</div>
-              <div className="text-lg font-bold text-slate-900">{run?.phase || '等待 API 状态'}</div>
+              <div className="text-lg font-bold text-slate-900">{displayPhase}</div>
+              {stageHint && <div className="mt-1 text-sm text-slate-500">{stageHint}</div>}
             </div>
             <span className={`inline-flex items-center rounded border px-2 py-0.5 text-xs font-medium ${statusTone(statusLabel)}`}>
               {isComplete ? <CheckCircle2 className="mr-1 h-3.5 w-3.5" /> : null}
@@ -270,10 +282,11 @@ export function TaskRunning({
             <DiagnosticPanel
               title="重链路"
               rows={[
-                ['钱包进度', formatActiveCount(activeWallets.completed_from_log ?? run?.selected_wallet_count, activeWallets.current_batch_total)],
+                ['候选进度', formatActiveCount(activeCandidateProgress ?? run?.selected_wallet_count, activeWallets.current_batch_total)],
                 ['详情文件', String(run?.wallet_detail_count ?? activeWallets.detail_files ?? '-')],
                 ['失败钱包', String(activeWallets.failed_from_log ?? errors.length ?? 0)],
-                ['Full hydration', `完成 ${hydration?.completed || 0} / 跳过 ${hydration?.skipped || 0} / 失败 ${hydration?.failed || 0}`],
+                ['Full hydration', formatHydrationProgress(activeHydration, hydration)],
+                ['Hydration 最近', formatStepLast(activeHydration)],
                 ['历史范围', topCountsLabel(hydration?.history_scopes)],
                 ['跳过原因', topCountsLabel(hydration?.reason_counts)],
               ]}
@@ -281,12 +294,16 @@ export function TaskRunning({
             <DiagnosticPanel
               title="DeepSeek"
               rows={[
-                ['生成结果', `生成 ${finderAiSummary?.generated || 0} / 缓存 ${finderAiSummary?.cached || 0} / 候选 ${finderAiSummary?.eligible || 0}`],
+                ['生成结果', formatDeepSeekProgress(activeDeepSeek, finderAiSummary)],
+                ['DeepSeek 最近', formatStepLast(activeDeepSeek)],
+                ['状态分布', topCountsLabel(activeDeepSeek?.status_counts || finderAiSummary?.status_counts, 3)],
                 ['需复核', `${finderAiSummary?.needs_review || 0}`],
                 ['Gate reason', topCountsLabel(finderAiSummary?.reason_counts)],
               ]}
             />
           </div>
+
+          {recentSlowSteps.length > 0 && <RecentSlowSteps steps={recentSlowSteps} />}
 
           {isComplete && (
             <div className="mt-6 flex flex-col gap-3 rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
@@ -407,9 +424,131 @@ function DiagnosticPanel({title, rows}: {title: string; rows: Array<[string, str
   );
 }
 
+function RecentSlowSteps({steps}: {steps: ActiveSlowStep[]}) {
+  const visible = steps.slice(0, 3);
+  return (
+    <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm">
+      <div className="mb-2 font-semibold text-amber-950">最近较慢步骤</div>
+      <div className="grid grid-cols-1 gap-2 lg:grid-cols-3">
+        {visible.map((step, index) => (
+          <div key={`${step.kind}-${step.wallet}-${step.started_at}-${index}`} className="min-w-0">
+            <div className="font-medium text-amber-950">
+              {step.label || step.kind || '步骤'} · {formatDuration(step.duration_seconds)}
+            </div>
+            <div className="mt-0.5 break-words text-amber-800">
+              {formatStepStatus(step.status)} · {shortHash(step.wallet)}
+              {step.detail ? ` · ${step.detail}` : ''}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function formatIndexedMax(value?: number | null, max?: number | null): string {
   const left = value == null ? '-' : String(value);
   return max == null || max === 0 ? left : `${left}/${max}`;
+}
+
+function formatDeepSeekStat(active?: ActiveStepDiagnostics, summary?: AnalysisSummary['finder_ai_summary']): string {
+  const summaryDone = (summary?.generated || 0) + (summary?.cached || 0);
+  const activeDone = (active?.generated || 0) + (active?.cached || 0) + (active?.fallback || 0) + (active?.completed || 0);
+  const done = summaryDone || activeDone;
+  const total = summary?.eligible || active?.started;
+  return formatIndexedMax(done, total);
+}
+
+function formatHydrationProgress(active?: ActiveStepDiagnostics, summary?: RunDiagnostics['hydration']): string {
+  const useActive = hasActiveStepSignals(active);
+  const started = useActive ? finiteNumber(active?.started) : undefined;
+  const inProgress = useActive ? finiteNumber(active?.in_progress) : undefined;
+  const completed = (useActive ? finiteNumber(active?.completed) : undefined) ?? finiteNumber(summary?.completed) ?? 0;
+  const skipped = (useActive ? finiteNumber(active?.skipped) : undefined) ?? finiteNumber(summary?.skipped) ?? 0;
+  const failed = (useActive ? finiteNumber(active?.failed) : undefined) ?? finiteNumber(summary?.failed) ?? 0;
+  const parts = started != null ? [`开始 ${started}`] : [];
+  parts.push(`完成 ${completed}`, `跳过 ${skipped}`, `失败 ${failed}`);
+  if (inProgress) parts.push(`进行中 ${inProgress}`);
+  return parts.join(' / ');
+}
+
+function formatDeepSeekProgress(active?: ActiveStepDiagnostics, summary?: AnalysisSummary['finder_ai_summary']): string {
+  const useActive = hasActiveStepSignals(active);
+  const started = useActive ? finiteNumber(active?.started) : undefined;
+  const generated = (useActive ? finiteNumber(active?.generated) : undefined) ?? finiteNumber(summary?.generated) ?? 0;
+  const cached = (useActive ? finiteNumber(active?.cached) : undefined) ?? finiteNumber(summary?.cached) ?? 0;
+  const fallback = (useActive ? finiteNumber(active?.fallback) : undefined) ?? finiteNumber(summary?.fallback) ?? 0;
+  const failed = (useActive ? finiteNumber(active?.failed) : undefined) ?? finiteNumber(summary?.failed) ?? 0;
+  const parts = started != null ? [`开始 ${started}`] : [];
+  parts.push(`生成 ${generated}`, `缓存 ${cached}`);
+  if (fallback) parts.push(`兜底 ${fallback}`);
+  if (failed) parts.push(`失败 ${failed}`);
+  return parts.join(' / ');
+}
+
+function hasActiveStepSignals(step?: ActiveStepDiagnostics): boolean {
+  if (!step) return false;
+  return [
+    step.started,
+    step.finished,
+    step.completed,
+    step.generated,
+    step.cached,
+    step.fallback,
+    step.needs_review,
+    step.skipped,
+    step.failed,
+    step.in_progress,
+  ].some((value) => typeof value === 'number' && Number.isFinite(value) && value > 0) || Boolean(step.last_status || step.last_wallet);
+}
+
+function formatStepLast(step?: ActiveStepDiagnostics): string {
+  if (!step?.last_status && !step?.last_wallet) return '-';
+  const parts = [formatStepStatus(step.last_status)];
+  if (step.last_wallet) parts.push(shortHash(step.last_wallet));
+  if (step.last_detail) parts.push(step.last_detail);
+  return parts.filter(Boolean).join(' · ');
+}
+
+function formatStageHint(stage?: ActiveProgressStage, slowStep?: ActiveSlowStep): string {
+  const parts: string[] = [];
+  if (stage?.wallet) parts.push(shortHash(stage.wallet));
+  if (stage?.detail) parts.push(stage.detail);
+  if (slowStep?.duration_seconds != null) {
+    parts.push(`最慢 ${slowStep.label || slowStep.kind || '步骤'} ${formatDuration(slowStep.duration_seconds)}`);
+  }
+  return parts.join(' · ');
+}
+
+function formatDuration(seconds?: number): string {
+  if (seconds == null || !Number.isFinite(seconds)) return '-';
+  if (seconds < 60) return `${Math.max(0, Math.round(seconds))}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.round(seconds % 60);
+  if (minutes < 60) return rest ? `${minutes}m ${rest}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const minuteRest = minutes % 60;
+  return minuteRest ? `${hours}h ${minuteRest}m` : `${hours}h`;
+}
+
+function formatStepStatus(status?: string): string {
+  const labels: Record<string, string> = {
+    started: '已开始',
+    in_progress: '进行中',
+    completed: '已完成',
+    generated: '已生成',
+    cached: '命中缓存',
+    fallback: '本地兜底',
+    needs_review: '需复核',
+    skipped: '已跳过',
+    failed: '失败',
+  };
+  return labels[status || ''] || status || '-';
+}
+
+function shortHash(value?: string): string {
+  if (!value) return '-';
+  return value.length <= 14 ? value : `${value.slice(0, 6)}...${value.slice(-4)}`;
 }
 
 function formatActiveCount(value?: number, total?: number): string {
@@ -426,6 +565,19 @@ function formatActiveBatch(wallets?: Record<string, number>): string {
   const total = wallets?.current_batch_total || 0;
   if (!start || !end || !total) return '-';
   return `${start}-${end}/${total}`;
+}
+
+function activeCandidateProgressCount(wallets?: Record<string, number>): number | undefined {
+  const currentBatchStart = finiteNumber(wallets?.current_batch_start);
+  const completedFromLog = finiteNumber(wallets?.completed_from_log);
+  if (currentBatchStart && currentBatchStart > 1) {
+    return Math.max(currentBatchStart - 1, completedFromLog ?? 0);
+  }
+  return completedFromLog;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 function formatWeatherPageCount(weatherEvents?: RunDiagnostics['weather_events']): string {

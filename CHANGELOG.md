@@ -2,6 +2,34 @@
 
 所有重要更新都会记录在这里。版本号遵循接近语义化的方式：主版本表示方向性重构，次版本表示能力升级，补丁版本表示修复与稳定性提升。
 
+## [0.2.1] - 2026-05-12
+
+### Added
+
+- 新增 Falcon 指标链路说明与 `.env.example` 占位：支持 lifetime PnL、ROI 和 `Falcon 15d` win rate 展示。
+- 新增桌面快捷方式校正脚本：可以把桌面入口重新指向当前 `D:\Finder` 版本。
+- 新增发布说明索引页：[docs/release/README.md](docs/release/README.md)。
+
+### Changed
+
+- README 改写为 GitHub 首页友好的中文介绍，突出项目定位、分析流程、功能矩阵、启动方式、环境变量和版本入口。
+- 本周高盈利榜单在前端切换时会加载独立筛选参数，不再沿用普通分析表单值。
+- Falcon Wallet 360 请求参数从 `limit=1` 调整为 `limit=5`，匹配当前 API 校验规则。
+
+### Fixed
+
+- 修复没有 `FALCON_API_TOKEN` 时 UI 只显示本地 `regional_trade_day_cashflow`，导致外部收益和胜率缺失的问题。
+- 修复本周高盈利榜单提交时被普通分析 overrides 覆盖的问题。
+- 修复桌面图标可能指向旧工作目录或旧启动器的问题。
+
+### Validation
+
+- `python -m unittest tests.test_falcon_client`
+- `python -m py_compile src/polymarket_weather_tool/falcon_client.py src/polymarket_weather_tool/server.py`
+- `python -m pytest tests/test_server.py::ServerConfigTests::test_build_config_for_run_applies_weekly_high_profit_mode_before_overrides tests/test_config_overrides.py`
+- `npm run lint`
+- `npm run build`
+
 ## [0.2.0] - 2026-05-09
 
 ### Added

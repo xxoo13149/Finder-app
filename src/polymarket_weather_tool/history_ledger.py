@@ -3,7 +3,7 @@
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -27,6 +27,8 @@ DEFAULT_HISTORY_LEDGER_OPERATION_TABLE = "wallet_operation_ledger"
 DEFAULT_HISTORY_LEDGER_GAP_TABLE = "wallet_history_gaps"
 DEFAULT_HISTORY_LEDGER_TIMEOUT_SECONDS = 20.0
 DEFAULT_HISTORY_LEDGER_QUERY_PAGE_SIZE = 1000
+DEFAULT_HISTORY_LEDGER_MAX_LOCAL_TABLE_BYTES = 128 * 1024 * 1024
+LOCAL_LEDGER_TABLE_TOO_LARGE_REASON = "local_ledger_table_too_large"
 LOCAL_LEDGER_FILENAMES = {
     "trades": "wallet_trade_ledger.json",
     "operations": "wallet_operation_ledger.json",
@@ -130,11 +132,19 @@ def resolve_history_ledger_settings(config: Mapping[str, Any] | None = None) -> 
             True,
         ),
         "replicate_to_cloudflare": coerce_bool(
-            section.get("replicate_to_cloudflare", True),
-            True,
+            section.get("replicate_to_cloudflare", False),
+            False,
         ),
         "compact_gap_payloads_after_batch": coerce_bool(
             section.get("compact_gap_payloads_after_batch", True),
+            True,
+        ),
+        "compact_gap_payloads_after_run": coerce_bool(
+            section.get("compact_gap_payloads_after_run", True),
+            True,
+        ),
+        "persist_screening_snapshots": coerce_bool(
+            section.get("persist_screening_snapshots", True),
             True,
         ),
         "persist_trades": coerce_bool(section.get("persist_trades", True), True),
@@ -143,6 +153,15 @@ def resolve_history_ledger_settings(config: Mapping[str, Any] | None = None) -> 
         "query_page_size": max(
             1,
             int(section.get("query_page_size", DEFAULT_HISTORY_LEDGER_QUERY_PAGE_SIZE)),
+        ),
+        "max_local_table_bytes": max(
+            0,
+            int(
+                section.get(
+                    "max_local_table_bytes",
+                    DEFAULT_HISTORY_LEDGER_MAX_LOCAL_TABLE_BYTES,
+                )
+            ),
         ),
     }
 
@@ -161,6 +180,11 @@ def create_history_ledger_store(
 class HistoryLedgerStore:
     artifacts_root: Path | None
     settings: dict[str, Any]
+    _local_gap_rows_cache: list[dict[str, Any]] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     @property
     def enabled(self) -> bool:
@@ -168,12 +192,12 @@ class HistoryLedgerStore:
 
     def status(self) -> dict[str, Any]:
         primary_backend = "cloudflare" if self._should_use_cloudflare() else "local"
-        return {
+        payload = {
             "enabled": bool(self.enabled),
             "backend": str(self.settings.get("backend") or DEFAULT_HISTORY_LEDGER_BACKEND),
             "primary_backend": primary_backend,
             "cloudflare_configured": bool(self._is_cloudflare_configured()),
-            "replicate_to_cloudflare": bool(self.settings.get("replicate_to_cloudflare", True)),
+            "replicate_to_cloudflare": bool(self.settings.get("replicate_to_cloudflare", False)),
             "read_fallback_enabled": bool(self.settings.get("read_fallback_enabled", True)),
             "read_cloud_fallback_enabled": bool(
                 self.settings.get("read_cloud_fallback_enabled", True)
@@ -184,7 +208,25 @@ class HistoryLedgerStore:
             "compact_gap_payloads_after_batch": bool(
                 self.settings.get("compact_gap_payloads_after_batch", True)
             ),
+            "compact_gap_payloads_after_run": bool(
+                self.settings.get("compact_gap_payloads_after_run", True)
+            ),
+            "persist_screening_snapshots": bool(
+                self.settings.get("persist_screening_snapshots", True)
+            ),
+            "max_local_table_bytes": int(
+                self.settings.get(
+                    "max_local_table_bytes",
+                    DEFAULT_HISTORY_LEDGER_MAX_LOCAL_TABLE_BYTES,
+                )
+                or 0
+            ),
         }
+        self._add_local_skip_fields(
+            payload,
+            self._local_tables_exceeding_size_limit(("trades", "operations", "gaps")),
+        )
+        return payload
 
     def persist_wallet_snapshot(
         self,
@@ -213,6 +255,26 @@ class HistoryLedgerStore:
                 reason="wallet_missing",
             )
 
+        primary_cloudflare = self._should_use_cloudflare()
+        replicate_cloudflare = self._should_replicate_to_cloudflare()
+        local_only_write = (
+            self.artifacts_root is not None
+            and not primary_cloudflare
+            and not replicate_cloudflare
+        )
+        early_skipped_local_tables: list[str] = []
+
+        def should_build_rows(kind: str, enabled: bool) -> bool:
+            if not enabled:
+                return False
+            if local_only_write and self._local_table_exceeds_size_limit(kind):
+                early_skipped_local_tables.append(kind)
+                return False
+            return True
+
+        persist_trades = bool(self.settings.get("persist_trades", True))
+        persist_operations = bool(self.settings.get("persist_operations", True))
+        persist_gaps = bool(self.settings.get("persist_gaps", True))
         trade_rows = (
             build_trade_ledger_rows(
                 snapshot,
@@ -220,7 +282,7 @@ class HistoryLedgerStore:
                 run_id=run_id,
                 snapshot_scope=normalized_scope,
             )
-            if bool(self.settings.get("persist_trades", True))
+            if should_build_rows("trades", persist_trades)
             else []
         )
         operation_rows = (
@@ -230,7 +292,7 @@ class HistoryLedgerStore:
                 run_id=run_id,
                 snapshot_scope=normalized_scope,
             )
-            if bool(self.settings.get("persist_operations", True))
+            if should_build_rows("operations", persist_operations)
             else []
         )
         gap_rows = (
@@ -240,9 +302,39 @@ class HistoryLedgerStore:
                 run_id=run_id,
                 snapshot_scope=normalized_scope,
             )
-            if bool(self.settings.get("persist_gaps", True))
+            if should_build_rows("gaps", persist_gaps)
             else []
         )
+        trade_count = len(trade_rows)
+        operation_count = len(operation_rows)
+        gap_count = len(gap_rows)
+        if "trades" in early_skipped_local_tables:
+            trades = snapshot.get("trades", [])
+            trade_count = len(trades) if isinstance(trades, list) else 0
+        if "operations" in early_skipped_local_tables:
+            operation_audit = (
+                snapshot.get("operation_audit", {})
+                if isinstance(snapshot.get("operation_audit", {}), Mapping)
+                else {}
+            )
+            operation_records = operation_audit.get("records", [])
+            operation_count = (
+                sum(
+                    1
+                    for record in operation_records
+                    if isinstance(record, Mapping)
+                    and str(record.get("operation") or "").strip().lower() not in {"", "trade"}
+                )
+                if isinstance(operation_records, list)
+                else 0
+            )
+        if "gaps" in early_skipped_local_tables:
+            collection_status = (
+                snapshot.get("collection_status", {})
+                if isinstance(snapshot.get("collection_status", {}), Mapping)
+                else {}
+            )
+            gap_count = len(collection_status)
 
         if self._should_use_cloudflare():
             try:
@@ -252,9 +344,9 @@ class HistoryLedgerStore:
                     backend="cloudflare",
                     wallet=normalized_wallet,
                     snapshot_scope=normalized_scope,
-                    trade_count=len(trade_rows),
-                    operation_count=len(operation_rows),
-                    gap_count=len(gap_rows),
+                    trade_count=trade_count,
+                    operation_count=operation_count,
+                    gap_count=gap_count,
                 )
             except CloudflareD1RequestError as exc:
                 if not self._should_fallback_local():
@@ -265,9 +357,9 @@ class HistoryLedgerStore:
                         backend="cloudflare",
                         wallet=normalized_wallet,
                         snapshot_scope=normalized_scope,
-                        trade_count=len(trade_rows),
-                        operation_count=len(operation_rows),
-                        gap_count=len(gap_rows),
+                        trade_count=trade_count,
+                        operation_count=operation_count,
+                        gap_count=gap_count,
                         error=str(exc),
                     )
 
@@ -281,9 +373,9 @@ class HistoryLedgerStore:
                         backend="cloudflare",
                         wallet=normalized_wallet,
                         snapshot_scope=normalized_scope,
-                        trade_count=len(trade_rows),
-                        operation_count=len(operation_rows),
-                        gap_count=len(gap_rows),
+                        trade_count=trade_count,
+                        operation_count=operation_count,
+                        gap_count=gap_count,
                         error=str(exc),
                     )
                 return self._status(
@@ -291,33 +383,66 @@ class HistoryLedgerStore:
                     backend="cloudflare",
                     wallet=normalized_wallet,
                     snapshot_scope=normalized_scope,
-                    trade_count=len(trade_rows),
-                    operation_count=len(operation_rows),
-                    gap_count=len(gap_rows),
+                    trade_count=trade_count,
+                    operation_count=operation_count,
+                    gap_count=gap_count,
                 )
             return self._status(
                 status="disabled",
                 backend="local",
                 wallet=normalized_wallet,
                 snapshot_scope=normalized_scope,
-                trade_count=len(trade_rows),
-                operation_count=len(operation_rows),
-                gap_count=len(gap_rows),
+                trade_count=trade_count,
+                operation_count=operation_count,
+                gap_count=gap_count,
                 reason="artifacts_root_missing",
             )
 
+        attempted_local_tables = [
+            kind
+            for kind, rows in (
+                ("trades", trade_rows),
+                ("operations", operation_rows),
+                ("gaps", gap_rows),
+            )
+            if rows
+        ]
+        skipped_local_tables = merge_local_skipped_tables(
+            early_skipped_local_tables,
+            [
+                kind
+                for kind, rows in (
+                    ("trades", trade_rows),
+                    ("operations", operation_rows),
+                    ("gaps", gap_rows),
+                )
+                if rows and self._local_table_exceeds_size_limit(kind)
+            ],
+        )
+        attempted_local_tables = merge_local_skipped_tables(
+            attempted_local_tables,
+            early_skipped_local_tables,
+        )
         self._persist_local_rows("trades", trade_rows)
         self._persist_local_rows("operations", operation_rows)
         self._persist_local_rows("gaps", gap_rows)
+        all_local_writes_skipped = bool(attempted_local_tables) and set(
+            attempted_local_tables
+        ).issubset(set(skipped_local_tables))
         status_payload = self._status(
-            status="persisted",
+            status="skipped" if all_local_writes_skipped else "persisted",
             backend="local",
             wallet=normalized_wallet,
             snapshot_scope=normalized_scope,
-            trade_count=len(trade_rows),
-            operation_count=len(operation_rows),
-            gap_count=len(gap_rows),
+            trade_count=trade_count,
+            operation_count=operation_count,
+            gap_count=gap_count,
+            reason=(
+                LOCAL_LEDGER_TABLE_TOO_LARGE_REASON if all_local_writes_skipped else ""
+            ),
         )
+        if skipped_local_tables:
+            self._add_local_skip_fields(status_payload, skipped_local_tables)
         if self._should_replicate_to_cloudflare():
             try:
                 self._persist_cloudflare_rows(trade_rows, operation_rows, gap_rows)
@@ -364,7 +489,18 @@ class HistoryLedgerStore:
 
         read_backends = self._trade_read_backends()
         errors: list[str] = []
+        skipped_local_tables: list[str] = []
         for backend in read_backends:
+            if backend == "local":
+                backend_skipped_tables = self._local_tables_exceeding_size_limit(
+                    ("gaps", "trades")
+                )
+                if backend_skipped_tables:
+                    skipped_local_tables = merge_local_skipped_tables(
+                        skipped_local_tables,
+                        backend_skipped_tables,
+                    )
+                    continue
             try:
                 coverage = self._find_complete_trade_coverage_for_backend(
                     backend,
@@ -409,7 +545,7 @@ class HistoryLedgerStore:
                 trade_rows = trade_rows[: max(0, int(limit))]
             records = [annotate_loaded_trade_payload(row.get("payload")) for row in trade_rows]
             coverage_complete = bool(coverage.get("complete", False))
-            return {
+            payload = {
                 "status": "loaded",
                 "backend": backend,
                 "wallet": normalized_wallet,
@@ -439,13 +575,18 @@ class HistoryLedgerStore:
                 },
                 "error": "",
             }
+            self._add_local_skip_fields(payload, skipped_local_tables)
+            return payload
 
-        status = (
-            "failed"
-            if read_backends and read_backends[0] == "cloudflare" and errors and not self._should_fallback_local()
-            else "missing"
+        status = "skipped" if skipped_local_tables else "missing"
+        if read_backends and read_backends[0] == "cloudflare" and errors and not self._should_fallback_local():
+            status = "failed"
+        reason = (
+            LOCAL_LEDGER_TABLE_TOO_LARGE_REASON
+            if skipped_local_tables
+            else "no_complete_trade_coverage"
         )
-        return self._trade_fallback_status(
+        payload = self._trade_fallback_status(
             status=status,
             backend=str(self.settings.get("backend") or DEFAULT_HISTORY_LEDGER_BACKEND),
             wallet=normalized_wallet,
@@ -453,9 +594,11 @@ class HistoryLedgerStore:
             snapshot_scope=normalized_snapshot_scope,
             range_start=range_start,
             range_end=range_end,
-            reason="no_complete_trade_coverage",
+            reason=reason,
             error=errors[0] if errors else "",
         )
+        self._add_local_skip_fields(payload, skipped_local_tables)
+        return payload
 
     def load_complete_operation_fallback(
         self,
@@ -489,7 +632,18 @@ class HistoryLedgerStore:
 
         read_backends = self._trade_read_backends()
         errors: list[str] = []
+        skipped_local_tables: list[str] = []
         for backend in read_backends:
+            if backend == "local":
+                backend_skipped_tables = self._local_tables_exceeding_size_limit(
+                    ("gaps", "operations")
+                )
+                if backend_skipped_tables:
+                    skipped_local_tables = merge_local_skipped_tables(
+                        skipped_local_tables,
+                        backend_skipped_tables,
+                    )
+                    continue
             try:
                 coverage = self._find_complete_operation_coverage_for_backend(
                     backend,
@@ -533,7 +687,7 @@ class HistoryLedgerStore:
                 for row in operation_rows
             ]
             coverage_complete = bool(operation_coverage_complete(coverage))
-            return {
+            payload = {
                 "status": "loaded",
                 "backend": backend,
                 "wallet": normalized_wallet,
@@ -559,21 +713,28 @@ class HistoryLedgerStore:
                 },
                 "error": "",
             }
+            self._add_local_skip_fields(payload, skipped_local_tables)
+            return payload
 
-        status = (
-            "failed"
-            if read_backends and read_backends[0] == "cloudflare" and errors and not self._should_fallback_local()
-            else "missing"
+        status = "skipped" if skipped_local_tables else "missing"
+        if read_backends and read_backends[0] == "cloudflare" and errors and not self._should_fallback_local():
+            status = "failed"
+        reason = (
+            LOCAL_LEDGER_TABLE_TOO_LARGE_REASON
+            if skipped_local_tables
+            else "no_complete_operation_coverage"
         )
-        return self._operation_fallback_status(
+        payload = self._operation_fallback_status(
             status=status,
             backend=str(self.settings.get("backend") or DEFAULT_HISTORY_LEDGER_BACKEND),
             wallet=normalized_wallet,
             history_scope=normalized_history_scope,
             snapshot_scope=normalized_snapshot_scope,
-            reason="no_complete_operation_coverage",
+            reason=reason,
             error=errors[0] if errors else "",
         )
+        self._add_local_skip_fields(payload, skipped_local_tables)
+        return payload
 
     def sync_local_to_cloudflare(self) -> dict[str, Any]:
         if not self.enabled:
@@ -595,15 +756,28 @@ class HistoryLedgerStore:
                 "reason": "cloudflare_not_configured",
             }
 
-        trade_rows = read_local_ledger_rows(history_ledger_table_path(self.artifacts_root, "trades"))
-        operation_rows = read_local_ledger_rows(
-            history_ledger_table_path(self.artifacts_root, "operations")
+        skipped_tables = self._local_tables_exceeding_size_limit(
+            ("trades", "operations", "gaps")
         )
-        gap_rows = read_local_ledger_rows(history_ledger_table_path(self.artifacts_root, "gaps"))
+        trade_rows = (
+            []
+            if "trades" in skipped_tables
+            else read_local_ledger_rows(history_ledger_table_path(self.artifacts_root, "trades"))
+        )
+        operation_rows = (
+            []
+            if "operations" in skipped_tables
+            else read_local_ledger_rows(history_ledger_table_path(self.artifacts_root, "operations"))
+        )
+        gap_rows = (
+            []
+            if "gaps" in skipped_tables
+            else read_local_ledger_rows(history_ledger_table_path(self.artifacts_root, "gaps"))
+        )
         try:
             self._persist_cloudflare_rows(trade_rows, operation_rows, gap_rows)
         except CloudflareD1RequestError as exc:
-            return {
+            payload = {
                 "status": "failed",
                 "backend": "cloudflare",
                 "trade_count": len(trade_rows),
@@ -611,15 +785,19 @@ class HistoryLedgerStore:
                 "gap_count": len(gap_rows),
                 "error": str(exc),
             }
-        return {
+            self._add_local_skip_fields(payload, skipped_tables, include_legacy_alias=True)
+            return payload
+        payload = {
             "status": "synced",
             "backend": "cloudflare",
             "trade_count": len(trade_rows),
             "operation_count": len(operation_rows),
             "gap_count": len(gap_rows),
         }
+        self._add_local_skip_fields(payload, skipped_tables, include_legacy_alias=True)
+        return payload
 
-    def compact_local_gap_payloads(self) -> dict[str, Any]:
+    def compact_local_gap_payloads(self, *, force: bool = False) -> dict[str, Any]:
         if not self.enabled:
             return {
                 "status": "disabled",
@@ -634,7 +812,7 @@ class HistoryLedgerStore:
                 "updated_count": 0,
                 "removed_record_lists": 0,
             }
-        if not bool(self.settings.get("compact_gap_payloads_after_batch", True)):
+        if not force and not bool(self.settings.get("compact_gap_payloads_after_batch", True)):
             return {
                 "status": "disabled",
                 "reason": "gap_payload_compaction_disabled",
@@ -647,6 +825,14 @@ class HistoryLedgerStore:
             return {
                 "status": "skipped",
                 "reason": "gap_ledger_missing",
+                "updated_count": 0,
+                "removed_record_lists": 0,
+            }
+        if self._local_table_exceeds_size_limit("gaps"):
+            return {
+                "status": "skipped",
+                "reason": LOCAL_LEDGER_TABLE_TOO_LARGE_REASON,
+                "local_skipped_tables": ["gaps"],
                 "updated_count": 0,
                 "removed_record_lists": 0,
             }
@@ -732,8 +918,12 @@ class HistoryLedgerStore:
         if self.artifacts_root is None or not rows:
             return
         path = history_ledger_table_path(self.artifacts_root, kind)
+        if self._local_table_exceeds_size_limit(kind):
+            return
         key_field = LOCAL_LEDGER_KEY_FIELDS[kind]
         with LEDGER_LOCK:
+            if self._local_table_exceeds_size_limit(kind):
+                return
             existing_rows = read_local_ledger_rows(path)
             rows_by_key = {
                 str(row.get(key_field) or ""): dict(row)
@@ -960,6 +1150,8 @@ class HistoryLedgerStore:
     ) -> list[dict[str, Any]]:
         if self.artifacts_root is None:
             return []
+        if self._local_table_exceeds_size_limit("trades"):
+            return []
         rows = read_local_ledger_rows(history_ledger_table_path(self.artifacts_root, "trades"))
         return filter_trade_rows(
             rows,
@@ -1012,6 +1204,8 @@ class HistoryLedgerStore:
     ) -> list[dict[str, Any]]:
         if self.artifacts_root is None:
             return []
+        if self._local_table_exceeds_size_limit("operations"):
+            return []
         rows = read_local_ledger_rows(history_ledger_table_path(self.artifacts_root, "operations"))
         return filter_operation_rows(
             rows,
@@ -1053,7 +1247,13 @@ class HistoryLedgerStore:
     def _load_gap_rows_local(self, *, wallet: str, section_name: str) -> list[dict[str, Any]]:
         if self.artifacts_root is None:
             return []
-        rows = read_local_ledger_rows(history_ledger_table_path(self.artifacts_root, "gaps"))
+        if self._local_table_exceeds_size_limit("gaps"):
+            return []
+        if self._local_gap_rows_cache is None:
+            self._local_gap_rows_cache = read_local_ledger_rows(
+                history_ledger_table_path(self.artifacts_root, "gaps")
+            )
+        rows = self._local_gap_rows_cache
         return [
             dict(row)
             for row in rows
@@ -1116,6 +1316,41 @@ class HistoryLedgerStore:
             offset += len(page)
         return rows
 
+    def _local_table_exceeds_size_limit(self, kind: str) -> bool:
+        if self.artifacts_root is None:
+            return False
+        limit = int(
+            self.settings.get(
+                "max_local_table_bytes",
+                DEFAULT_HISTORY_LEDGER_MAX_LOCAL_TABLE_BYTES,
+            )
+            or 0
+        )
+        if limit <= 0:
+            return False
+        path = history_ledger_table_path(self.artifacts_root, kind)
+        try:
+            return path.exists() and path.stat().st_size > limit
+        except OSError:
+            return False
+
+    def _local_tables_exceeding_size_limit(self, kinds: tuple[str, ...]) -> list[str]:
+        return [kind for kind in kinds if self._local_table_exceeds_size_limit(kind)]
+
+    def _add_local_skip_fields(
+        self,
+        payload: dict[str, Any],
+        skipped_tables: list[str],
+        *,
+        include_legacy_alias: bool = False,
+    ) -> None:
+        if not skipped_tables:
+            return
+        payload["local_skipped_tables"] = list(skipped_tables)
+        if include_legacy_alias:
+            payload["skipped_local_tables"] = list(skipped_tables)
+        payload["local_skip_reason"] = LOCAL_LEDGER_TABLE_TOO_LARGE_REASON
+
     def _should_use_cloudflare(self) -> bool:
         return bool(
             self.enabled
@@ -1145,7 +1380,7 @@ class HistoryLedgerStore:
         return bool(
             self.enabled
             and self.settings.get("backend") != "cloudflare"
-            and self.settings.get("replicate_to_cloudflare", True)
+            and self.settings.get("replicate_to_cloudflare", False)
             and self._is_cloudflare_configured()
         )
 
@@ -1790,6 +2025,17 @@ def compact_dict(source: Mapping[str, Any]) -> dict[str, Any]:
         for key, value in source.items()
         if value not in (None, "", [], {}, ())
     }
+
+
+def merge_local_skipped_tables(
+    existing_tables: list[str],
+    next_tables: list[str],
+) -> list[str]:
+    merged: list[str] = []
+    for table in [*existing_tables, *next_tables]:
+        if table not in merged:
+            merged.append(table)
+    return merged
 
 
 def to_optional_int(value: Any) -> int | None:

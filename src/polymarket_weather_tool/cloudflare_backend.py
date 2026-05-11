@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from http.client import IncompleteRead
 from typing import Any, Mapping
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -228,6 +229,8 @@ def _cloudflare_d1_query(
         ) from exc
     except urlerror.URLError as exc:
         raise CloudflareD1RequestError(f"Cloudflare D1 query failed: {exc.reason}") from exc
+    except (TimeoutError, IncompleteRead, OSError) as exc:
+        raise CloudflareD1RequestError(f"Cloudflare D1 query failed: {exc}") from exc
 
     try:
         payload = json.loads(raw_body.decode("utf-8"))

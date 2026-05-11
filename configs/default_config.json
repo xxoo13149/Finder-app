@@ -28,7 +28,8 @@
     "max_traded_count": 200,
     "min_weather_trade_ratio": 0.5,
     "include_wallets": [],
-    "exclude_wallets": []
+    "exclude_wallets": [],
+    "activity_filter_mode": "all"
   },
   "pagination": {
     "page_size": 500,
@@ -44,7 +45,9 @@
     "active_only": false,
     "closed_only": false,
     "include_archived": true,
-    "page_size": 200
+    "page_size": 200,
+    "reuse_recent_cache": false,
+    "cache_ttl_seconds": 1800
   },
   "analysis": {
     "concurrent_wallets": 4,
@@ -58,6 +61,12 @@
     "position_size_threshold": 0.1,
     "lightweight_batch_cleanup_enabled": true,
     "gc_after_wallet_batch": true,
+    "defer_selected_wallet_full_hydration": true,
+    "full_hydration_concurrency": 3,
+    "finder_ai_concurrency": 2,
+    "falcon_metrics_concurrency": 2,
+    "wallet_screening_lookahead_multiplier": 3,
+    "time_partition_probe_pages": 2,
     "region_fields": [
       "region",
       "regionName",
@@ -79,6 +88,16 @@
     "top_trades_in_report": 5,
     "top_closed_positions_in_report": 5
   },
+  "falcon": {
+    "enabled": true,
+    "token_env": "FALCON_API_TOKEN",
+    "base_url": "https://narrative.agent.heisenberg.so/api/v2/semantic/retrieve/parameterized",
+    "timeout_seconds": 20,
+    "cache_dir": ".cache/falcon",
+    "cache_ttl_seconds": 3600,
+    "win_rate_window_days": 15,
+    "profit_and_loss_start_date": "2010-01-01"
+  },
   "history_registry": {
     "enabled": true,
     "backend": "local",
@@ -91,7 +110,7 @@
     "timeout_seconds": 20,
     "fallback_to_local_on_error": true,
     "read_cloud_fallback_enabled": true,
-    "replicate_to_cloudflare": true
+    "replicate_to_cloudflare": false
   },
   "history_provider": {
     "enabled": true,
@@ -103,7 +122,9 @@
     "positions_url": "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/positions-subgraph/0.0.7/gn",
     "page_size": 200,
     "max_pages_per_stream": 30,
+    "partition_probe_pages": 2,
     "token_lookup_chunk_size": 100,
+    "token_lookup_cache_enabled": true,
     "asset_decimals": 6,
     "usdc_asset_id": "0",
     "always_for_full_snapshot": false,
@@ -125,12 +146,15 @@
     "fallback_to_local_on_error": true,
     "read_fallback_enabled": true,
     "read_cloud_fallback_enabled": true,
-    "replicate_to_cloudflare": true,
-    "compact_gap_payloads_after_batch": true,
+    "replicate_to_cloudflare": false,
+    "compact_gap_payloads_after_batch": false,
+    "compact_gap_payloads_after_run": true,
+    "persist_screening_snapshots": false,
     "persist_trades": true,
     "persist_operations": true,
     "persist_gaps": true,
-    "query_page_size": 1000
+    "query_page_size": 1000,
+    "max_local_table_bytes": 134217728
   },
   "cloud_archive": {
     "enabled": true,
@@ -146,7 +170,7 @@
     "archive_before_cleanup": true
   },
   "chain_validation": {
-    "enabled": true,
+    "enabled": false,
     "api_key_envs": [
       "ETHERSCAN_API_KEY",
       "POLYGONSCAN_API_KEY"
@@ -202,7 +226,8 @@
         "include_wallets": [],
         "exclude_wallets": [],
         "min_weather_notional_ratio": 0.45,
-        "weather_focus_mode": "trade_or_notional"
+        "weather_focus_mode": "trade_or_notional",
+        "activity_filter_mode": "all"
       },
       "pagination": {
         "page_size": 500,
@@ -252,7 +277,7 @@
         "top_closed_positions_in_report": 5
       },
       "chain_validation": {
-        "enabled": true,
+        "enabled": false,
         "api_key_envs": [
           "ETHERSCAN_API_KEY",
           "POLYGONSCAN_API_KEY"

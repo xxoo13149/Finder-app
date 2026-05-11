@@ -1,5 +1,44 @@
 export type RunStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'partial' | 'artifact';
 
+export type ActiveProgressStage = {
+  key?: string;
+  label?: string;
+  status?: string;
+  wallet?: string;
+  detail?: string;
+  message?: string;
+  time?: string;
+};
+
+export type ActiveStepDiagnostics = {
+  started?: number;
+  finished?: number;
+  completed?: number;
+  generated?: number;
+  cached?: number;
+  fallback?: number;
+  needs_review?: number;
+  skipped?: number;
+  failed?: number;
+  in_progress?: number;
+  status_counts?: Record<string, number>;
+  last_status?: string;
+  last_wallet?: string;
+  last_at?: string;
+  last_detail?: string;
+};
+
+export type ActiveSlowStep = {
+  kind?: string;
+  label?: string;
+  wallet?: string;
+  status?: string;
+  detail?: string;
+  started_at?: string;
+  finished_at?: string | null;
+  duration_seconds?: number;
+};
+
 export type RunRecord = {
   run_id: string;
   status: RunStatus;
@@ -21,8 +60,12 @@ export type RunRecord = {
   wallet_detail_count?: number;
   active_diagnostics?: {
     progress_counts?: Record<string, number>;
+    current_stage?: ActiveProgressStage;
     wallets?: Record<string, number>;
     weather_events?: Record<string, number>;
+    hydration?: ActiveStepDiagnostics;
+    deepseek?: ActiveStepDiagnostics;
+    recent_slow_steps?: ActiveSlowStep[];
     relay_source?: Record<string, unknown>;
   };
   resumable?: boolean;
@@ -51,6 +94,12 @@ export type AnalysisSummary = {
   averages?: Record<string, number>;
   top_wallets_by_pnl?: WalletRankSummary[];
   top_wallets_by_frequency?: WalletRankSummary[];
+  falcon_display?: {
+    total_pnl_source?: string;
+    total_roi_source?: string;
+    win_rate_source?: string;
+    win_rate_window_label?: string;
+  };
 };
 
 export type FinderAiRunSummary = {
@@ -110,6 +159,16 @@ export type WalletRankSummary = {
   user_name?: string;
   x_username?: string;
   pnl?: number;
+  display_pnl?: number;
+  display_roi?: number;
+  display_win_rate?: number;
+  display_win_rate_source?: string;
+  display_win_rate_window_label?: string;
+  falcon_total_pnl?: number;
+  falcon_total_roi?: number;
+  falcon_win_rate?: number;
+  falcon_win_rate_source?: string;
+  falcon_win_rate_window_label?: string;
   closed_profit_multiple?: number;
   wallet_win_rate?: number;
   closed_position_win_rate?: number;
@@ -132,6 +191,16 @@ export type WalletRow = {
   ai_has_conflict?: boolean;
   ai_evidence_level?: string;
   pnl?: number;
+  display_pnl?: number;
+  display_roi?: number;
+  display_win_rate?: number;
+  display_win_rate_source?: string;
+  display_win_rate_window_label?: string;
+  falcon_total_pnl?: number;
+  falcon_total_roi?: number;
+  falcon_win_rate?: number;
+  falcon_win_rate_source?: string;
+  falcon_win_rate_window_label?: string;
   volume?: number;
   trade_count?: number;
   weather_trade_count?: number;
@@ -163,6 +232,39 @@ export type WalletRow = {
   detail_available?: boolean;
   source?: string;
 };
+
+export function walletDisplayPnl(
+  wallet?: Pick<WalletRow, 'display_pnl' | 'falcon_total_pnl' | 'pnl'> | null,
+): number | undefined {
+  return wallet?.display_pnl ?? wallet?.falcon_total_pnl;
+}
+
+export function walletDisplayWinRate(
+  wallet?: Pick<
+    WalletRow,
+    'display_win_rate' | 'falcon_win_rate' | 'wallet_win_rate' | 'closed_position_win_rate'
+  > | null,
+): number | undefined {
+  return wallet?.display_win_rate ?? wallet?.falcon_win_rate;
+}
+
+export function walletDisplayWinRateLabel(
+  wallet?: Pick<
+    WalletRow,
+    | 'display_win_rate_window_label'
+    | 'display_win_rate_source'
+    | 'falcon_win_rate_window_label'
+    | 'falcon_win_rate_source'
+    | 'wallet_win_rate_source'
+  > | null,
+): string {
+  if (wallet?.display_win_rate_window_label) return wallet.display_win_rate_window_label;
+  if (wallet?.display_win_rate_source) return wallet.display_win_rate_source;
+  if (wallet?.falcon_win_rate_window_label) return wallet.falcon_win_rate_window_label;
+  if (wallet?.falcon_win_rate_source) return wallet.falcon_win_rate_source;
+  if (wallet?.wallet_win_rate_source) return wallet.wallet_win_rate_source;
+  return 'Finder';
+}
 
 export type LabelSummary = {
   key: string;

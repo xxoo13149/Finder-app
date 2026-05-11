@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import gc
 import statistics
 import time
 import urllib.parse
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import wait as wait_for_futures
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from threading import Lock
+from typing import Any, Callable, Iterator, Mapping
 from urllib.error import HTTPError, URLError
 
 from . import cloud_archive as cloud_archive_module
@@ -20,6 +23,11 @@ from .client import PolymarketClient, PolymarketRequestError, resolve_api_key
 from .config import DEFAULT_ANALYSIS_MODE, RELAY_ANALYSIS_MODE, SMART_WALLET_LIBRARY_REFRESH_MODE
 from .finder_ai_contract import build_finder_ai_contract, enrich_finder_ai_generation_context
 from .finder_ai_generation import generate_finder_ai_brief
+from .falcon_client import (
+    falcon_display_metrics_for_wallet,
+    falcon_settings,
+    falcon_win_rate_window_label,
+)
 from . import history_provider as history_provider_module
 from .labels import CORE_LABEL_KEYS, build_strategy_notes, evaluate_label_evaluations, evaluate_labels
 from .metrics import (
@@ -85,6 +93,11 @@ DEFAULT_HISTORY_PROVIDER_USDC_ASSET_ID = "0"
 DEFAULT_FULL_HYDRATION_RETRY_ATTEMPTS = 2
 DEFAULT_FULL_HYDRATION_RETRY_BACKOFF_SECONDS = 0.75
 WEATHER_FETCH_SUMMARY_FILENAME = "weather_fetch_summary.json"
+WEATHER_EVENTS_CACHE_DIRNAME = "weather-events"
+WEATHER_EVENTS_CACHE_VERSION = 1
+GRAPH_TOKEN_CONDITION_LOOKUP_CACHE_MAX = 50_000
+GRAPH_TOKEN_CONDITION_LOOKUP_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+GRAPH_TOKEN_CONDITION_LOOKUP_CACHE_LOCK = Lock()
 WEATHER_RECORD_TAG_TERMS = {
     "weather",
     "daily weather",
@@ -142,6 +155,10 @@ WEATHER_RECORD_TEXT_FIELDS = (
 )
 
 
+def current_utc_date_string() -> str:
+    return datetime.now(UTC).date().isoformat()
+
+
 @dataclass
 class WeatherIndex:
     event_ids: set[str]
@@ -150,6 +167,40 @@ class WeatherIndex:
     market_slugs: set[str]
     regions_by_key: dict[str, str]
     market_dates_by_key: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class PendingSelectedWalletResult:
+    sequence: int
+    wallet: str
+    wallet_result: dict[str, Any]
+    snapshot: dict[str, Any]
+    leaderboard_entry: dict[str, Any] = field(default_factory=dict)
+    ai_future: Future[dict[str, Any]] | None = None
+    completion_future: Future[dict[str, Any]] | None = None
+    falcon_metrics_future: Future[dict[str, Any]] | None = None
+    finalized: bool = False
+
+
+SELECTED_WALLET_SEQUENCE_FIELD = "_analysis_sequence"
+
+
+class PaginationCountedRecords(list[dict[str, Any]]):
+    def __init__(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        pagination_count: int | None = None,
+    ) -> None:
+        super().__init__(records)
+        self.pagination_count = (
+            list.__len__(self)
+            if pagination_count is None
+            else max(0, int(pagination_count))
+        )
+
+    def __len__(self) -> int:
+        return self.pagination_count
 
 
 def bool_config_value(value: Any, default: bool) -> bool:
@@ -250,6 +301,8 @@ def compact_wallet_result_for_run_summary(wallet_result: Mapping[str, Any]) -> d
         metrics["operation_audit"] = compact_operation_audit_for_embedding(
             metrics.get("operation_audit")
         )
+    if isinstance(metrics.get("falcon_metrics"), Mapping):
+        metrics["falcon_metrics"] = dict(metrics.get("falcon_metrics"))
 
     compact: dict[str, Any] = {}
     for key in (
@@ -280,6 +333,14 @@ def compact_wallet_result_for_run_summary(wallet_result: Mapping[str, Any]) -> d
     return compact
 
 
+def analysis_setting_int(config: Mapping[str, Any], key: str, default: int) -> int:
+    analysis_settings = config.get("analysis", {}) if isinstance(config.get("analysis", {}), Mapping) else {}
+    try:
+        return max(1, int(analysis_settings.get(key, default)))
+    except (TypeError, ValueError):
+        return max(1, int(default))
+
+
 def cleanup_completed_analysis_batch(
     config: Mapping[str, Any],
     batch_results: list[dict[str, Any]],
@@ -292,7 +353,24 @@ def cleanup_completed_analysis_batch(
 
     released_count = len(batch_results)
     batch_results.clear()
-    ledger_compaction = history_ledger_store(config).compact_local_gap_payloads()
+    history_ledger_settings = (
+        config.get("history_ledger", {})
+        if isinstance(config.get("history_ledger", {}), Mapping)
+        else {}
+    )
+    ledger_compaction = (
+        history_ledger_store(config).compact_local_gap_payloads()
+        if bool_config_value(
+            history_ledger_settings.get("compact_gap_payloads_after_batch"),
+            False,
+        )
+        else {
+            "status": "deferred",
+            "reason": "gap_payload_compaction_after_run",
+            "updated_count": 0,
+            "removed_record_lists": 0,
+        }
+    )
     gc_triggered = False
     if bool_config_value(analysis_settings.get("gc_after_wallet_batch"), True):
         gc.collect()
@@ -302,6 +380,33 @@ def cleanup_completed_analysis_batch(
         "released_result_count": released_count,
         "history_ledger_gap_compaction": ledger_compaction,
         "gc_triggered": gc_triggered,
+    }
+
+
+def cleanup_completed_analysis_run(config: Mapping[str, Any]) -> dict[str, Any]:
+    history_ledger_settings = (
+        config.get("history_ledger", {})
+        if isinstance(config.get("history_ledger", {}), Mapping)
+        else {}
+    )
+    if not bool_config_value(
+        history_ledger_settings.get("compact_gap_payloads_after_run"),
+        True,
+    ):
+        return {
+            "status": "disabled",
+            "history_ledger_gap_compaction": {
+                "status": "disabled",
+                "reason": "gap_payload_compaction_after_run_disabled",
+                "updated_count": 0,
+                "removed_record_lists": 0,
+            },
+        }
+    return {
+        "status": "completed",
+        "history_ledger_gap_compaction": history_ledger_store(config).compact_local_gap_payloads(
+            force=True
+        ),
     }
 
 
@@ -361,33 +466,799 @@ def selection_record_from_wallet_result(wallet_result: Mapping[str, Any], wallet
     return record
 
 
+def apply_falcon_metrics_to_selection_record(
+    selection_record: Mapping[str, Any],
+    falcon_metrics: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    record = dict(selection_record)
+    if not isinstance(falcon_metrics, Mapping):
+        return record
+
+    falcon_total_pnl = falcon_metrics.get("total_pnl")
+    falcon_total_roi = falcon_metrics.get("total_roi")
+    falcon_win_rate = falcon_metrics.get("win_rate")
+    falcon_win_rate_source = str(falcon_metrics.get("win_rate_source") or "").strip()
+    falcon_win_rate_window_label = str(falcon_metrics.get("win_rate_window_label") or "").strip()
+
+    record["falcon_total_pnl"] = falcon_total_pnl
+    record["falcon_total_roi"] = falcon_total_roi
+    record["falcon_win_rate"] = falcon_win_rate
+    record["falcon_win_rate_source"] = falcon_win_rate_source
+    record["falcon_win_rate_window_label"] = falcon_win_rate_window_label
+    record["falcon_metric_source"] = str(falcon_metrics.get("metric_source") or "falcon")
+
+    if falcon_total_pnl is not None:
+        record["display_pnl"] = falcon_total_pnl
+    if falcon_total_roi is not None:
+        record["display_roi"] = falcon_total_roi
+    if falcon_win_rate is not None:
+        record["display_win_rate"] = falcon_win_rate
+        record["display_win_rate_source"] = falcon_win_rate_source or "falcon"
+        record["display_win_rate_window_label"] = falcon_win_rate_window_label
+    return record
+
+
+def apply_falcon_metrics_to_metrics(
+    metrics: Mapping[str, Any],
+    falcon_metrics: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    result = dict(metrics)
+    if not isinstance(falcon_metrics, Mapping):
+        return result
+
+    result["falcon_metrics"] = dict(falcon_metrics)
+    result["falcon_total_pnl"] = falcon_metrics.get("total_pnl")
+    result["falcon_total_roi"] = falcon_metrics.get("total_roi")
+    result["falcon_win_rate"] = falcon_metrics.get("win_rate")
+    result["falcon_win_rate_source"] = falcon_metrics.get("win_rate_source")
+    result["falcon_win_rate_window_label"] = falcon_metrics.get("win_rate_window_label")
+    result["falcon_metric_source"] = falcon_metrics.get("metric_source") or "falcon"
+    result["falcon_total_trades"] = falcon_metrics.get("total_trades")
+    result["falcon_total_invested"] = falcon_metrics.get("total_invested")
+    result["falcon_wins"] = falcon_metrics.get("wins")
+    result["falcon_losses"] = falcon_metrics.get("losses")
+    result["falcon_pnl_updated_at"] = falcon_metrics.get("pnl_updated_at")
+    result["falcon_win_rate_updated_at"] = falcon_metrics.get("win_rate_updated_at")
+
+    if falcon_metrics.get("total_pnl") is not None:
+        result["display_pnl"] = falcon_metrics.get("total_pnl")
+    if falcon_metrics.get("total_roi") is not None:
+        result["display_roi"] = falcon_metrics.get("total_roi")
+    if falcon_metrics.get("win_rate") is not None:
+        result["display_win_rate"] = falcon_metrics.get("win_rate")
+        result["display_win_rate_source"] = (
+            falcon_metrics.get("win_rate_source") or "falcon"
+        )
+        result["display_win_rate_window_label"] = (
+            falcon_metrics.get("win_rate_window_label") or ""
+        )
+
+    profile = (
+        dict(result.get("profile"))
+        if isinstance(result.get("profile"), Mapping)
+        else {}
+    )
+    closed_position_pnl = (
+        dict(profile.get("closed_position_pnl"))
+        if isinstance(profile.get("closed_position_pnl"), Mapping)
+        else {}
+    )
+    if falcon_metrics.get("win_rate") is not None:
+        profile["falcon_win_rate"] = falcon_metrics.get("win_rate")
+        profile["falcon_win_rate_source"] = falcon_metrics.get("win_rate_source")
+        profile["falcon_win_rate_window_label"] = falcon_metrics.get("win_rate_window_label")
+    if falcon_metrics.get("total_pnl") is not None:
+        profile["falcon_total_pnl"] = falcon_metrics.get("total_pnl")
+    if falcon_metrics.get("total_roi") is not None:
+        profile["falcon_total_roi"] = falcon_metrics.get("total_roi")
+    if closed_position_pnl:
+        profile["closed_position_pnl"] = closed_position_pnl
+    if profile:
+        result["profile"] = profile
+
+    return result
+
+
+def finalize_selected_wallet_result(
+    wallet_result: Mapping[str, Any],
+    *,
+    snapshot: Mapping[str, Any] | None = None,
+    weather_index: WeatherIndex | None = None,
+    config: Mapping[str, Any] | None = None,
+    finder_ai_result: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = dict(wallet_result)
+    if (
+        snapshot is not None
+        and weather_index is not None
+        and config is not None
+        and (
+            "finder_ai" not in result
+            or "structured_materials" not in result
+            or "top_trades" not in result
+            or "top_positions" not in result
+            or "top_closed_positions" not in result
+        )
+    ):
+        result = enrich_wallet_result_artifacts(
+            wallet_result=result,
+            snapshot=snapshot,
+            weather_index=weather_index,
+            config=config,
+        )
+    if isinstance(finder_ai_result, Mapping) and finder_ai_result:
+        result["finder_ai"] = dict(finder_ai_result)
+    result["selection_record"] = sync_selection_record_finder_ai_fields(
+        result.get("selection_record"),
+        result.get("finder_ai"),
+    )
+    core_label_keys = wallet_result_system_core_label_keys(result)
+    result["selection_record"]["has_core_label"] = bool(core_label_keys)
+    result["selection_record"]["core_label_keys"] = core_label_keys
+    return result
+
+
+def finder_ai_failed_result(
+    finder_ai_payload: Mapping[str, Any] | None,
+    exc: Exception,
+) -> dict[str, Any]:
+    result = dict(finder_ai_payload) if isinstance(finder_ai_payload, Mapping) else {}
+    brief_generation = (
+        dict(result.get("briefGeneration"))
+        if isinstance(result.get("briefGeneration"), Mapping)
+        else {}
+    )
+    brief_generation["status"] = "failed"
+    brief_generation["reason"] = "provider_error"
+    brief_generation["lastError"] = str(exc).strip()[:240]
+    result["briefGeneration"] = brief_generation
+    return result
+
+
+def elapsed_perf_seconds(started_at: float) -> float:
+    return round(max(0.0, time.perf_counter() - started_at), 3)
+
+
+def progress_wallet_trace(
+    config: dict[str, Any],
+    wallet: str,
+    *,
+    stage: str,
+    status: str = "completed",
+    **payload: Any,
+) -> None:
+    if not wallet:
+        return
+    trace: dict[str, Any] = {
+        "wallet": normalize_address(wallet),
+        "stage": str(stage or "wallet"),
+        "status": str(status or "completed"),
+    }
+    for key, value in payload.items():
+        if value in (None, ""):
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            trace[str(key)] = value
+    progress(
+        config,
+        "Wallet trace: "
+        + json.dumps(trace, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    )
+
+
+def collection_trace_fields(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    collection_status = (
+        snapshot.get("collection_status")
+        if isinstance(snapshot.get("collection_status"), Mapping)
+        else {}
+    )
+    activity_status = (
+        collection_status.get("activity")
+        if isinstance(collection_status, Mapping)
+        and isinstance(collection_status.get("activity"), Mapping)
+        else {}
+    )
+    trades_status = (
+        collection_status.get("trades")
+        if isinstance(collection_status, Mapping)
+        and isinstance(collection_status.get("trades"), Mapping)
+        else {}
+    )
+    fields: dict[str, Any] = {
+        "snapshot_scope": snapshot.get("snapshot_scope"),
+        "activity_pages": activity_status.get("page_count"),
+        "activity_records": activity_status.get("record_count"),
+        "activity_mode": activity_status.get("collection_mode"),
+        "trades_pages": trades_status.get("page_count"),
+        "trades_records": trades_status.get("record_count"),
+        "trades_mode": trades_status.get("collection_mode"),
+    }
+    if isinstance(collection_status, Mapping) and isinstance(collection_status.get("history_provider"), Mapping):
+        provider = collection_status["history_provider"]
+        fields["history_provider_mode"] = provider.get("collection_mode")
+        fields["history_provider_complete"] = provider.get("complete")
+    return fields
+
+
+def generate_finder_ai_for_wallet_result(
+    wallet_result: Mapping[str, Any],
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = wallet_result.get("finder_ai")
+    wallet = normalize_address(wallet_result.get("wallet") or "")
+    started_at = time.perf_counter()
+    if config is not None and wallet:
+        progress(dict(config), f"DeepSeek started: {wallet}")
+    try:
+        result = generate_finder_ai_brief(
+            payload=payload if isinstance(payload, Mapping) else None,
+            wallet_result=wallet_result,
+        )
+        if config is not None and wallet:
+            brief_generation = (
+                result.get("briefGeneration")
+                if isinstance(result.get("briefGeneration"), Mapping)
+                else {}
+            )
+            status = str(brief_generation.get("status") or "completed").strip()
+            progress(dict(config), f"DeepSeek {status}: {wallet}")
+            progress_wallet_trace(
+                dict(config),
+                wallet,
+                stage="deepseek",
+                status=status or "completed",
+                total_seconds=elapsed_perf_seconds(started_at),
+            )
+        return result
+    except Exception as exc:
+        if config is not None and wallet:
+            progress(dict(config), f"DeepSeek failed: {wallet} ({type(exc).__name__})")
+            progress_wallet_trace(
+                dict(config),
+                wallet,
+                stage="deepseek",
+                status="failed",
+                total_seconds=elapsed_perf_seconds(started_at),
+                error_type=type(exc).__name__,
+            )
+        return finder_ai_failed_result(
+            payload if isinstance(payload, Mapping) else None,
+            exc,
+        )
+
+
+def fetch_falcon_metrics_for_selected_wallet(
+    wallet: str,
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized_wallet = normalize_address(wallet)
+    if not normalized_wallet:
+        return {}
+    started_at = time.perf_counter()
+    progress(dict(config), f"Falcon metrics started: {normalized_wallet}")
+    try:
+        metrics = falcon_display_metrics_for_wallet(
+            normalized_wallet,
+            config=config,
+            now_date=current_utc_date_string(),
+        )
+        status = "completed" if metrics else "empty"
+        progress(dict(config), f"Falcon metrics {status}: {normalized_wallet}")
+        progress_wallet_trace(
+            dict(config),
+            normalized_wallet,
+            stage="falcon",
+            status=status,
+            total_seconds=elapsed_perf_seconds(started_at),
+        )
+        return dict(metrics) if isinstance(metrics, Mapping) else {}
+    except Exception as exc:
+        progress(dict(config), f"Falcon metrics failed: {normalized_wallet} ({type(exc).__name__})")
+        progress_wallet_trace(
+            dict(config),
+            normalized_wallet,
+            stage="falcon",
+            status="failed",
+            total_seconds=elapsed_perf_seconds(started_at),
+            error_type=type(exc).__name__,
+        )
+        raise
+
+
+def flush_pending_selected_wallet_results(
+    *,
+    pending_wallets: list[PendingSelectedWalletResult],
+    selected_wallets: list[dict[str, Any]],
+    wallet_results: list[dict[str, Any]],
+    wallets_dir: Path,
+    output_dir: Path,
+    config: Mapping[str, Any],
+    weather_index: WeatherIndex,
+    target_count: int,
+    history_registry_dir: Path | history_registry_module.HistoryRegistry | None = None,
+    history_run_id: str = "",
+    ai_executor: ThreadPoolExecutor | None = None,
+    wait: bool = False,
+) -> bool:
+    flushed_any = False
+    pending_wallets.sort(key=lambda item: item.sequence)
+    while pending_wallets:
+        if selected_wallets:
+            last_flushed_sequence = max(
+                int(record.get(SELECTED_WALLET_SEQUENCE_FIELD, -1_000_000_000))
+                for record in selected_wallets
+            )
+        else:
+            last_flushed_sequence = -1
+        min_pending_sequence = min(item.sequence for item in pending_wallets)
+        next_flush_sequence = (
+            min_pending_sequence
+            if min_pending_sequence > last_flushed_sequence + 1
+            else last_flushed_sequence + 1
+        )
+        ready_index = next(
+            (
+                index
+                for index, item in enumerate(pending_wallets)
+                if item.sequence == next_flush_sequence
+                and selected_wallet_pending_result_ready(item)
+            ),
+            None,
+        )
+        if ready_index is None:
+            ready_later_indices = [
+                index
+                for index, item in enumerate(pending_wallets)
+                if item.sequence > next_flush_sequence
+                and item.completion_future is not None
+                and item.completion_future.done()
+            ]
+            advanced_any = False
+            for index in reversed(ready_later_indices):
+                pending = pending_wallets.pop(index)
+                process_ready_pending_selected_wallet_result(
+                    pending=pending,
+                    pending_wallets=pending_wallets,
+                    selected_wallets=selected_wallets,
+                    wallet_results=wallet_results,
+                    wallets_dir=wallets_dir,
+                    output_dir=output_dir,
+                    config=config,
+                    weather_index=weather_index,
+                    target_count=target_count,
+                    history_registry_dir=history_registry_dir,
+                    history_run_id=history_run_id,
+                    ai_executor=ai_executor,
+                    allow_flush=False,
+                )
+                advanced_any = True
+            if advanced_any:
+                pending_wallets.sort(key=lambda item: item.sequence)
+                continue
+            if wait:
+                futures_to_wait: list[Future[dict[str, Any]]] = []
+                for pending in pending_wallets:
+                    if pending.completion_future is not None:
+                        futures_to_wait.append(pending.completion_future)
+                    elif pending.ai_future is not None:
+                        futures_to_wait.append(pending.ai_future)
+                if futures_to_wait:
+                    wait_for_futures(futures_to_wait, return_when=FIRST_COMPLETED)
+                    continue
+            break
+        pending = pending_wallets.pop(ready_index)
+        flushed_any = (
+            process_ready_pending_selected_wallet_result(
+                pending=pending,
+                pending_wallets=pending_wallets,
+                selected_wallets=selected_wallets,
+                wallet_results=wallet_results,
+                wallets_dir=wallets_dir,
+                output_dir=output_dir,
+                config=config,
+                weather_index=weather_index,
+                target_count=target_count,
+                history_registry_dir=history_registry_dir,
+                history_run_id=history_run_id,
+                ai_executor=ai_executor,
+                allow_flush=True,
+            )
+            or flushed_any
+        )
+    return flushed_any
+
+
+def process_ready_pending_selected_wallet_result(
+    *,
+    pending: PendingSelectedWalletResult,
+    pending_wallets: list[PendingSelectedWalletResult],
+    selected_wallets: list[dict[str, Any]],
+    wallet_results: list[dict[str, Any]],
+    wallets_dir: Path,
+    output_dir: Path,
+    config: Mapping[str, Any],
+    weather_index: WeatherIndex,
+    target_count: int,
+    history_registry_dir: Path | history_registry_module.HistoryRegistry | None = None,
+    history_run_id: str = "",
+    ai_executor: ThreadPoolExecutor | None = None,
+    allow_flush: bool = True,
+) -> bool:
+    completion_future = pending.completion_future
+    if completion_future is not None:
+        completed = completion_future.result()
+        completed_wallet_result = completed.get("wallet_result")
+        if isinstance(completed_wallet_result, Mapping):
+            pending.wallet_result = dict(completed_wallet_result)
+        completed_snapshot = completed.get("snapshot")
+        if isinstance(completed_snapshot, Mapping):
+            pending.snapshot = dict(completed_snapshot)
+        pending.completion_future = None
+        pending.finalized = bool(completed.get("finalized", False))
+        if bool(completed.get("finder_ai_pending")) and pending.ai_future is None:
+            if ai_executor is not None:
+                pending.ai_future = ai_executor.submit(
+                    generate_finder_ai_for_wallet_result,
+                    pending.wallet_result,
+                    config,
+                )
+            else:
+                pending.finalized = False
+
+    if pending.ai_future is not None and not pending.ai_future.done():
+        pending_wallets.append(pending)
+        pending_wallets.sort(key=lambda item: item.sequence)
+        return False
+
+    if not allow_flush:
+        pending_wallets.append(pending)
+        pending_wallets.sort(key=lambda item: item.sequence)
+        return False
+
+    future = pending.ai_future
+    if pending.finalized:
+        finalized = pending.wallet_result
+    else:
+        finder_ai_result = future.result() if future is not None else pending.wallet_result.get("finder_ai")
+        finalized = finalize_selected_wallet_result(
+            pending.wallet_result,
+            snapshot=pending.snapshot,
+            weather_index=weather_index,
+            config=config,
+            finder_ai_result=finder_ai_result if isinstance(finder_ai_result, Mapping) else None,
+        )
+    selection_record = dict(finalized["selection_record"])
+    selection_record[SELECTED_WALLET_SEQUENCE_FIELD] = pending.sequence
+    selected_wallets.append(selection_record)
+    selected_wallets.sort(key=selected_wallet_sort_key)
+    write_json(wallets_dir / f"{pending.wallet}.json", finalized)
+    write_wallet_history_record(
+        history_registry_dir=history_registry_dir,
+        wallet=pending.wallet,
+        leaderboard_entry=pending.leaderboard_entry,
+        run_id=history_run_id,
+        status="selected",
+    )
+    wallet_results.append(compact_wallet_result_for_run_summary(finalized))
+    progress(
+        dict(config),
+        f"Wallet completed {len(selected_wallets)} of {target_count}: {pending.wallet}",
+    )
+    return True
+
+
+def selected_wallet_pending_result_ready(
+    pending: PendingSelectedWalletResult,
+) -> bool:
+    completion_future = pending.completion_future
+    if completion_future is not None:
+        return completion_future.done()
+    ai_future = pending.ai_future
+    if ai_future is not None:
+        return ai_future.done()
+    return True
+
+
+def start_selected_wallet_pending_result(
+    *,
+    client: PolymarketClient,
+    batch_index: int,
+    batch_result: dict[str, Any],
+    selected_completion_executor: ThreadPoolExecutor,
+    falcon_executor: ThreadPoolExecutor,
+    ai_executor: ThreadPoolExecutor,
+    weather_index: WeatherIndex,
+    config: Mapping[str, Any],
+) -> PendingSelectedWalletResult:
+    wallet_result = batch_result["wallet_result"]
+    snapshot = batch_result["snapshot"]
+    wallet = str(batch_result.get("wallet") or wallet_result.get("wallet") or "")
+    falcon_metrics_future: Future[dict[str, Any]] | None = None
+    if wallet:
+        falcon_metrics_future = falcon_executor.submit(
+            fetch_falcon_metrics_for_selected_wallet,
+            wallet,
+            dict(config),
+        )
+    completion_future: Future[dict[str, Any]] | None = None
+    if wallet_result_full_hydration_deferred(wallet_result):
+        completion_future = selected_completion_executor.submit(
+            complete_deferred_selected_wallet_result,
+            client=client,
+            leaderboard_entry=batch_result.get("leaderboard_entry", {}),
+            wallet_result=wallet_result,
+            snapshot=snapshot,
+            weather_index=weather_index,
+            config=dict(config),
+            falcon_metrics_future=falcon_metrics_future,
+        )
+    else:
+        falcon_metrics = (
+            falcon_metrics_future.result()
+            if falcon_metrics_future is not None
+            else None
+        )
+        wallet_result = enrich_wallet_result_artifacts(
+            wallet_result=wallet_result,
+            snapshot=snapshot,
+            weather_index=weather_index,
+            config=dict(config),
+            falcon_metrics=falcon_metrics,
+        )
+    ai_future: Future[dict[str, Any]] | None = None
+    if completion_future is None and should_generate_finder_ai_for_wallet_result(wallet_result):
+        ai_future = ai_executor.submit(
+            generate_finder_ai_for_wallet_result,
+            wallet_result,
+            dict(config),
+        )
+    return PendingSelectedWalletResult(
+        sequence=batch_result.get("sequence", batch_index),
+        wallet=wallet,
+        wallet_result=wallet_result,
+        snapshot=snapshot,
+        leaderboard_entry=dict(batch_result.get("leaderboard_entry", {})),
+        ai_future=ai_future,
+        completion_future=completion_future,
+        falcon_metrics_future=falcon_metrics_future,
+    )
+
+
+def write_analysis_batch_result_history_record(
+    *,
+    result: Mapping[str, Any],
+    history_registry_dir: Path | None,
+    history_run_id: str,
+) -> None:
+    status = str(result.get("history_record_status") or "").strip()
+    if not status:
+        return
+    wallet = normalize_address(result.get("wallet") or "")
+    if not wallet:
+        return
+    leaderboard_entry = (
+        dict(result.get("leaderboard_entry"))
+        if isinstance(result.get("leaderboard_entry"), Mapping)
+        else {}
+    )
+    write_wallet_history_record(
+        history_registry_dir=history_registry_dir,
+        wallet=wallet,
+        leaderboard_entry=leaderboard_entry,
+        run_id=history_run_id,
+        status=status,
+    )
+
+
+def selected_wallet_sort_key(record: Mapping[str, Any]) -> tuple[int, str]:
+    try:
+        sequence = int(record.get(SELECTED_WALLET_SEQUENCE_FIELD, 1_000_000_000))
+    except (TypeError, ValueError):
+        sequence = 1_000_000_000
+    return sequence, normalize_address(record.get("wallet") or "")
+
+
+def selected_wallets_for_output(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output_records: list[dict[str, Any]] = []
+    for record in sorted(records, key=selected_wallet_sort_key):
+        output_records.append(
+            {
+                str(key): value
+                for key, value in record.items()
+                if str(key) != SELECTED_WALLET_SEQUENCE_FIELD
+            }
+        )
+    return output_records
+
+
+def seed_selected_wallet_sequences(records: list[dict[str, Any]]) -> None:
+    if not records:
+        return
+    offset = len(records)
+    for index, record in enumerate(records):
+        record.setdefault(SELECTED_WALLET_SEQUENCE_FIELD, index - offset)
+
+
+def load_existing_wallet_resume_index(
+    output_dir: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str]]:
+    wallets_dir = output_dir / "wallets"
+    if not wallets_dir.exists():
+        return [], [], set()
+
+    completed_wallets: set[str] = {
+        normalize_address(wallet_path.stem)
+        for wallet_path in sorted(wallets_dir.glob("*.json"))
+        if normalize_address(wallet_path.stem)
+    }
+    selected_wallets = [
+        dict(item)
+        for item in read_json_list(output_dir / "selected_wallets.json")
+        if isinstance(item, Mapping)
+    ]
+    screening_records = [
+        dict(item)
+        for item in read_json_list(output_dir / "screening_records.json")
+        if isinstance(item, Mapping)
+    ]
+    if not selected_wallets or not screening_records:
+        (
+            rebuilt_selected_wallets,
+            rebuilt_screening_records,
+        ) = rebuild_wallet_resume_index_from_detail_files(output_dir)
+        if not selected_wallets:
+            selected_wallets = rebuilt_selected_wallets
+        if not screening_records:
+            screening_records = rebuilt_screening_records
+    selected_wallets, screening_records = merge_missing_wallet_resume_records_from_detail_files(
+        output_dir=output_dir,
+        selected_wallets=selected_wallets,
+        screening_records=screening_records,
+        completed_wallets=completed_wallets,
+    )
+    return selected_wallets, screening_records, completed_wallets
+
+
 def load_existing_wallet_results_for_resume(
     output_dir: Path,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], set[str]]:
+    selected_wallets, screening_records, completed_wallets = load_existing_wallet_resume_index(output_dir)
+    wallet_results = load_wallet_results_from_detail_files(
+        output_dir=output_dir,
+        selected_wallets=selected_wallets,
+    )
+    if not screening_records:
+        screening_records = [
+            dict(wallet_result.get("screening"))
+            for wallet_result in wallet_results
+            if isinstance(wallet_result.get("screening"), Mapping)
+        ]
+    if not selected_wallets:
+        selected_wallets = [
+            dict(wallet_result.get("selection_record"))
+            for wallet_result in wallet_results
+            if isinstance(wallet_result.get("selection_record"), Mapping)
+        ]
+    if not completed_wallets:
+        completed_wallets = {
+            wallet_address_from_result(wallet_result)
+            for wallet_result in wallet_results
+            if wallet_address_from_result(wallet_result)
+        }
+    return selected_wallets, wallet_results, screening_records, completed_wallets
+
+
+def load_wallet_results_from_detail_files(
+    *,
+    output_dir: Path,
+    selected_wallets: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     wallets_dir = output_dir / "wallets"
     if not wallets_dir.exists():
-        return [], [], [], set()
-
-    selected_wallets: list[dict[str, Any]] = []
-    wallet_results: list[dict[str, Any]] = []
-    screening_records: list[dict[str, Any]] = []
-    completed_wallets: set[str] = set()
+        return []
+    wallet_order = [
+        normalize_address(item.get("wallet"))
+        for item in (selected_wallets or [])
+        if isinstance(item, Mapping) and normalize_address(item.get("wallet"))
+    ]
+    selected_wallet_lookup = set(wallet_order)
+    compacted_by_wallet: dict[str, dict[str, Any]] = {}
     for wallet_path in sorted(wallets_dir.glob("*.json")):
         wallet_result = read_json_file(wallet_path)
         if not isinstance(wallet_result, Mapping):
             continue
         wallet = wallet_address_from_result(wallet_result, wallet_path.stem)
-        if not wallet or wallet in completed_wallets:
+        if not wallet:
             continue
-        completed_wallets.add(wallet)
+        if selected_wallet_lookup and wallet not in selected_wallet_lookup:
+            continue
+        compacted_by_wallet[wallet] = compact_wallet_result_for_run_summary(wallet_result)
+    if wallet_order:
+        return [compacted_by_wallet[wallet] for wallet in wallet_order if wallet in compacted_by_wallet]
+    return list(compacted_by_wallet.values())
+
+
+def rebuild_wallet_resume_index_from_detail_files(
+    output_dir: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    wallets_dir = output_dir / "wallets"
+    if not wallets_dir.exists():
+        return [], []
+
+    selected_wallets: list[dict[str, Any]] = []
+    screening_records: list[dict[str, Any]] = []
+    for wallet_path in sorted(wallets_dir.glob("*.json")):
+        wallet_result = read_json_file(wallet_path)
+        if not isinstance(wallet_result, Mapping):
+            continue
+        wallet = wallet_address_from_result(wallet_result, wallet_path.stem)
+        if not wallet:
+            continue
         screening = wallet_result.get("screening")
         if isinstance(screening, Mapping):
             screening_records.append(dict(screening))
             if screening.get("selected") is False:
                 continue
         selected_wallets.append(selection_record_from_wallet_result(wallet_result, wallet))
-        wallet_results.append(compact_wallet_result_for_run_summary(wallet_result))
-    return selected_wallets, wallet_results, screening_records, completed_wallets
+    return selected_wallets, screening_records
+
+
+def merge_missing_wallet_resume_records_from_detail_files(
+    *,
+    output_dir: Path,
+    selected_wallets: list[dict[str, Any]],
+    screening_records: list[dict[str, Any]],
+    completed_wallets: set[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not completed_wallets:
+        return selected_wallets, screening_records
+
+    selected_by_wallet = {
+        normalize_address(item.get("wallet"))
+        for item in selected_wallets
+        if isinstance(item, Mapping) and normalize_address(item.get("wallet"))
+    }
+    screening_by_wallet = {
+        normalize_address(item.get("wallet"))
+        for item in screening_records
+        if isinstance(item, Mapping) and normalize_address(item.get("wallet"))
+    }
+    screening_selected_wallets = {
+        normalize_address(item.get("wallet"))
+        for item in screening_records
+        if (
+            isinstance(item, Mapping)
+            and item.get("selected") is True
+            and normalize_address(item.get("wallet"))
+        )
+    }
+    missing_wallets = (completed_wallets - screening_by_wallet) | (
+        screening_selected_wallets - selected_by_wallet
+    )
+    if not missing_wallets:
+        return selected_wallets, screening_records
+
+    wallets_dir = output_dir / "wallets"
+    for wallet in sorted(missing_wallets):
+        wallet_result = read_json_file(wallets_dir / f"{wallet}.json")
+        if not isinstance(wallet_result, Mapping):
+            continue
+        resolved_wallet = wallet_address_from_result(wallet_result, wallet)
+        if not resolved_wallet:
+            continue
+        screening = wallet_result.get("screening")
+        if isinstance(screening, Mapping) and resolved_wallet not in screening_by_wallet:
+            screening_records.append(dict(screening))
+            screening_by_wallet.add(resolved_wallet)
+            if screening.get("selected") is True:
+                screening_selected_wallets.add(resolved_wallet)
+        if resolved_wallet in selected_by_wallet:
+            continue
+        if isinstance(screening, Mapping) and screening.get("selected") is False:
+            continue
+        selected_wallets.append(selection_record_from_wallet_result(wallet_result, resolved_wallet))
+        selected_by_wallet.add(resolved_wallet)
+    return selected_wallets, screening_records
 
 
 def load_existing_weather_events_for_resume(output_dir: Path) -> list[dict[str, Any]]:
@@ -407,11 +1278,25 @@ def filter_completed_leaderboard_entries(
     return [entry for entry in entries if entry_wallet(entry) not in completed_wallets]
 
 
+def freeze_analysis_current_datetime(config: dict[str, Any]) -> str:
+    analysis_settings = config.setdefault("analysis", {})
+    configured = analysis_settings.get("current_datetime") or analysis_settings.get("current_date")
+    parsed = parse_datetime(configured)
+    if parsed is not None:
+        frozen = parsed.astimezone(UTC).isoformat()
+        analysis_settings["current_datetime"] = frozen
+        return frozen
+    frozen = datetime.now(UTC).isoformat()
+    analysis_settings["current_datetime"] = frozen
+    return frozen
+
+
 def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     runtime = config.setdefault("runtime", {})
     runtime["run_id"] = str(runtime.get("run_id") or output_dir.name).strip()
     runtime["artifacts_root"] = str(output_dir.parent.resolve())
+    freeze_analysis_current_datetime(config)
     wallets_dir = output_dir / "wallets"
     wallets_dir.mkdir(parents=True, exist_ok=True)
     history_registry_dir = history_registry_module.create_history_registry(
@@ -442,10 +1327,10 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     if resume_existing_output:
         (
             selected_wallets,
-            wallet_results,
             screening_records,
             completed_wallets,
-        ) = load_existing_wallet_results_for_resume(output_dir)
+        ) = load_existing_wallet_resume_index(output_dir)
+        seed_selected_wallet_sequences(selected_wallets)
         if completed_wallets:
             progress(
                 config,
@@ -497,134 +1382,308 @@ def run_pipeline(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     weather_index_ready = False
     if not (resume_existing_output and (output_dir / "weather_events.json").exists()):
         write_json(output_dir / "weather_events.json", weather_events)
-    write_json(output_dir / "selected_wallets.json", selected_wallets)
+    write_json(output_dir / "selected_wallets.json", selected_wallets_for_output(selected_wallets))
     write_json(output_dir / "errors.json", errors)
+    selected_wallets_dirty = False
+    screening_records_dirty = False
+    errors_dirty = False
+    finder_ai_concurrency = analysis_setting_int(config, "finder_ai_concurrency", 1)
+    full_hydration_concurrency = analysis_setting_int(config, "full_hydration_concurrency", 2)
+    falcon_metrics_concurrency = analysis_setting_int(config, "falcon_metrics_concurrency", 2)
+    wallet_screening_lookahead_multiplier = analysis_setting_int(
+        config,
+        "wallet_screening_lookahead_multiplier",
+        1,
+    )
+    defer_full_hydration = should_defer_selected_wallet_full_hydration(config)
+    pending_selected_wallets: list[PendingSelectedWalletResult] = []
 
     processed_entries = 0
     next_leaderboard_offset = len(leaderboard)
-
-    while True:
-        if len(selected_wallets) >= target_count:
-            break
-        if processed_entries >= len(candidate_entries):
-            if not auto_extend_leaderboard:
+    ai_executor = ThreadPoolExecutor(max_workers=finder_ai_concurrency)
+    selected_completion_executor = ThreadPoolExecutor(max_workers=full_hydration_concurrency)
+    falcon_executor = ThreadPoolExecutor(max_workers=falcon_metrics_concurrency)
+    try:
+        while True:
+            if flush_pending_selected_wallet_results(
+                pending_wallets=pending_selected_wallets,
+                selected_wallets=selected_wallets,
+                wallet_results=wallet_results,
+                wallets_dir=wallets_dir,
+                output_dir=output_dir,
+                config=config,
+                weather_index=weather_index,
+                target_count=target_count,
+                history_registry_dir=history_registry_dir,
+                history_run_id=history_run_id,
+                ai_executor=ai_executor,
+            ):
+                selected_wallets_dirty = True
+            selected_progress = len(selected_wallets) + len(pending_selected_wallets)
+            if selected_progress >= target_count:
                 break
-            if max_leaderboard_rows is not None and next_leaderboard_offset >= max_leaderboard_rows:
+            if processed_entries >= len(candidate_entries):
+                if not auto_extend_leaderboard:
+                    break
+                if max_leaderboard_rows is not None and next_leaderboard_offset >= max_leaderboard_rows:
+                    progress(
+                        config,
+                        f"Stopped extending leaderboard at configured cap {max_leaderboard_rows}",
+                    )
+                    break
+
+                additional_limit = leaderboard_page_size
+                if max_leaderboard_rows is not None:
+                    additional_limit = min(additional_limit, max_leaderboard_rows - next_leaderboard_offset)
+                if additional_limit <= 0:
+                    break
+
+                extra_rows = fetch_leaderboard(
+                    client,
+                    config,
+                    offset=next_leaderboard_offset,
+                    fetch_limit=additional_limit,
+                )
+                if not extra_rows:
+                    break
+
+                extra_wallets = {
+                    entry_wallet(entry)
+                    for entry in extra_rows
+                    if entry_wallet(entry)
+                }
+                if not any(wallet not in seen_candidate_wallets for wallet in extra_wallets):
+                    progress(
+                        config,
+                        "Stopped extending leaderboard because the next page did not add new wallets",
+                    )
+                    break
+
+                extra_entries = [
+                    entry for entry in extra_rows if str(entry.get("proxyWallet", "")).strip()
+                ]
+                extra_entries = filter_completed_leaderboard_entries(extra_entries, completed_wallets)
+                extra_candidates, extra_prefiltered = split_leaderboard_prefilter_candidates(
+                    extra_entries,
+                    config,
+                    history_registry_dir=history_registry_dir,
+                    seen_wallets=seen_candidate_wallets,
+                )
+                leaderboard.extend(extra_rows)
+                write_json(output_dir / "leaderboard.json", leaderboard)
+                candidate_entries.extend(extra_candidates)
+                screening_records.extend(extra_prefiltered)
+                if extra_prefiltered:
+                    screening_records_dirty = True
+                next_leaderboard_offset += len(extra_rows)
+                write_json(output_dir / "screening_records.json", screening_records)
+                screening_records_dirty = False
                 progress(
                     config,
-                    f"Stopped extending leaderboard at configured cap {max_leaderboard_rows}",
+                    f"Extended leaderboard to {len(leaderboard)} rows; {len(candidate_entries)} candidates remain under consideration",
                 )
-                break
+                continue
 
-            additional_limit = leaderboard_page_size
-            if max_leaderboard_rows is not None:
-                additional_limit = min(additional_limit, max_leaderboard_rows - next_leaderboard_offset)
-            if additional_limit <= 0:
-                break
+            if candidate_entries and not weather_index_ready:
+                if resume_existing_output and (output_dir / "weather_events.json").exists():
+                    progress(config, "Loading existing weather events for resumed run")
+                    weather_events = load_existing_weather_events_for_resume(output_dir)
+                if not weather_events:
+                    progress(config, "Fetching weather events")
+                    weather_events = fetch_weather_events(client, config)
+                    write_json(output_dir / "weather_events.json", weather_events)
+                weather_index = build_weather_index(weather_events)
+                weather_index_ready = True
+                progress(config, f"Indexed {len(weather_events)} weather events")
 
-            extra_rows = fetch_leaderboard(
-                client,
-                config,
-                offset=next_leaderboard_offset,
-                fetch_limit=additional_limit,
+            selected_progress = len(selected_wallets) + len(pending_selected_wallets)
+            remaining_target = max(1, target_count - selected_progress)
+            screening_window_size = concurrent_wallets * wallet_screening_lookahead_multiplier
+            tail_batch_size = min(
+                max(concurrent_wallets, screening_window_size),
+                max(1, remaining_target + concurrent_wallets),
             )
-            if not extra_rows:
-                break
-
-            leaderboard.extend(extra_rows)
-            write_json(output_dir / "leaderboard.json", leaderboard)
-            extra_entries = [
-                entry for entry in extra_rows if str(entry.get("proxyWallet", "")).strip()
-            ]
-            extra_entries = filter_completed_leaderboard_entries(extra_entries, completed_wallets)
-            extra_candidates, extra_prefiltered = split_leaderboard_prefilter_candidates(
-                extra_entries,
-                config,
-                history_registry_dir=history_registry_dir,
-                seen_wallets=seen_candidate_wallets,
-            )
-            candidate_entries.extend(extra_candidates)
-            screening_records.extend(extra_prefiltered)
-            next_leaderboard_offset += len(extra_rows)
+            batch = candidate_entries[processed_entries : processed_entries + tail_batch_size]
             progress(
                 config,
-                f"Extended leaderboard to {len(leaderboard)} rows; {len(candidate_entries)} candidates remain under consideration",
+                f"Analyzing wallets {processed_entries + 1}-{processed_entries + len(batch)} of {len(candidate_entries)}",
             )
-            continue
+            batch_results: list[dict[str, Any]] = []
+            batch_results_by_index: dict[int, dict[str, Any]] = {}
+            pending_selected_by_index: dict[int, PendingSelectedWalletResult] = {}
+            next_batch_result_index = 0
+            stop_processing_batch = False
+            try:
+                for batch_index, result in iter_analyze_wallet_batch_results(
+                    client=client,
+                    leaderboard_entries=batch,
+                    weather_index=weather_index,
+                    config=config,
+                    max_workers=concurrent_wallets,
+                    history_registry_dir=history_registry_dir,
+                    history_run_id=history_run_id,
+                    defer_full_hydration=defer_full_hydration,
+                ):
+                    result.setdefault("sequence", processed_entries + batch_index)
+                    batch_results.append(result)
+                    batch_results_by_index[batch_index] = result
+                    if (
+                        not stop_processing_batch
+                        and batch_index < remaining_target
+                        and isinstance(result.get("wallet_result"), Mapping)
+                        and result["wallet_result"].get("screening", {}).get("selected")
+                    ):
+                        pending_selected_by_index.setdefault(
+                            batch_index,
+                            start_selected_wallet_pending_result(
+                                client=client,
+                                batch_index=batch_index,
+                                batch_result=result,
+                                selected_completion_executor=selected_completion_executor,
+                                falcon_executor=falcon_executor,
+                                ai_executor=ai_executor,
+                                weather_index=weather_index,
+                                config=config,
+                            ),
+                        )
+                    while not stop_processing_batch and next_batch_result_index in batch_results_by_index:
+                        current_result = batch_results_by_index.pop(next_batch_result_index)
+                        wallet = current_result["wallet"]
+                        if current_result.get("error"):
+                            write_analysis_batch_result_history_record(
+                                result=current_result,
+                                history_registry_dir=history_registry_dir,
+                                history_run_id=history_run_id,
+                            )
+                            error_payload = current_result["error"]
+                            if isinstance(error_payload, Mapping):
+                                errors.append(dict(error_payload))
+                            else:
+                                errors.append({"wallet": wallet, "error": str(error_payload)})
+                            errors_dirty = True
+                            progress(config, f"Wallet failed {len(errors)}: {wallet}")
+                            next_batch_result_index += 1
+                            continue
+                        if current_result.get("screening"):
+                            write_analysis_batch_result_history_record(
+                                result=current_result,
+                                history_registry_dir=history_registry_dir,
+                                history_run_id=history_run_id,
+                            )
+                            screening_records.append(current_result["screening"])
+                            screening_records_dirty = True
+                            next_batch_result_index += 1
+                            continue
 
-        if candidate_entries and not weather_index_ready:
-            if resume_existing_output and (output_dir / "weather_events.json").exists():
-                progress(config, "Loading existing weather events for resumed run")
-                weather_events = load_existing_weather_events_for_resume(output_dir)
-            if not weather_events:
-                progress(config, "Fetching weather events")
-                weather_events = fetch_weather_events(client, config)
-                write_json(output_dir / "weather_events.json", weather_events)
-            weather_index = build_weather_index(weather_events)
-            weather_index_ready = True
-            progress(config, f"Indexed {len(weather_events)} weather events")
+                        wallet_result = current_result["wallet_result"]
+                        write_analysis_batch_result_history_record(
+                            result=current_result,
+                            history_registry_dir=history_registry_dir,
+                            history_run_id=history_run_id,
+                        )
+                        screening_records.append(wallet_result["screening"])
+                        screening_records_dirty = True
+                        if not wallet_result["screening"]["selected"]:
+                            next_batch_result_index += 1
+                            continue
 
-        batch = candidate_entries[processed_entries : processed_entries + concurrent_wallets]
-        progress(
-            config,
-            f"Analyzing wallets {processed_entries + 1}-{processed_entries + len(batch)} of {len(candidate_entries)}",
-        )
-        batch_results = analyze_wallet_batch(
-            client=client,
-            leaderboard_entries=batch,
-            weather_index=weather_index,
+                        pending = pending_selected_by_index.pop(next_batch_result_index, None)
+                        if pending is None:
+                            pending = start_selected_wallet_pending_result(
+                                client=client,
+                                batch_index=next_batch_result_index,
+                                batch_result=current_result,
+                                selected_completion_executor=selected_completion_executor,
+                                falcon_executor=falcon_executor,
+                                ai_executor=ai_executor,
+                                weather_index=weather_index,
+                                config=config,
+                            )
+                        pending_selected_wallets.append(pending)
+                        if flush_pending_selected_wallet_results(
+                            pending_wallets=pending_selected_wallets,
+                            selected_wallets=selected_wallets,
+                            wallet_results=wallet_results,
+                            wallets_dir=wallets_dir,
+                            output_dir=output_dir,
+                            config=config,
+                            weather_index=weather_index,
+                            target_count=target_count,
+                            history_registry_dir=history_registry_dir,
+                            history_run_id=history_run_id,
+                            ai_executor=ai_executor,
+                        ):
+                            selected_wallets_dirty = True
+                        selected_progress = len(selected_wallets) + len(pending_selected_wallets)
+                        next_batch_result_index += 1
+                        if selected_progress >= target_count:
+                            stop_processing_batch = True
+                            for pending in pending_selected_by_index.values():
+                                if pending.completion_future is not None:
+                                    pending.completion_future.cancel()
+                                if pending.falcon_metrics_future is not None:
+                                    pending.falcon_metrics_future.cancel()
+                                if pending.ai_future is not None:
+                                    pending.ai_future.cancel()
+                            break
+            finally:
+                cleanup_completed_analysis_batch(config, batch_results)
+            if screening_records_dirty:
+                write_json(output_dir / "screening_records.json", screening_records)
+                screening_records_dirty = False
+            if errors_dirty:
+                write_json(output_dir / "errors.json", errors)
+                errors_dirty = False
+            if selected_wallets_dirty:
+                write_json(output_dir / "selected_wallets.json", selected_wallets_for_output(selected_wallets))
+                selected_wallets_dirty = False
+            processed_entries += len(batch)
+        if flush_pending_selected_wallet_results(
+            pending_wallets=pending_selected_wallets,
+            selected_wallets=selected_wallets,
+            wallet_results=wallet_results,
+            wallets_dir=wallets_dir,
+            output_dir=output_dir,
             config=config,
-            max_workers=concurrent_wallets,
+            weather_index=weather_index,
+            target_count=target_count,
             history_registry_dir=history_registry_dir,
             history_run_id=history_run_id,
-        )
-        try:
-            for result in batch_results:
-                wallet = result["wallet"]
-                if result.get("error"):
-                    error_payload = result["error"]
-                    if isinstance(error_payload, Mapping):
-                        errors.append(dict(error_payload))
-                    else:
-                        errors.append({"wallet": wallet, "error": str(error_payload)})
-                    write_json(output_dir / "errors.json", errors)
-                    progress(config, f"Wallet failed {len(errors)}: {wallet}")
-                    continue
-                if result.get("screening"):
-                    screening_records.append(result["screening"])
-                    continue
+            ai_executor=ai_executor,
+            wait=True,
+        ):
+            selected_wallets_dirty = True
+    finally:
+        selected_completion_executor.shutdown(wait=True)
+        falcon_executor.shutdown(wait=True)
+        ai_executor.shutdown(wait=True)
 
-                wallet_result = result["wallet_result"]
-                screening_records.append(wallet_result["screening"])
-                if wallet_result["screening"]["selected"]:
-                    if should_generate_finder_ai_for_wallet_result(wallet_result):
-                        wallet_result["finder_ai"] = generate_finder_ai_brief(
-                            payload=wallet_result.get("finder_ai"),
-                            wallet_result=wallet_result,
-                        )
-                    wallet_result["selection_record"] = sync_selection_record_finder_ai_fields(
-                        wallet_result.get("selection_record"),
-                        wallet_result.get("finder_ai"),
-                    )
-                    core_label_keys = wallet_result_system_core_label_keys(wallet_result)
-                    wallet_result["selection_record"]["has_core_label"] = bool(core_label_keys)
-                    wallet_result["selection_record"]["core_label_keys"] = core_label_keys
-                    selected_wallets.append(wallet_result["selection_record"])
-                    write_json(wallets_dir / f"{wallet}.json", wallet_result)
-                    wallet_results.append(compact_wallet_result_for_run_summary(wallet_result))
-                    write_json(output_dir / "selected_wallets.json", selected_wallets)
-                    progress(config, f"Wallet completed {len(selected_wallets)} of {target_count}: {wallet}")
-                    if len(selected_wallets) >= target_count:
-                        break
-        finally:
-            cleanup_completed_analysis_batch(config, batch_results)
-        processed_entries += len(batch)
+    run_cleanup = cleanup_completed_analysis_run(config)
+    compaction_status = (
+        run_cleanup.get("history_ledger_gap_compaction")
+        if isinstance(run_cleanup.get("history_ledger_gap_compaction"), Mapping)
+        else {}
+    )
+    progress(
+        config,
+        "Final cleanup completed"
+        + (
+            f" (gap compaction: {compaction_status.get('status')})"
+            if compaction_status
+            else ""
+        ),
+    )
 
     write_json(output_dir / "leaderboard.json", leaderboard)
     write_json(output_dir / "screening_records.json", screening_records)
-    write_json(output_dir / "selected_wallets.json", selected_wallets)
+    write_json(output_dir / "selected_wallets.json", selected_wallets_for_output(selected_wallets))
     write_json(output_dir / "errors.json", errors)
+    wallet_results = load_wallet_results_from_detail_files(
+        output_dir=output_dir,
+        selected_wallets=selected_wallets,
+    )
     analysis_summary = build_analysis_summary(
+        config=config,
         leaderboard=leaderboard,
         weather_events=weather_events,
         screening_records=screening_records,
@@ -716,6 +1775,26 @@ def fetch_weather_events(client: PolymarketClient, config: dict[str, Any]) -> li
     tag_slug = weather.get("tag_slug")
 
     if weather.get("use_keyset", True):
+        cache_signature = weather_events_cache_signature(
+            page_size=int(weather["page_size"]),
+            max_events=max_events,
+            order=str(weather.get("order", "createdAt")),
+            ascending=bool(weather.get("ascending", False)),
+            tag_id=tag_id,
+            tag_slug=tag_slug,
+            active=active,
+            closed=closed,
+            archived=archived,
+        )
+        cached_events = load_reusable_weather_events_cache(
+            client=client,
+            config=config,
+            signature=cache_signature,
+        )
+        if cached_events is not None:
+            events, fetch_summary = cached_events
+            write_weather_fetch_summary(config, fetch_summary)
+            return events
         try:
             events, fetch_summary = fetch_weather_events_keyset_with_summary(
                 client=client,
@@ -730,6 +1809,12 @@ def fetch_weather_events(client: PolymarketClient, config: dict[str, Any]) -> li
                 archived=archived,
             )
             write_weather_fetch_summary(config, fetch_summary)
+            write_weather_events_cache(
+                config=config,
+                signature=cache_signature,
+                events=events,
+                summary=fetch_summary,
+            )
             return events
         except Exception:
             pass
@@ -758,6 +1843,210 @@ def fetch_weather_events(client: PolymarketClient, config: dict[str, Any]) -> li
         },
     )
     return events
+
+
+def weather_events_cache_enabled(config: Mapping[str, Any]) -> bool:
+    weather = config.get("weather", {}) if isinstance(config, Mapping) else {}
+    if not isinstance(weather, Mapping):
+        return False
+    return bool_config_value(
+        weather.get("reuse_recent_cache", weather.get("cache_enabled")),
+        False,
+    )
+
+
+def weather_events_cache_dir(config: Mapping[str, Any]) -> Path:
+    weather = config.get("weather", {}) if isinstance(config, Mapping) else {}
+    if isinstance(weather, Mapping):
+        configured = str(weather.get("cache_dir") or "").strip()
+        if configured:
+            return Path(configured)
+    api = config.get("api", {}) if isinstance(config, Mapping) else {}
+    api_cache_dir = (
+        str(api.get("cache_dir") or "").strip()
+        if isinstance(api, Mapping)
+        else ""
+    )
+    base_dir = Path(api_cache_dir or ".cache/polymarket-weather-tool")
+    return base_dir / WEATHER_EVENTS_CACHE_DIRNAME
+
+
+def weather_events_cache_ttl_seconds(config: Mapping[str, Any]) -> int:
+    weather = config.get("weather", {}) if isinstance(config, Mapping) else {}
+    api = config.get("api", {}) if isinstance(config, Mapping) else {}
+    raw = None
+    if isinstance(weather, Mapping):
+        raw = weather.get("cache_ttl_seconds")
+    if raw in (None, "") and isinstance(api, Mapping):
+        raw = api.get("cache_ttl_seconds")
+    try:
+        return max(0, int(raw if raw not in (None, "") else 1800))
+    except (TypeError, ValueError):
+        return 1800
+
+
+def weather_events_cache_signature(
+    *,
+    page_size: int,
+    max_events: int,
+    order: str,
+    ascending: bool,
+    tag_id: int | str | None,
+    tag_slug: str | None,
+    active: bool | None,
+    closed: bool | None,
+    archived: bool | None,
+) -> dict[str, Any]:
+    return {
+        "version": WEATHER_EVENTS_CACHE_VERSION,
+        "mode": "keyset",
+        "page_size": int(page_size),
+        "max_events": int(max_events),
+        "order": str(order),
+        "ascending": bool(ascending),
+        "tag_id": tag_id,
+        "tag_slug": tag_slug,
+        "active": active,
+        "closed": closed,
+        "archived": archived,
+    }
+
+
+def weather_events_cache_path(config: Mapping[str, Any], signature: Mapping[str, Any]) -> Path:
+    signature_json = json.dumps(
+        dict(signature),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    digest = hashlib.sha256(signature_json.encode("utf-8")).hexdigest()
+    return weather_events_cache_dir(config) / f"{digest}.json"
+
+
+def weather_events_page_fingerprint(events: list[dict[str, Any]]) -> str:
+    payload = json.dumps(
+        events,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def load_reusable_weather_events_cache(
+    *,
+    client: PolymarketClient,
+    config: dict[str, Any],
+    signature: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    if not weather_events_cache_enabled(config):
+        return None
+    ttl_seconds = weather_events_cache_ttl_seconds(config)
+    if ttl_seconds <= 0:
+        return None
+    cache_path = weather_events_cache_path(config, signature)
+    try:
+        if not cache_path.exists():
+            return None
+        if time.time() - cache_path.stat().st_mtime > ttl_seconds:
+            return None
+    except OSError:
+        return None
+
+    payload = read_json_file(cache_path)
+    if not payload:
+        return None
+    if payload.get("signature") != dict(signature):
+        return None
+    summary = payload.get("summary")
+    events = payload.get("events")
+    if not isinstance(summary, Mapping) or not isinstance(events, list):
+        return None
+    if not bool(summary.get("natural_end")):
+        return None
+    cached_fingerprint = str(payload.get("first_page_fingerprint") or "").strip()
+    if not cached_fingerprint:
+        return None
+
+    try:
+        validation_payload = client.fetch_events_keyset_page(
+            limit=min(int(signature["page_size"]), int(signature["max_events"])),
+            after_cursor=None,
+            order=str(signature["order"]),
+            ascending=bool(signature["ascending"]),
+            tag_id=signature.get("tag_id"),
+            tag_slug=signature.get("tag_slug"),
+            active=signature.get("active"),
+            closed=signature.get("closed"),
+            archived=signature.get("archived"),
+        )
+    except Exception:
+        return None
+
+    validation_page = validation_payload.get("events", [])
+    if not isinstance(validation_page, list):
+        return None
+    validation_events = [
+        dict(event)
+        for event in validation_page
+        if isinstance(event, Mapping)
+    ]
+    if weather_events_page_fingerprint(validation_events) != cached_fingerprint:
+        return None
+
+    cached_events = [
+        dict(event)
+        for event in events
+        if isinstance(event, Mapping)
+    ]
+    fetch_summary = dict(summary)
+    fetch_summary.update(
+        {
+            "mode": "keyset_cache",
+            "source_mode": summary.get("mode", "keyset"),
+            "indexed": len(cached_events),
+            "cache_status": "reused",
+            "cache_created_at": payload.get("created_at"),
+            "cache_validated_first_page": True,
+            "validation_page_size": len(validation_events),
+            "validation_page_count": 1,
+        }
+    )
+    progress(config, f"Reused weather events cache ({len(cached_events)} events; validated first page)")
+    return cached_events, fetch_summary
+
+
+def write_weather_events_cache(
+    *,
+    config: Mapping[str, Any],
+    signature: Mapping[str, Any],
+    events: list[dict[str, Any]],
+    summary: Mapping[str, Any],
+) -> None:
+    if not weather_events_cache_enabled(config):
+        return
+    if not bool(summary.get("natural_end")):
+        return
+    page_size = max(1, int(signature.get("page_size") or len(events) or 1))
+    first_page = [
+        dict(event)
+        for event in events[:page_size]
+        if isinstance(event, Mapping)
+    ]
+    payload = {
+        "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "signature": dict(signature),
+        "summary": dict(summary),
+        "event_count": len(events),
+        "first_page_fingerprint": weather_events_page_fingerprint(first_page),
+        "events": events,
+    }
+    try:
+        write_json(weather_events_cache_path(config, signature), payload)
+    except OSError:
+        return
 
 
 def fetch_weather_events_keyset(
@@ -872,34 +2161,75 @@ def write_weather_fetch_summary(config: Mapping[str, Any], summary: Mapping[str,
         return
 
 
-def fetch_wallet_snapshot(
+def prefetched_collection_page_can_resume_aggregate(
+    page: Mapping[str, Any],
+    *,
+    section_name: str,
+) -> bool:
+    source_section = str(page.get("source_section") or section_name).strip().lower()
+    if source_section and source_section != section_name.lower():
+        return False
+
+    history_scope = str(page.get("history_scope") or "aggregate").strip().lower()
+    if history_scope not in {"aggregate"}:
+        return False
+
+    collection_mode = str(page.get("collection_mode") or "").strip().lower()
+    unsafe_modes = {
+        "activity_projection",
+        "recent_activity_projection",
+        "screening_prefetch",
+        "screening_window",
+        "screening_window_failed",
+    }
+    return collection_mode not in unsafe_modes
+
+
+def collection_record_stable_key(record: Mapping[str, Any]) -> tuple[str, ...]:
+    stable_id = str(first_non_empty_value(record, ("transactionHash", "txHash", "hash", "id")) or "").strip()
+    if stable_id:
+        return ("id", stable_id.lower())
+    return ("identity", *collection_record_identity_key(record))
+
+
+def collection_page_covers_prefetched_records(
+    page: Mapping[str, Any],
+    prefetched_records: list[dict[str, Any]],
+) -> bool:
+    if not prefetched_records:
+        return True
+    page_records = [
+        record
+        for record in (page.get("records", []) if isinstance(page.get("records", []), list) else [])
+        if isinstance(record, Mapping)
+    ]
+    page_keys = {collection_record_stable_key(record) for record in page_records}
+    return all(collection_record_stable_key(record) in page_keys for record in prefetched_records)
+
+
+def fetch_wallet_activity_page_for_snapshot(
+    *,
     client: PolymarketClient,
     wallet: str,
-    config: dict[str, Any],
-    *,
-    snapshot_scope: str = "full",
-    prefetched_trades: list[dict[str, Any]] | None = None,
+    page_size: int,
+    max_offset: int,
+    snapshot_scope: str,
+    screening_mode: str,
+    window_bounds: tuple[int, int] | None,
+    prefetched_activity_page: Mapping[str, Any] | None,
+    partition_probe_pages: int | None = None,
 ) -> dict[str, Any]:
-    pagination = config["pagination"]
-    page_size = int(pagination["page_size"])
-    max_offset = int(pagination["max_offset"])
-    position_size_threshold = float(config["analysis"].get("position_size_threshold", 0.1))
-    screening_mode = screening_snapshot_mode(config) if snapshot_scope == "screening" else ""
-    ledger_store = history_ledger_store(config)
-    window_bounds = (
-        screening_trade_window_bounds(config)
-        if screening_mode == "screening_window"
-        else None
-    )
-
-    if screening_mode == "recent_activity":
-        activity_page = fetch_recent_activity_screening_page(
-            client=client,
-            wallet=wallet,
-            page_size=page_size,
-        )
-    elif window_bounds is None:
-        activity_page = fetch_collection_page_with_recovery(
+    if (
+        isinstance(prefetched_activity_page, Mapping)
+        and snapshot_scope == "full"
+        and window_bounds is None
+    ):
+        prefetched_activity_records = [
+            dict(record)
+            for record in prefetched_activity_page.get("records", [])
+            if isinstance(record, Mapping)
+        ]
+        return fetch_collection_page_with_recovery(
             page_size=page_size,
             max_offset=max_offset,
             section_name="activity",
@@ -915,56 +2245,220 @@ def fetch_wallet_snapshot(
                 start=start,
                 end=end,
             ),
+            initial_records=prefetched_activity_records,
+            initial_page_count=decode_int(
+                prefetched_activity_page.get(
+                    "page_count",
+                    1 if prefetched_activity_records else 0,
+                )
+            ),
+            initial_next_offset=decode_int(
+                prefetched_activity_page.get(
+                    "next_offset",
+                    len(prefetched_activity_records),
+                )
+            ),
+            partition_probe_pages=partition_probe_pages,
         )
-    else:
-        window_start_ts, window_end_ts = window_bounds
-        try:
-            activity_page = fetch_time_window_collection_page(
-                page_size=page_size,
-                max_offset=max_offset,
-                section_name="activity",
-                start_ts=window_start_ts,
-                end_ts=window_end_ts,
-                fetch_partition_page=lambda limit, offset, start, end: client.fetch_activity_page(
-                    user=wallet,
-                    limit=limit,
-                    offset=offset,
-                    start=start,
-                    end=end,
-                ),
-            )
-        except Exception as exc:
-            activity_page = failed_collection_page(
-                section_name="activity",
-                stop_reason=f"request_error:{type(exc).__name__}",
-                history_scope="screening_window",
-                collection_mode="screening_window_failed",
-                range_start=window_start_ts,
-                range_end=window_end_ts,
-            )
-    if snapshot_scope == "screening":
-        positions_page = deferred_collection_page("positions")
-        accounting_snapshot = None
-        closed_positions_page = deferred_collection_page("closed_positions")
-    else:
-        positions_page, accounting_snapshot = fetch_positions_page_with_accounting_fallback(
+    if isinstance(prefetched_activity_page, Mapping):
+        activity_page = {
+            str(key): value
+            for key, value in prefetched_activity_page.items()
+        }
+        if isinstance(prefetched_activity_page.get("records"), list):
+            activity_page["records"] = [
+                dict(record)
+                for record in prefetched_activity_page.get("records", [])
+                if isinstance(record, Mapping)
+            ]
+        return activity_page
+    if screening_mode == "recent_activity":
+        return fetch_recent_activity_screening_page(
             client=client,
             wallet=wallet,
-            config=config,
             page_size=page_size,
-            max_offset=max_offset,
         )
-        closed_positions_page = paginate_with_status(
+    if window_bounds is None:
+        return fetch_collection_page_with_recovery(
             page_size=page_size,
             max_offset=max_offset,
-            fetch_page=lambda limit, offset: client.fetch_closed_positions_page(
+            section_name="activity",
+            fetch_aggregate_page=lambda limit, offset: client.fetch_activity_page(
                 user=wallet,
                 limit=limit,
                 offset=offset,
             ),
+            fetch_partition_page=lambda limit, offset, start, end: client.fetch_activity_page(
+                user=wallet,
+                limit=limit,
+                offset=offset,
+                start=start,
+                end=end,
+            ),
+            partition_probe_pages=partition_probe_pages,
         )
 
-    if prefetched_trades is not None:
+    window_start_ts, window_end_ts = window_bounds
+    try:
+        return fetch_time_window_collection_page(
+            page_size=page_size,
+            max_offset=max_offset,
+            section_name="activity",
+            start_ts=window_start_ts,
+            end_ts=window_end_ts,
+            fetch_partition_page=lambda limit, offset, start, end: client.fetch_activity_page(
+                user=wallet,
+                limit=limit,
+                offset=offset,
+                start=start,
+                end=end,
+            ),
+            partition_probe_pages=partition_probe_pages,
+        )
+    except Exception as exc:
+        return failed_collection_page(
+            section_name="activity",
+            stop_reason=f"request_error:{type(exc).__name__}",
+            history_scope="screening_window",
+            collection_mode="screening_window_failed",
+            range_start=window_start_ts,
+            range_end=window_end_ts,
+        )
+
+
+def start_optional_chain_validation_future(
+    client: PolymarketClient,
+    wallet: str,
+    config: dict[str, Any],
+) -> Future[dict[str, Any]] | None:
+    if not bool(config.get("chain_validation", {}).get("enabled", False)):
+        return None
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fetch_optional_chain_validation, client, wallet, config)
+    future.add_done_callback(lambda _future, pool=executor: pool.shutdown(wait=False))
+    return future
+
+
+def fetch_wallet_snapshot(
+    client: PolymarketClient,
+    wallet: str,
+    config: dict[str, Any],
+    *,
+    snapshot_scope: str = "full",
+    prefetched_trades: list[dict[str, Any]] | None = None,
+    prefetched_trades_page: Mapping[str, Any] | None = None,
+    prefetched_activity_page: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    pagination = config["pagination"]
+    page_size = int(pagination["page_size"])
+    max_offset = int(pagination["max_offset"])
+    position_size_threshold = float(config["analysis"].get("position_size_threshold", 0.1))
+    partition_probe_pages = analysis_setting_int(config, "time_partition_probe_pages", 2)
+    screening_mode = screening_snapshot_mode(config) if snapshot_scope == "screening" else ""
+    ledger_store = history_ledger_store(config)
+    window_bounds = (
+        screening_trade_window_bounds(config)
+        if screening_mode == "screening_window"
+        else None
+    )
+
+    if snapshot_scope == "screening":
+        activity_page = fetch_wallet_activity_page_for_snapshot(
+            client=client,
+            wallet=wallet,
+            page_size=page_size,
+            max_offset=max_offset,
+            snapshot_scope=snapshot_scope,
+            screening_mode=screening_mode,
+            window_bounds=window_bounds,
+            prefetched_activity_page=prefetched_activity_page,
+            partition_probe_pages=partition_probe_pages,
+        )
+        positions_page = deferred_collection_page("positions")
+        accounting_snapshot = None
+        closed_positions_page = deferred_collection_page("closed_positions")
+        chain_validation_future: Future[dict[str, Any]] | None = None
+    else:
+        chain_validation_future = start_optional_chain_validation_future(client, wallet, config)
+        with ThreadPoolExecutor(max_workers=1) as auxiliary_executor:
+            auxiliary_pages_future = auxiliary_executor.submit(
+                fetch_full_snapshot_auxiliary_pages,
+                client=client,
+                wallet=wallet,
+                config=config,
+                page_size=page_size,
+                max_offset=max_offset,
+            )
+            activity_page = fetch_wallet_activity_page_for_snapshot(
+                client=client,
+                wallet=wallet,
+                page_size=page_size,
+                max_offset=max_offset,
+                snapshot_scope=snapshot_scope,
+                screening_mode=screening_mode,
+                window_bounds=window_bounds,
+                prefetched_activity_page=prefetched_activity_page,
+                partition_probe_pages=partition_probe_pages,
+            )
+            positions_page, accounting_snapshot, closed_positions_page = auxiliary_pages_future.result()
+
+    if (
+        isinstance(prefetched_trades_page, Mapping)
+        and snapshot_scope == "full"
+        and window_bounds is None
+        and prefetched_collection_page_can_resume_aggregate(
+            prefetched_trades_page,
+            section_name="trades",
+        )
+    ):
+        prefetched_trade_records = [
+            dict(record)
+            for record in prefetched_trades_page.get("records", [])
+            if isinstance(record, Mapping)
+        ]
+        projected_trades_page = project_trades_page_from_activity(activity_page)
+        if (
+            projected_trades_page is not None
+            and collection_page_covers_prefetched_records(
+                projected_trades_page,
+                prefetched_trade_records,
+            )
+        ):
+            trades_page = projected_trades_page
+        else:
+            trades_page = fetch_collection_page_with_recovery(
+                page_size=page_size,
+                max_offset=max_offset,
+                section_name="trades",
+                fetch_aggregate_page=lambda limit, offset: client.fetch_trades_page(
+                    user=wallet,
+                    limit=limit,
+                    offset=offset,
+                ),
+                fetch_partition_page=lambda limit, offset, start, end: client.fetch_activity_page(
+                    user=wallet,
+                    limit=limit,
+                    offset=offset,
+                    activity_type="TRADE",
+                    start=start,
+                    end=end,
+                ),
+                initial_records=prefetched_trade_records,
+                initial_page_count=decode_int(
+                    prefetched_trades_page.get(
+                        "page_count",
+                        1 if prefetched_trade_records else 0,
+                    )
+                ),
+                initial_next_offset=decode_int(
+                    prefetched_trades_page.get(
+                        "next_offset",
+                        len(prefetched_trade_records),
+                    )
+                ),
+                partition_probe_pages=partition_probe_pages,
+            )
+    elif prefetched_trades is not None:
         if screening_mode == "recent_activity":
             prefetched_scope = "recent_activity"
         elif window_bounds is not None:
@@ -1019,6 +2513,7 @@ def fetch_wallet_snapshot(
                             start=start,
                             end=end,
                         ),
+                        partition_probe_pages=partition_probe_pages,
                     )
             else:
                 try:
@@ -1036,6 +2531,7 @@ def fetch_wallet_snapshot(
                             start=start,
                             end=end,
                         ),
+                        partition_probe_pages=partition_probe_pages,
                     )
                 except Exception as exc:
                     trades_page = failed_collection_page(
@@ -1124,6 +2620,8 @@ def fetch_wallet_snapshot(
             reason="deferred until full history hydration",
         )
         if snapshot_scope == "screening"
+        else chain_validation_future.result()
+        if chain_validation_future is not None
         else fetch_optional_chain_validation(client, wallet, config)
     )
     collection_status = {
@@ -1211,20 +2709,29 @@ def fetch_wallet_snapshot(
         "operation_audit": operation_audit,
         "snapshot_scope": snapshot_scope,
     }
-    try:
-        snapshot["history_ledger"] = ledger_store.persist_wallet_snapshot(
-            snapshot,
-            wallet=wallet,
-            run_id=str((config.get("runtime", {}) or {}).get("run_id") or ""),
-            snapshot_scope=snapshot_scope,
-        )
-    except Exception as exc:
+    if should_persist_history_ledger_snapshot(config, snapshot_scope=snapshot_scope):
+        try:
+            snapshot["history_ledger"] = ledger_store.persist_wallet_snapshot(
+                snapshot,
+                wallet=wallet,
+                run_id=str((config.get("runtime", {}) or {}).get("run_id") or ""),
+                snapshot_scope=snapshot_scope,
+            )
+        except Exception as exc:
+            snapshot["history_ledger"] = {
+                "status": "failed",
+                "backend": str((config.get("history_ledger", {}) or {}).get("backend") or "local"),
+                "wallet": wallet,
+                "snapshot_scope": snapshot_scope,
+                "error": str(exc),
+            }
+    else:
         snapshot["history_ledger"] = {
-            "status": "failed",
+            "status": "skipped",
             "backend": str((config.get("history_ledger", {}) or {}).get("backend") or "local"),
             "wallet": wallet,
             "snapshot_scope": snapshot_scope,
-            "error": str(exc),
+            "reason": "screening_snapshot_persistence_disabled",
         }
     return snapshot
 
@@ -1233,6 +2740,9 @@ def fetch_full_wallet_snapshot_with_retry(
     client: PolymarketClient,
     wallet: str,
     config: dict[str, Any],
+    *,
+    prefetched_activity_page: Mapping[str, Any] | None = None,
+    prefetched_trades_page: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     analysis_settings = config.get("analysis", {}) if isinstance(config.get("analysis"), Mapping) else {}
     attempts = max(
@@ -1255,6 +2765,8 @@ def fetch_full_wallet_snapshot_with_retry(
                 wallet,
                 config,
                 snapshot_scope="full",
+                prefetched_activity_page=prefetched_activity_page,
+                prefetched_trades_page=prefetched_trades_page,
             )
             if attempt:
                 collection_status = snapshot.setdefault("collection_status", {})
@@ -1358,6 +2870,24 @@ def history_ledger_store(config: Mapping[str, Any]) -> history_ledger_module.His
     return history_ledger_module.create_history_ledger_store(
         Path(artifacts_root_value) if artifacts_root_value else None,
         config=config,
+    )
+
+
+def should_persist_history_ledger_snapshot(
+    config: Mapping[str, Any],
+    *,
+    snapshot_scope: str,
+) -> bool:
+    if str(snapshot_scope or "").strip().lower() != "screening":
+        return True
+    history_ledger_settings = (
+        config.get("history_ledger", {})
+        if isinstance(config.get("history_ledger", {}), Mapping)
+        else {}
+    )
+    return bool_config_value(
+        history_ledger_settings.get("persist_screening_snapshots"),
+        True,
     )
 
 
@@ -1500,6 +3030,38 @@ def merge_trades_page_with_history_ledger(
             else trades_page.get("range_end")
         ),
     }
+
+
+def fetch_full_snapshot_auxiliary_pages(
+    *,
+    client: PolymarketClient,
+    wallet: str,
+    config: dict[str, Any],
+    page_size: int,
+    max_offset: int,
+) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        positions_future = executor.submit(
+            fetch_positions_page_with_accounting_fallback,
+            client=client,
+            wallet=wallet,
+            config=config,
+            page_size=page_size,
+            max_offset=max_offset,
+        )
+        closed_positions_future = executor.submit(
+            paginate_with_status,
+            page_size=page_size,
+            max_offset=max_offset,
+            fetch_page=lambda limit, offset: client.fetch_closed_positions_page(
+                user=wallet,
+                limit=limit,
+                offset=offset,
+            ),
+        )
+        positions_page, accounting_snapshot = positions_future.result()
+        closed_positions_page = closed_positions_future.result()
+    return positions_page, accounting_snapshot, closed_positions_page
 
 
 def fetch_positions_page_with_accounting_fallback(
@@ -1869,7 +3431,10 @@ query WalletOrderFillsWindow(
             for record in data.get("taker", [])
             if isinstance(record, Mapping)
         ] if isinstance(data, Mapping) else []
-        return dedupe_graph_history_records([*maker_records, *taker_records])
+        return PaginationCountedRecords(
+            dedupe_graph_history_records([*maker_records, *taker_records]),
+            pagination_count=max(len(maker_records), len(taker_records)),
+        )
 
     page = paginate_time_partitioned(
         page_size=page_size,
@@ -1877,6 +3442,7 @@ query WalletOrderFillsWindow(
         fetch_page=fetch_page,
         start_ts=start_ts,
         end_ts=end_ts,
+        partition_probe_pages=int(settings.get("partition_probe_pages", 2) or 2),
     )
     return {
         **page,
@@ -1914,7 +3480,13 @@ def fetch_graph_token_condition_lookup(
     chunk_size = int(
         settings.get("token_lookup_chunk_size", DEFAULT_HISTORY_PROVIDER_TOKEN_LOOKUP_CHUNK_SIZE)
     )
-    normalized_token_ids = [token_id for token_id in token_ids if str(token_id).strip()]
+    normalized_token_ids = sorted(
+        {
+            str(token_id).strip()
+            for token_id in token_ids
+            if str(token_id).strip()
+        }
+    )
     if not normalized_token_ids:
         return {
             "records": [],
@@ -1929,6 +3501,19 @@ def fetch_graph_token_condition_lookup(
             "history_scope": "full_history",
             "endpoint_url": endpoint_url,
         }
+    cache_enabled = bool(settings.get("token_lookup_cache_enabled", False))
+    cached_records: list[dict[str, Any]] = []
+    missing_token_ids: list[str] = []
+    if cache_enabled:
+        with GRAPH_TOKEN_CONDITION_LOOKUP_CACHE_LOCK:
+            for token_id in normalized_token_ids:
+                cached = GRAPH_TOKEN_CONDITION_LOOKUP_CACHE.get((endpoint_url, token_id))
+                if cached is None:
+                    missing_token_ids.append(token_id)
+                else:
+                    cached_records.append(dict(cached))
+    else:
+        missing_token_ids = list(normalized_token_ids)
     query = """
 query TokenIdConditions($ids: [String!], $first: Int!) {
   tokenIdConditions(first: $first, where: { id_in: $ids }) {
@@ -1941,12 +3526,12 @@ query TokenIdConditions($ids: [String!], $first: Int!) {
   }
 }
 """.strip()
-    records: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = list(cached_records)
     page_count = 0
     complete = True
     stop_reason = "all_chunks_loaded"
-    for offset in range(0, len(normalized_token_ids), chunk_size):
-        chunk = normalized_token_ids[offset : offset + chunk_size]
+    for offset in range(0, len(missing_token_ids), chunk_size):
+        chunk = missing_token_ids[offset : offset + chunk_size]
         try:
             payload = client.fetch_graphql(
                 endpoint_url=endpoint_url,
@@ -1964,11 +3549,22 @@ query TokenIdConditions($ids: [String!], $first: Int!) {
         data = payload.get("data", {}) if isinstance(payload, Mapping) else {}
         errors = payload.get("errors", []) if isinstance(payload, Mapping) else []
         if isinstance(data, Mapping):
-            records.extend(
+            fetched_records = [
                 dict(record)
                 for record in data.get("tokenIdConditions", [])
                 if isinstance(record, Mapping)
-            )
+            ]
+            records.extend(fetched_records)
+            if cache_enabled:
+                with GRAPH_TOKEN_CONDITION_LOOKUP_CACHE_LOCK:
+                    for record in fetched_records:
+                        token_id = str(record.get("id") or "").strip()
+                        if token_id:
+                            GRAPH_TOKEN_CONDITION_LOOKUP_CACHE[(endpoint_url, token_id)] = dict(record)
+                    if len(GRAPH_TOKEN_CONDITION_LOOKUP_CACHE) > GRAPH_TOKEN_CONDITION_LOOKUP_CACHE_MAX:
+                        overflow = len(GRAPH_TOKEN_CONDITION_LOOKUP_CACHE) - GRAPH_TOKEN_CONDITION_LOOKUP_CACHE_MAX
+                        for key in list(GRAPH_TOKEN_CONDITION_LOOKUP_CACHE.keys())[:overflow]:
+                            GRAPH_TOKEN_CONDITION_LOOKUP_CACHE.pop(key, None)
         if errors:
             complete = False
             stop_reason = "graphql_errors_present"
@@ -1981,11 +3577,14 @@ query TokenIdConditions($ids: [String!], $first: Int!) {
         "page_count": page_count,
         "record_count": len(deduped),
         "last_offset": max(0, (page_count - 1) * chunk_size),
-        "next_offset": page_count * chunk_size,
+        "next_offset": len(normalized_token_ids),
         "collection_mode": "graphql_token_lookup",
         "source_section": "token_conditions",
         "history_scope": "full_history",
         "endpoint_url": endpoint_url,
+        "cache_hit_count": len(cached_records),
+        "cache_miss_count": len(missing_token_ids),
+        "cache_enabled": cache_enabled,
     }
 
 
@@ -2119,7 +3718,8 @@ query WalletNegRiskConversions(
     page_count = 0
     complete = True
     stop_reason = "all_streams_loaded"
-    for spec in stream_specs:
+
+    def fetch_operation_stream(spec: Mapping[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         stream_page = fetch_graph_activity_stream(
             client=client,
             wallet=wallet,
@@ -2130,15 +3730,25 @@ query WalletNegRiskConversions(
             max_pages=int(
                 settings.get("max_pages_per_stream", DEFAULT_HISTORY_PROVIDER_MAX_PAGES)
             ),
+            partition_probe_pages=int(settings.get("partition_probe_pages", 2) or 2),
         )
+        converted_records = convert_graph_activity_records(
+            raw_records=stream_page.get("records", []),
+            operation_type=str(spec["operation_type"]),
+            settings=settings,
+        )
+        return stream_page, converted_records
+
+    max_workers = min(
+        len(stream_specs),
+        max(1, int(settings.get("operation_stream_concurrency", len(stream_specs)))),
+    )
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        stream_results = list(executor.map(fetch_operation_stream, stream_specs))
+
+    for spec, (stream_page, converted_records) in zip(stream_specs, stream_results):
         page_count += int(stream_page.get("page_count", 0))
-        records.extend(
-            convert_graph_activity_records(
-                raw_records=stream_page.get("records", []),
-                operation_type=str(spec["operation_type"]),
-                settings=settings,
-            )
-        )
+        records.extend(converted_records)
         if not bool(stream_page.get("complete", False)):
             complete = False
             if stop_reason == "all_streams_loaded":
@@ -2168,6 +3778,7 @@ def fetch_graph_activity_stream(
     root_field: str,
     page_size: int,
     max_pages: int,
+    partition_probe_pages: int | None = None,
 ) -> dict[str, Any]:
     max_offset = max(0, (max_pages - 1) * page_size)
 
@@ -2202,6 +3813,7 @@ def fetch_graph_activity_stream(
             page_size=page_size,
             max_offset=max_offset,
             fetch_page=fetch_page,
+            partition_probe_pages=partition_probe_pages,
         )
     except Exception as exc:
         page = {
@@ -2465,33 +4077,38 @@ def fetch_optional_chain_validation(
         settings.get("positions_converted_topic0", POSITIONS_CONVERTED_TOPIC0)
     ).lower()
     try:
-        logs_page = fetch_polygon_logs_paginated(
-            client=client,
-            api_key=api_key,
-            contract_address=contract_address,
-            topic0=configured_topic0,
-            topic1=address_to_topic(wallet),
-            base_url=str(settings.get("provider_base_url", "https://api.etherscan.io")),
-            chain_id=settings.get("chain_id", 137),
-            from_block=int(settings.get("from_block", 0)),
-            to_block=int(settings.get("to_block", 99999999)),
-            offset=int(settings.get("offset", 1000)),
-            start_page=int(settings.get("page", 1)),
-            max_pages=int(settings.get("max_pages", 10)),
-        )
-        transaction_page = fetch_polygon_transactions_paginated(
-            client=client,
-            address=wallet,
-            api_key=api_key,
-            base_url=str(settings.get("provider_base_url", "https://api.etherscan.io")),
-            chain_id=settings.get("chain_id", 137),
-            start_block=0,
-            end_block=int(settings.get("to_block", 99999999)),
-            offset=int(settings.get("transaction_offset", settings.get("offset", 1000))),
-            start_page=1,
-            sort="asc",
-            max_pages=int(settings.get("transaction_max_pages", 1)),
-        )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            logs_future = executor.submit(
+                fetch_polygon_logs_paginated,
+                client=client,
+                api_key=api_key,
+                contract_address=contract_address,
+                topic0=configured_topic0,
+                topic1=address_to_topic(wallet),
+                base_url=str(settings.get("provider_base_url", "https://api.etherscan.io")),
+                chain_id=settings.get("chain_id", 137),
+                from_block=int(settings.get("from_block", 0)),
+                to_block=int(settings.get("to_block", 99999999)),
+                offset=int(settings.get("offset", 1000)),
+                start_page=int(settings.get("page", 1)),
+                max_pages=int(settings.get("max_pages", 10)),
+            )
+            transaction_future = executor.submit(
+                fetch_polygon_transactions_paginated,
+                client=client,
+                address=wallet,
+                api_key=api_key,
+                base_url=str(settings.get("provider_base_url", "https://api.etherscan.io")),
+                chain_id=settings.get("chain_id", 137),
+                start_block=0,
+                end_block=int(settings.get("to_block", 99999999)),
+                offset=int(settings.get("transaction_offset", settings.get("offset", 1000))),
+                start_page=1,
+                sort="asc",
+                max_pages=int(settings.get("transaction_max_pages", 1)),
+            )
+            logs_page = logs_future.result()
+            transaction_page = transaction_future.result()
     except Exception as exc:
         return empty_chain_validation(status="request_failed", reason=str(exc))
 
@@ -2942,7 +4559,11 @@ def wallet_is_in_history_registry(history_registry_dir: Path | None, wallet: str
     if isinstance(history_registry_dir, history_registry_module.HistoryRegistry):
         return history_registry_dir.contains(wallet)
     record_path = wallet_history_record_path(history_registry_dir, wallet)
-    return bool(record_path and record_path.exists())
+    if not record_path or not record_path.exists():
+        return False
+    return history_registry_module.wallet_history_record_is_complete(
+        read_json_file(record_path)
+    )
 
 
 def read_json_file(path: Path) -> dict[str, Any]:
@@ -3116,6 +4737,16 @@ def should_hydrate_selected_wallet_full_history(config: Mapping[str, Any]) -> bo
     return bool(config.get("analysis", {}).get("hydrate_selected_wallet_full_history", True))
 
 
+def should_defer_selected_wallet_full_hydration(config: Mapping[str, Any]) -> bool:
+    analysis_settings = (
+        config.get("analysis", {}) if isinstance(config.get("analysis", {}), Mapping) else {}
+    )
+    return bool_config_value(
+        analysis_settings.get("defer_selected_wallet_full_hydration"),
+        True,
+    )
+
+
 def wallet_result_has_system_core_label(wallet_result: Mapping[str, Any]) -> bool:
     return bool(wallet_result_system_core_label_keys(wallet_result))
 
@@ -3274,6 +4905,168 @@ def should_generate_finder_ai_for_wallet_result(wallet_result: Mapping[str, Any]
     return wallet_result_selected(wallet_result) and wallet_result_has_system_core_label(wallet_result)
 
 
+def wallet_result_full_hydration_deferred(wallet_result: Mapping[str, Any]) -> bool:
+    deep_hydration = wallet_result.get("deep_hydration")
+    return (
+        isinstance(deep_hydration, Mapping)
+        and str(deep_hydration.get("status") or "").strip().lower() == "deferred"
+    )
+
+
+def recent_activity_prefetch_for_full_hydration(
+    snapshot: Mapping[str, Any],
+    *,
+    screening_mode: str,
+) -> dict[str, Any] | None:
+    if screening_mode != "recent_activity":
+        return None
+    collection_status = snapshot.get("collection_status")
+    activity_status = (
+        collection_status.get("activity")
+        if isinstance(collection_status, Mapping)
+        else {}
+    )
+    return {
+        "records": list(snapshot.get("activity", [])),
+        **(dict(activity_status) if isinstance(activity_status, Mapping) else {}),
+    }
+
+
+def hydrate_selected_wallet_result_full_history(
+    *,
+    client: PolymarketClient,
+    wallet: str,
+    leaderboard_entry: dict[str, Any],
+    lightweight_wallet_result: dict[str, Any],
+    snapshot: dict[str, Any],
+    weather_index: WeatherIndex,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    wallet_result = lightweight_wallet_result
+    started_at = time.perf_counter()
+    fetch_seconds: float | None = None
+    analyze_seconds: float | None = None
+    try:
+        progress(config, f"Full hydration started: {wallet}")
+        screening_mode = screening_snapshot_mode(config)
+        fetch_started_at = time.perf_counter()
+        full_snapshot = fetch_full_wallet_snapshot_with_retry(
+            client,
+            wallet,
+            config,
+            prefetched_activity_page=recent_activity_prefetch_for_full_hydration(
+                snapshot,
+                screening_mode=screening_mode,
+            ),
+            prefetched_trades_page=None,
+        )
+        fetch_seconds = elapsed_perf_seconds(fetch_started_at)
+        analyze_started_at = time.perf_counter()
+        wallet_result = analyze_wallet(
+            wallet=wallet,
+            leaderboard_entry=leaderboard_entry,
+            snapshot=full_snapshot,
+            weather_index=weather_index,
+            config=config,
+            include_artifacts=False,
+        )
+        analyze_seconds = elapsed_perf_seconds(analyze_started_at)
+        restore_lightweight_screening_context(wallet_result, lightweight_wallet_result)
+        relabel_record = build_full_history_relabel_record(
+            before=lightweight_wallet_result,
+            after=wallet_result,
+        )
+        wallet_result["deep_hydration"] = {
+            "status": "completed",
+            "snapshot_scope": "full",
+            "relabel": relabel_record,
+        }
+        progress(
+            config,
+            f"Full hydration completed: {wallet} ({len(full_snapshot.get('trades', []))} trades)",
+        )
+        progress_wallet_trace(
+            config,
+            wallet,
+            stage="full_hydration",
+            status="completed",
+            total_seconds=elapsed_perf_seconds(started_at),
+            fetch_seconds=fetch_seconds,
+            analyze_seconds=analyze_seconds,
+            trade_count=len(full_snapshot.get("trades", [])),
+            **collection_trace_fields(full_snapshot),
+        )
+        return wallet_result, full_snapshot
+    except Exception as hydration_exc:
+        wallet_result["deep_hydration"] = {
+            "status": "failed",
+            "reason": str(hydration_exc),
+            "error": build_analysis_error_record(wallet, hydration_exc),
+        }
+        progress(
+            config,
+            f"Full hydration failed: {wallet} ({type(hydration_exc).__name__})",
+        )
+        progress_wallet_trace(
+            config,
+            wallet,
+            stage="full_hydration",
+            status="failed",
+            total_seconds=elapsed_perf_seconds(started_at),
+            fetch_seconds=fetch_seconds,
+            analyze_seconds=analyze_seconds,
+            error_type=type(hydration_exc).__name__,
+        )
+        return wallet_result, snapshot
+
+
+def complete_deferred_selected_wallet_result(
+    *,
+    client: PolymarketClient,
+    leaderboard_entry: dict[str, Any],
+    wallet_result: dict[str, Any],
+    snapshot: dict[str, Any],
+    weather_index: WeatherIndex,
+    config: dict[str, Any],
+    ai_executor: ThreadPoolExecutor | None = None,
+    falcon_metrics_future: Future[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    wallet = normalize_address(wallet_result.get("wallet") or leaderboard_entry.get("proxyWallet") or "")
+    hydrated_wallet_result, hydrated_snapshot = hydrate_selected_wallet_result_full_history(
+        client=client,
+        wallet=wallet,
+        leaderboard_entry=leaderboard_entry,
+        lightweight_wallet_result=wallet_result,
+        snapshot=snapshot,
+        weather_index=weather_index,
+        config=config,
+    )
+    falcon_metrics = (
+        falcon_metrics_future.result()
+        if falcon_metrics_future is not None
+        else None
+    )
+    hydrated_wallet_result = enrich_wallet_result_artifacts(
+        wallet_result=hydrated_wallet_result,
+        snapshot=hydrated_snapshot,
+        weather_index=weather_index,
+        config=config,
+        falcon_metrics=falcon_metrics,
+    )
+    finalized = finalize_selected_wallet_result(
+        hydrated_wallet_result,
+        snapshot=hydrated_snapshot,
+        weather_index=weather_index,
+        config=config,
+    )
+    return {
+        "wallet_result": finalized,
+        "snapshot": hydrated_snapshot,
+        "finder_ai_pending": should_generate_finder_ai_for_wallet_result(finalized),
+        "finalized": False,
+    }
+
+
 def trades_in_screening_window(
     trades: list[dict[str, Any]],
     config: dict[str, Any],
@@ -3404,8 +5197,10 @@ def probe_wallet_trade_window(
     ledger_store = history_ledger_store(config)
     probe_complete = False
     live_probe_failed = False
+    live_probe_used_aggregate = False
     try:
         if window_bounds is None:
+            live_probe_used_aggregate = True
             trades = client.fetch_trades_page(user=wallet, limit=probe_limit, offset=0)
         else:
             trades = client.fetch_activity_page(
@@ -3448,6 +5243,26 @@ def probe_wallet_trade_window(
     if live_probe_failed and not probe_complete and not list(locals().get("trades", [])):
         return {"prefetched_trades": None, "trade_probe_fetched": False}
     trade_count = len(trades)
+    prefetched_trades_page = (
+        {
+            "records": [dict(record) for record in trades if isinstance(record, Mapping)],
+            "complete": probe_complete,
+            "stop_reason": (
+                "probe_prefetched_complete"
+                if probe_complete
+                else "probe_prefetched_prefix"
+            ),
+            "page_count": 1 if trades else 0,
+            "record_count": trade_count,
+            "last_offset": 0,
+            "next_offset": trade_count,
+            "collection_mode": "probe_prefetch",
+            "source_section": "trades",
+            "history_scope": "aggregate",
+        }
+        if live_probe_used_aggregate and trades
+        else None
+    )
 
     if max_traded_count is not None and trade_count > max_traded_count:
         return {
@@ -3475,6 +5290,7 @@ def probe_wallet_trade_window(
 
     return {
         "prefetched_trades": trades if probe_complete else None,
+        "prefetched_trades_page": prefetched_trades_page,
         "trade_probe_fetched": True,
     }
 
@@ -3514,34 +5330,63 @@ def analyze_wallet_batch(
     max_workers: int,
     history_registry_dir: Path | None = None,
     history_run_id: str = "",
+    defer_full_hydration: bool = False,
 ) -> list[dict[str, Any]]:
+    ordered_results: list[dict[str, Any] | None] = [None] * len(leaderboard_entries)
+    for index, result in iter_analyze_wallet_batch_results(
+        client=client,
+        leaderboard_entries=leaderboard_entries,
+        weather_index=weather_index,
+        config=config,
+        max_workers=max_workers,
+        history_registry_dir=history_registry_dir,
+        history_run_id=history_run_id,
+        defer_full_hydration=defer_full_hydration,
+    ):
+        ordered_results[index] = result
+    return [result for result in ordered_results if isinstance(result, dict)]
+
+
+def iter_analyze_wallet_batch_results(
+    *,
+    client: PolymarketClient,
+    leaderboard_entries: list[dict[str, Any]],
+    weather_index: WeatherIndex,
+    config: dict[str, Any],
+    max_workers: int,
+    history_registry_dir: Path | None = None,
+    history_run_id: str = "",
+    defer_full_hydration: bool = False,
+) -> Iterator[tuple[int, dict[str, Any]]]:
     if max_workers <= 1 or len(leaderboard_entries) <= 1:
-        return [
-            analyze_leaderboard_entry(
+        for index, entry in enumerate(leaderboard_entries):
+            yield index, analyze_leaderboard_entry(
                 client=client,
                 leaderboard_entry=entry,
                 weather_index=weather_index,
                 config=config,
                 history_registry_dir=history_registry_dir,
                 history_run_id=history_run_id,
+                defer_full_hydration=defer_full_hydration,
             )
-            for entry in leaderboard_entries
-        ]
+        return
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        return list(
-            executor.map(
-                lambda entry: analyze_leaderboard_entry(
-                    client=client,
-                    leaderboard_entry=entry,
-                    weather_index=weather_index,
-                    config=config,
-                    history_registry_dir=history_registry_dir,
-                    history_run_id=history_run_id,
-                ),
-                leaderboard_entries,
-            )
-        )
+        future_to_index = {
+            executor.submit(
+                analyze_leaderboard_entry,
+                client=client,
+                leaderboard_entry=entry,
+                weather_index=weather_index,
+                config=config,
+                history_registry_dir=history_registry_dir,
+                history_run_id=history_run_id,
+                defer_full_hydration=defer_full_hydration,
+            ): index
+            for index, entry in enumerate(leaderboard_entries)
+        }
+        for future in as_completed(future_to_index):
+            yield future_to_index[future], future.result()
 
 
 def analyze_leaderboard_entry(
@@ -3552,76 +5397,96 @@ def analyze_leaderboard_entry(
     config: dict[str, Any],
     history_registry_dir: Path | None = None,
     history_run_id: str = "",
+    defer_full_hydration: bool = False,
 ) -> dict[str, Any]:
     wallet = normalize_address(leaderboard_entry.get("proxyWallet", ""))
     trade_probe_fetched = False
     snapshot_fetched = False
     screening_snapshot_used = False
+    started_at = time.perf_counter()
+    probe_seconds: float | None = None
+    snapshot_seconds: float | None = None
+    analyze_seconds: float | None = None
     try:
+        probe_started_at = time.perf_counter()
         trade_probe = probe_wallet_trade_window(client, wallet, leaderboard_entry, config)
+        probe_seconds = elapsed_perf_seconds(probe_started_at)
         trade_probe_fetched = bool(trade_probe.get("trade_probe_fetched"))
         if trade_probe.get("screening"):
+            screening = trade_probe["screening"]
+            progress_wallet_trace(
+                config,
+                wallet,
+                stage="trade_probe",
+                status="screened_out",
+                total_seconds=elapsed_perf_seconds(started_at),
+                probe_seconds=probe_seconds,
+                trade_count=screening.get("trade_count") if isinstance(screening, Mapping) else None,
+            )
             if trade_probe_fetched:
-                write_wallet_history_record(
-                    history_registry_dir=history_registry_dir,
-                    wallet=wallet,
-                    leaderboard_entry=leaderboard_entry,
-                    run_id=history_run_id,
-                    status="trade_probe_screened_out",
-                )
+                return {
+                    "wallet": wallet,
+                    "screening": trade_probe["screening"],
+                    "leaderboard_entry": leaderboard_entry,
+                    "history_record_status": "trade_probe_screened_out",
+                }
             return {"wallet": wallet, "screening": trade_probe["screening"]}
 
         screening_snapshot_used = should_use_screening_snapshot(config)
+        probe_window_bounds = screening_trade_window_bounds(config)
+        prefetched_trades_page = (
+            trade_probe.get("prefetched_trades_page")
+            if not screening_snapshot_used and probe_window_bounds is None
+            else None
+        )
+        prefetched_trades = (
+            trade_probe.get("prefetched_trades")
+            if screening_snapshot_used or (probe_window_bounds is None and prefetched_trades_page is None)
+            else None
+        )
+        snapshot_started_at = time.perf_counter()
         snapshot = fetch_wallet_snapshot(
             client,
             wallet,
             config,
             snapshot_scope="screening" if screening_snapshot_used else "full",
-            prefetched_trades=trade_probe.get("prefetched_trades"),
+            prefetched_trades=prefetched_trades,
+            prefetched_trades_page=prefetched_trades_page,
         )
+        snapshot_seconds = elapsed_perf_seconds(snapshot_started_at)
         snapshot_fetched = True
+        analyze_started_at = time.perf_counter()
         wallet_result = analyze_wallet(
             wallet=wallet,
             leaderboard_entry=leaderboard_entry,
             snapshot=snapshot,
             weather_index=weather_index,
             config=config,
+            include_artifacts=False,
         )
+        analyze_seconds = elapsed_perf_seconds(analyze_started_at)
         if (
             screening_snapshot_used
             and wallet_result["screening"]["selected"]
             and should_hydrate_wallet_result_full_history(config, wallet_result)
         ):
-            try:
-                full_snapshot = fetch_full_wallet_snapshot_with_retry(
-                    client,
-                    wallet,
-                    config,
-                )
-                lightweight_wallet_result = wallet_result
-                wallet_result = analyze_wallet(
+            if defer_full_hydration:
+                wallet_result["deep_hydration"] = {
+                    "status": "deferred",
+                    "reason": "scheduled_after_screening_batch",
+                    "snapshot_scope": str(snapshot.get("snapshot_scope") or "screening"),
+                }
+                progress(config, f"Full hydration deferred: {wallet}")
+            else:
+                wallet_result, snapshot = hydrate_selected_wallet_result_full_history(
+                    client=client,
                     wallet=wallet,
                     leaderboard_entry=leaderboard_entry,
-                    snapshot=full_snapshot,
+                    lightweight_wallet_result=wallet_result,
+                    snapshot=snapshot,
                     weather_index=weather_index,
                     config=config,
                 )
-                restore_lightweight_screening_context(wallet_result, lightweight_wallet_result)
-                relabel_record = build_full_history_relabel_record(
-                    before=lightweight_wallet_result,
-                    after=wallet_result,
-                )
-                wallet_result["deep_hydration"] = {
-                    "status": "completed",
-                    "snapshot_scope": "full",
-                    "relabel": relabel_record,
-                }
-            except Exception as hydration_exc:
-                wallet_result["deep_hydration"] = {
-                    "status": "failed",
-                    "reason": str(hydration_exc),
-                    "error": build_analysis_error_record(wallet, hydration_exc),
-                }
         elif screening_snapshot_used:
             wallet_result["deep_hydration"] = (
                 {
@@ -3634,15 +5499,39 @@ def analyze_leaderboard_entry(
                     "reason": "screened_out",
                 }
             )
+            if wallet_result["screening"]["selected"]:
+                progress(config, f"Full hydration skipped: {wallet} (no core label)")
+        screening = wallet_result.get("screening") if isinstance(wallet_result, Mapping) else {}
+        progress_wallet_trace(
+            config,
+            wallet,
+            stage="screening",
+            status="selected" if isinstance(screening, Mapping) and screening.get("selected") else "screened_out",
+            total_seconds=elapsed_perf_seconds(started_at),
+            probe_seconds=probe_seconds,
+            snapshot_seconds=snapshot_seconds,
+            analyze_seconds=analyze_seconds,
+            selected=bool(isinstance(screening, Mapping) and screening.get("selected")),
+            trade_probe_fetched=trade_probe_fetched,
+            **collection_trace_fields(snapshot),
+        )
+        registry_status = ""
         if trade_probe_fetched or snapshot_fetched:
-            write_wallet_history_record(
-                history_registry_dir=history_registry_dir,
-                wallet=wallet,
-                leaderboard_entry=leaderboard_entry,
-                run_id=history_run_id,
-                status="selected" if wallet_result["screening"]["selected"] else "screened_out",
+            registry_status = (
+                "selected_pending_hydration"
+                if wallet_result["screening"]["selected"]
+                and wallet_result_full_hydration_deferred(wallet_result)
+                else "selected_pending"
+                if wallet_result["screening"]["selected"]
+                else "screened_out"
             )
-        return {"wallet": wallet, "wallet_result": wallet_result}
+        return {
+            "wallet": wallet,
+            "wallet_result": wallet_result,
+            "snapshot": snapshot,
+            "leaderboard_entry": leaderboard_entry,
+            "history_record_status": registry_status,
+        }
     except Exception as exc:
         archived_wallet_result = cloud_archive_module.load_latest_wallet_analysis(
             wallet,
@@ -3659,23 +5548,42 @@ def analyze_leaderboard_entry(
                 }
             )
             wallet_result["cloud_fallback"] = cloud_fallback
-            write_wallet_history_record(
-                history_registry_dir=history_registry_dir,
-                wallet=wallet,
-                leaderboard_entry=leaderboard_entry,
-                run_id=history_run_id,
-                status="cloud_fallback_used",
+            progress_wallet_trace(
+                config,
+                wallet,
+                stage="screening",
+                status="cloud_fallback",
+                total_seconds=elapsed_perf_seconds(started_at),
+                probe_seconds=probe_seconds,
+                snapshot_seconds=snapshot_seconds,
+                analyze_seconds=analyze_seconds,
+                error_type=type(exc).__name__,
             )
-            return {"wallet": wallet, "wallet_result": wallet_result}
+            return {
+                "wallet": wallet,
+                "wallet_result": wallet_result,
+                "leaderboard_entry": leaderboard_entry,
+                "history_record_status": "cloud_fallback_used",
+            }
+        history_record_status = ""
         if trade_probe_fetched or snapshot_fetched:
-            write_wallet_history_record(
-                history_registry_dir=history_registry_dir,
-                wallet=wallet,
-                leaderboard_entry=leaderboard_entry,
-                run_id=history_run_id,
-                status="analysis_error",
-            )
-        return {"wallet": wallet, "error": build_analysis_error_record(wallet, exc)}
+            history_record_status = "analysis_error"
+        progress_wallet_trace(
+            config,
+            wallet,
+            stage="screening",
+            status="failed",
+            total_seconds=elapsed_perf_seconds(started_at),
+            probe_seconds=probe_seconds,
+            snapshot_seconds=snapshot_seconds,
+            analyze_seconds=analyze_seconds,
+            error_type=type(exc).__name__,
+        )
+        result = {"wallet": wallet, "error": build_analysis_error_record(wallet, exc)}
+        if history_record_status:
+            result["leaderboard_entry"] = leaderboard_entry
+            result["history_record_status"] = history_record_status
+        return result
 
 
 def build_analysis_error_record(wallet: str, exc: Exception) -> dict[str, Any]:
@@ -3725,6 +5633,7 @@ def analyze_wallet(
     snapshot: dict[str, Any],
     weather_index: WeatherIndex,
     config: dict[str, Any],
+    include_artifacts: bool = True,
 ) -> dict[str, Any]:
     metrics = compute_metrics(
         snapshot=snapshot,
@@ -3813,21 +5722,6 @@ def analyze_wallet(
         "selected": screening["selected"],
         "reasons": screening["reasons"],
     }
-    top_trades = top_records(
-        snapshot["trades"],
-        limit=int(config["analysis"]["top_trades_in_report"]),
-        sort_key=lambda item: record_notional(item),
-    )
-    top_positions = top_records(
-        snapshot["positions"],
-        limit=int(config["analysis"]["top_positions_in_report"]),
-        sort_key=lambda item: to_float(item.get("currentValue")),
-    )
-    top_closed_positions = top_records(
-        snapshot["closed_positions"],
-        limit=int(config["analysis"]["top_closed_positions_in_report"]),
-        sort_key=lambda item: to_float(item.get("realizedPnl")),
-    )
     wallet_result = {
         "wallet": wallet,
         "leaderboard_entry": leaderboard_entry,
@@ -3842,9 +5736,6 @@ def analyze_wallet(
         "strategy_notes": strategy_notes,
         "metrics": metrics,
         "operation_audit": operation_audit,
-        "top_trades": top_trades,
-        "top_positions": top_positions,
-        "top_closed_positions": top_closed_positions,
         "raw_counts": {
             "activity_count": len(snapshot["activity"]),
             "trade_count": len(snapshot["trades"]),
@@ -3854,21 +5745,87 @@ def analyze_wallet(
             "operation_record_count": len(operation_audit.get("records", [])),
         },
     }
-    wallet_result["finder_ai"] = build_finder_ai_contract(
-        run_id=str(config.get("runtime", {}).get("run_id") or ""),
-        wallet_result=wallet_result,
+    if include_artifacts:
+        wallet_result = enrich_wallet_result_artifacts(
+            wallet_result=wallet_result,
+            snapshot=snapshot,
+            weather_index=weather_index,
+            config=config,
+        )
+    return wallet_result
+
+
+def enrich_wallet_result_artifacts(
+    *,
+    wallet_result: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    weather_index: WeatherIndex,
+    config: Mapping[str, Any],
+    falcon_metrics: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = dict(wallet_result)
+    wallet = str(result.get("wallet") or "")
+    metrics = (
+        dict(result.get("metrics"))
+        if isinstance(result.get("metrics"), Mapping)
+        else {}
     )
-    wallet_result["structured_materials"] = build_structured_materials(
-        config=config,
-        wallet_result=wallet_result,
+    selection_record = (
+        dict(result.get("selection_record"))
+        if isinstance(result.get("selection_record"), Mapping)
+        else {}
+    )
+
+    if falcon_metrics is None:
+        falcon_metrics = falcon_display_metrics_for_wallet(
+            wallet,
+            config=config,
+            now_date=current_utc_date_string(),
+        )
+    selection_record = apply_falcon_metrics_to_selection_record(selection_record, falcon_metrics)
+    metrics = apply_falcon_metrics_to_metrics(metrics, falcon_metrics)
+    result["selection_record"] = selection_record
+    result["metrics"] = metrics
+    result["profile"] = metrics.get("profile", result.get("profile"))
+
+    trades = snapshot.get("trades") if isinstance(snapshot.get("trades"), list) else []
+    positions = snapshot.get("positions") if isinstance(snapshot.get("positions"), list) else []
+    closed_positions = (
+        snapshot.get("closed_positions")
+        if isinstance(snapshot.get("closed_positions"), list)
+        else []
+    )
+    result["top_trades"] = top_records(
+        trades,
+        limit=int(config["analysis"]["top_trades_in_report"]),
+        sort_key=lambda item: record_notional(item),
+    )
+    result["top_positions"] = top_records(
+        positions,
+        limit=int(config["analysis"]["top_positions_in_report"]),
+        sort_key=lambda item: to_float(item.get("currentValue")),
+    )
+    result["top_closed_positions"] = top_records(
+        closed_positions,
+        limit=int(config["analysis"]["top_closed_positions_in_report"]),
+        sort_key=lambda item: to_float(item.get("realizedPnl")),
+    )
+
+    finder_ai = build_finder_ai_contract(
+        run_id=str(config.get("runtime", {}).get("run_id") or ""),
+        wallet_result=result,
+    )
+    result["finder_ai"] = enrich_finder_ai_generation_context(
+        payload=finder_ai,
+        wallet_result=result,
+    )
+    result["structured_materials"] = build_structured_materials(
+        config=dict(config),
+        wallet_result=result,
         snapshot=snapshot,
         weather_index=weather_index,
     )
-    wallet_result["finder_ai"] = enrich_finder_ai_generation_context(
-        payload=wallet_result["finder_ai"],
-        wallet_result=wallet_result,
-    )
-    return wallet_result
+    return result
 
 
 def build_structured_materials(
@@ -4678,6 +6635,7 @@ def compute_metrics(
 
 def build_analysis_summary(
     *,
+    config: Mapping[str, Any] | None = None,
     leaderboard: list[dict[str, Any]],
     weather_events: list[dict[str, Any]],
     screening_records: list[dict[str, Any]],
@@ -4685,6 +6643,7 @@ def build_analysis_summary(
     errors: list[dict[str, Any]],
 ) -> dict[str, Any]:
     metrics_list = [wallet["metrics"] for wallet in wallet_results]
+    falcon_label = falcon_win_rate_window_label(falcon_settings(config))
     label_counts: Counter[str] = Counter()
     core_label_keys = set(CORE_LABEL_KEYS)
     wallets_core_labeled = 0
@@ -4700,6 +6659,17 @@ def build_analysis_summary(
             wallets_core_labeled += 1
 
     finder_ai_summary = build_finder_ai_run_summary(wallet_results)
+    top_wallets_by_pnl = sorted(
+        wallet_results,
+        key=lambda item: (
+            item["metrics"].get("falcon_total_pnl")
+            if item["metrics"].get("falcon_total_pnl") is not None
+            else item["metrics"].get("display_pnl")
+            if item["metrics"].get("display_pnl") is not None
+            else item["metrics"]["leaderboard_pnl"]
+        ),
+        reverse=True,
+    )[:10]
 
     return {
         "leaderboard_rows_fetched": len(leaderboard),
@@ -4708,9 +6678,29 @@ def build_analysis_summary(
         "wallets_selected": len(wallet_results),
         "wallets_core_labeled": wallets_core_labeled,
         "finder_ai_summary": finder_ai_summary,
+        "falcon_display": {
+            "total_pnl_source": "falcon_lifetime",
+            "total_roi_source": "falcon_lifetime",
+            "win_rate_source": "falcon_wallet_360",
+            "win_rate_window_label": falcon_label,
+        },
         "errors": len(errors),
         "label_counts": dict(label_counts.most_common()),
         "averages": {
+            "falcon_total_roi": mean(
+                [
+                    metrics.get("falcon_total_roi", metrics.get("display_roi"))
+                    for metrics in metrics_list
+                    if metrics.get("falcon_total_roi", metrics.get("display_roi")) is not None
+                ]
+            ),
+            "falcon_win_rate": mean(
+                [
+                    metrics.get("falcon_win_rate", metrics.get("display_win_rate"))
+                    for metrics in metrics_list
+                    if metrics.get("falcon_win_rate", metrics.get("display_win_rate")) is not None
+                ]
+            ),
             "weather_notional_ratio": mean(
                 [metrics["weather_notional_ratio"] for metrics in metrics_list]
             ),
@@ -4746,7 +6736,17 @@ def build_analysis_summary(
                 "user_name": wallet.get("selection_record", {}).get("user_name")
                 or wallet["leaderboard_entry"].get("userName"),
                 "x_username": wallet["leaderboard_entry"].get("xUsername"),
-                "pnl": wallet["metrics"]["leaderboard_pnl"],
+                "pnl": wallet["metrics"].get("display_pnl", wallet["metrics"].get("falcon_total_pnl", wallet["metrics"]["leaderboard_pnl"])),
+                "display_pnl": wallet["metrics"].get("display_pnl"),
+                "display_roi": wallet["metrics"].get("display_roi"),
+                "display_win_rate": wallet["metrics"].get("display_win_rate"),
+                "display_win_rate_source": wallet["metrics"].get("display_win_rate_source"),
+                "display_win_rate_window_label": wallet["metrics"].get("display_win_rate_window_label"),
+                "falcon_total_pnl": wallet["metrics"].get("falcon_total_pnl"),
+                "falcon_total_roi": wallet["metrics"].get("falcon_total_roi"),
+                "falcon_win_rate": wallet["metrics"].get("falcon_win_rate"),
+                "falcon_win_rate_source": wallet["metrics"].get("falcon_win_rate_source"),
+                "falcon_win_rate_window_label": wallet["metrics"].get("falcon_win_rate_window_label"),
                 "closed_profit_multiple": wallet["metrics"]["closed_profit_multiple"],
                 "closed_position_win_rate": wallet["metrics"]["closed_position_win_rate"],
                 "closed_position_sample_win_rate": wallet["metrics"].get(
@@ -4759,11 +6759,7 @@ def build_analysis_summary(
                 ),
                 "wallet_win_rate_source": wallet["metrics"].get("wallet_win_rate_source", ""),
             }
-            for wallet in sorted(
-                wallet_results,
-                key=lambda item: item["metrics"]["leaderboard_pnl"],
-                reverse=True,
-            )[:10]
+            for wallet in top_wallets_by_pnl
         ],
         "top_wallets_by_frequency": [
             {
@@ -5926,12 +7922,25 @@ def fetch_collection_page_with_recovery(
     section_name: str,
     fetch_aggregate_page: Callable[[int, int], list[dict[str, Any]]],
     fetch_partition_page: Callable[[int, int, int, int], list[dict[str, Any]]],
+    initial_records: list[dict[str, Any]] | None = None,
+    initial_page_count: int = 0,
+    initial_next_offset: int | None = None,
+    partition_probe_pages: int | None = None,
 ) -> dict[str, Any]:
+    aggregate_max_offset = partition_probe_max_offset(
+        page_size=page_size,
+        max_offset=max_offset,
+        partition_probe_pages=partition_probe_pages,
+        current_offset=initial_next_offset,
+    )
     try:
         aggregate_page = paginate_with_status(
             page_size=page_size,
-            max_offset=max_offset,
+            max_offset=aggregate_max_offset,
             fetch_page=fetch_aggregate_page,
+            initial_records=initial_records,
+            initial_page_count=initial_page_count,
+            initial_next_offset=initial_next_offset,
         )
     except RuntimeError as exc:
         initial_stop_reason = classify_initial_collection_stop_reason(exc)
@@ -5941,6 +7950,7 @@ def fetch_collection_page_with_recovery(
             page_size=page_size,
             max_offset=max_offset,
             fetch_page=fetch_partition_page,
+            partition_probe_pages=partition_probe_pages,
         )
         if partitioned_page["record_count"] <= 0 and not bool(partitioned_page.get("complete", False)):
             raise exc
@@ -5966,6 +7976,7 @@ def fetch_collection_page_with_recovery(
         page_size=page_size,
         max_offset=max_offset,
         fetch_page=fetch_partition_page,
+        partition_probe_pages=partition_probe_pages,
     )
     if partitioned_page["record_count"] <= 0:
         aggregate_page["collection_mode"] = "aggregate"
@@ -6019,6 +8030,7 @@ def fetch_time_window_collection_page(
     start_ts: int,
     end_ts: int,
     fetch_partition_page: Callable[[int, int, int, int], list[dict[str, Any]]],
+    partition_probe_pages: int | None = None,
 ) -> dict[str, Any]:
     page = paginate_time_partitioned(
         page_size=page_size,
@@ -6026,6 +8038,7 @@ def fetch_time_window_collection_page(
         fetch_page=fetch_partition_page,
         start_ts=start_ts,
         end_ts=end_ts,
+        partition_probe_pages=partition_probe_pages,
     )
     return {
         **page,
@@ -6046,6 +8059,7 @@ def paginate_time_partitioned(
     start_ts: int | None = None,
     end_ts: int | None = None,
     depth: int = 0,
+    partition_probe_pages: int | None = None,
 ) -> dict[str, Any]:
     if start_ts is None:
         start_ts = 0
@@ -6067,11 +8081,23 @@ def paginate_time_partitioned(
             "partition_depth": depth,
         }
 
-    page = paginate_with_status(
+    effective_max_offset = partition_probe_max_offset(
         page_size=page_size,
         max_offset=max_offset,
+        partition_probe_pages=partition_probe_pages,
+        current_offset=0,
+    )
+    if start_ts >= end_ts or depth >= TIME_PARTITION_MAX_DEPTH:
+        effective_max_offset = max_offset
+
+    page = paginate_with_status(
+        page_size=page_size,
+        max_offset=effective_max_offset,
         fetch_page=lambda limit, offset: fetch_page(limit, offset, start_ts, end_ts),
     )
+    if effective_max_offset < max_offset:
+        page["probe_max_offset"] = effective_max_offset
+        page["probe_page_limit"] = partition_probe_pages
     page["range_start"] = start_ts
     page["range_end"] = end_ts
     page["partition_depth"] = depth
@@ -6098,6 +8124,7 @@ def paginate_time_partitioned(
         start_ts=start_ts,
         end_ts=midpoint,
         depth=depth + 1,
+        partition_probe_pages=partition_probe_pages,
     )
     upper = paginate_time_partitioned(
         page_size=page_size,
@@ -6106,6 +8133,7 @@ def paginate_time_partitioned(
         start_ts=midpoint + 1,
         end_ts=end_ts,
         depth=depth + 1,
+        partition_probe_pages=partition_probe_pages,
     )
     records = dedupe_collection_records([*lower["records"], *upper["records"]])
     complete = bool(lower["complete"]) and bool(upper["complete"])
@@ -6126,12 +8154,34 @@ def paginate_time_partitioned(
     }
 
 
+def partition_probe_max_offset(
+    *,
+    page_size: int,
+    max_offset: int,
+    partition_probe_pages: int | None,
+    current_offset: int | None = None,
+) -> int:
+    if partition_probe_pages is None:
+        return max_offset
+    try:
+        probe_pages = int(partition_probe_pages)
+    except (TypeError, ValueError):
+        return max_offset
+    if probe_pages <= 0:
+        return max_offset
+    probe_max_offset = max(0, (probe_pages - 1) * max(1, int(page_size)))
+    if current_offset is not None:
+        probe_max_offset = max(probe_max_offset, max(0, int(current_offset)))
+    return min(max_offset, probe_max_offset)
+
+
 def build_partition_recovery_page(
     *,
     aggregate_page: Mapping[str, Any],
     page_size: int,
     max_offset: int,
     fetch_page: Callable[[int, int, int, int], list[dict[str, Any]]],
+    partition_probe_pages: int | None = None,
 ) -> dict[str, Any]:
     oldest_seen = oldest_collection_timestamp(aggregate_page.get("records", []))
     if oldest_seen <= 0:
@@ -6139,6 +8189,7 @@ def build_partition_recovery_page(
             page_size=page_size,
             max_offset=max_offset,
             fetch_page=fetch_page,
+            partition_probe_pages=partition_probe_pages,
         )
 
     boundary_page = paginate_time_partitioned(
@@ -6147,6 +8198,7 @@ def build_partition_recovery_page(
         fetch_page=fetch_page,
         start_ts=oldest_seen,
         end_ts=oldest_seen,
+        partition_probe_pages=partition_probe_pages,
     )
     tail_page = paginate_time_tail_recovery(
         page_size=page_size,
@@ -6154,6 +8206,7 @@ def build_partition_recovery_page(
         fetch_page=fetch_page,
         start_ts=0,
         end_ts=max(0, oldest_seen - 1),
+        partition_probe_pages=partition_probe_pages,
     )
     return merge_partition_pages([boundary_page, tail_page])
 
@@ -6191,6 +8244,7 @@ def paginate_time_tail_recovery(
     fetch_page: Callable[[int, int, int, int], list[dict[str, Any]]],
     start_ts: int,
     end_ts: int,
+    partition_probe_pages: int | None = None,
 ) -> dict[str, Any]:
     if start_ts > end_ts:
         return {
@@ -6216,9 +8270,15 @@ def paginate_time_tail_recovery(
     complete = True
 
     while current_end >= start_ts:
-        page = paginate_with_status(
+        effective_max_offset = partition_probe_max_offset(
             page_size=page_size,
             max_offset=max_offset,
+            partition_probe_pages=partition_probe_pages,
+            current_offset=0,
+        )
+        page = paginate_with_status(
+            page_size=page_size,
+            max_offset=effective_max_offset,
             fetch_page=lambda limit, offset: fetch_page(limit, offset, start_ts, current_end),
         )
         page_count += int(page.get("page_count", 0))
@@ -6251,6 +8311,7 @@ def paginate_time_tail_recovery(
             fetch_page=fetch_page,
             start_ts=boundary_ts,
             end_ts=boundary_ts,
+            partition_probe_pages=partition_probe_pages,
         )
         page_count += int(boundary_page.get("page_count", 0))
         partition_count += int(boundary_page.get("partition_count", 0))
@@ -6346,6 +8407,40 @@ def project_recent_trades_page_from_activity(
     }
 
 
+def build_prefetched_collection_prefix_page(
+    *,
+    records: Any,
+    collection_status: Mapping[str, Any] | None,
+    section_name: str,
+    collection_mode: str,
+    history_scope: str = "aggregate",
+) -> dict[str, Any] | None:
+    prefetched_records = [
+        dict(record)
+        for record in (records if isinstance(records, list) else [])
+        if isinstance(record, Mapping)
+    ]
+    if not prefetched_records:
+        return None
+    status = collection_status if isinstance(collection_status, Mapping) else {}
+    return {
+        "records": prefetched_records,
+        "complete": False,
+        "stop_reason": "prefetched_prefix",
+        "page_count": max(1, decode_int(status.get("page_count", 0))),
+        "record_count": len(prefetched_records),
+        "last_offset": decode_int(status.get("last_offset", 0)),
+        "next_offset": len(prefetched_records),
+        "collection_mode": collection_mode,
+        "source_section": section_name,
+        "history_scope": history_scope,
+        "range_start": status.get("range_start"),
+        "range_end": status.get("range_end"),
+        "partitioned": bool(status.get("partitioned", False)),
+        "partition_attempted": bool(status.get("partition_attempted", False)),
+    }
+
+
 def dedupe_collection_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     deduped: dict[tuple[str, ...], dict[str, Any]] = {}
     for record in records:
@@ -6424,10 +8519,17 @@ def paginate_with_status(
     page_size: int,
     max_offset: int,
     fetch_page: Callable[[int, int], list[dict[str, Any]]],
+    initial_records: list[dict[str, Any]] | None = None,
+    initial_page_count: int = 0,
+    initial_next_offset: int | None = None,
 ) -> dict[str, Any]:
-    results: list[dict[str, Any]] = []
-    offset = 0
-    page_count = 0
+    results: list[dict[str, Any]] = list(initial_records or [])
+    offset = (
+        max(0, int(initial_next_offset))
+        if initial_next_offset is not None
+        else (len(results) if results else 0)
+    )
+    page_count = max(0, int(initial_page_count or 0))
     complete = True
     stop_reason = "empty_page"
     while offset <= max_offset:

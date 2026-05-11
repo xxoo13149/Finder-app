@@ -4,6 +4,7 @@ import json
 import http.client
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any
@@ -14,22 +15,30 @@ from urllib.error import HTTPError
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from polymarket_weather_tool import history_provider as history_provider_module
 from polymarket_weather_tool.analysis import (
     WeatherIndex,
     analyze_leaderboard_entry,
     build_screening_record,
     compute_metrics,
     fetch_graph_activity_stream,
+    fetch_graph_activity_operations,
+    fetch_graph_order_fills,
+    fetch_graph_token_condition_lookup,
     fetch_wallet_snapshot,
     fetch_weather_events,
     fetch_weather_events_keyset,
     fetch_weather_events_keyset_with_summary,
+    freeze_analysis_current_datetime,
     history_provider_fetch_plan,
     paginate,
+    paginate_with_status,
     probe_wallet_trade_window,
     project_trades_page_from_activity,
     should_hydrate_wallet_result_full_history,
     split_leaderboard_prefilter_candidates,
+    wallet_is_in_history_registry,
+    write_wallet_history_record,
 )
 from polymarket_weather_tool.client import PolymarketClient
 from polymarket_weather_tool.config import (
@@ -352,6 +361,43 @@ class GraphHistoryProviderClient(WindowActivityClient):
         raise AssertionError(f"unexpected graphql query: {query}")
 
 
+class SplitGraphOrderFillsClient(WindowActivityClient):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.graphql_calls: list[dict[str, Any]] = []
+
+    def fetch_graphql(
+        self,
+        *,
+        endpoint_url: str,
+        query: str,
+        variables: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        variables = dict(variables or {})
+        self.graphql_calls.append(
+            {
+                "endpoint_url": endpoint_url,
+                "query": query,
+                "variables": variables,
+            }
+        )
+        skip = int(variables.get("skip") or 0)
+        if skip != 0:
+            return {"data": {"maker": [], "taker": []}}
+        return {
+            "data": {
+                "maker": [
+                    {"id": f"maker-{index}", "timestamp": str(1_777_000_000 - index)}
+                    for index in range(3)
+                ],
+                "taker": [
+                    {"id": f"taker-{index}", "timestamp": str(1_777_000_100 - index)}
+                    for index in range(2)
+                ],
+            }
+        }
+
+
 class IncompleteGraphHistoryProviderClient(GraphHistoryProviderClient):
     def __init__(self) -> None:
         super().__init__([])
@@ -590,6 +636,67 @@ class UpgradeBehaviorTests(unittest.TestCase):
 
         self.assertEqual([event["id"] for event in events], ["1", "2"])
 
+    def test_fetch_weather_events_reuses_recent_cache_after_first_page_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = {
+                "api": {"cache_dir": str(Path(temp_dir) / "api-cache"), "cache_ttl_seconds": 3600},
+                "pagination": {"page_size": 2, "max_offset": 10},
+                "weather": {
+                    "tag_id": 84,
+                    "tag_slug": "weather",
+                    "use_keyset": True,
+                    "order": "createdAt",
+                    "ascending": False,
+                    "max_events": 10,
+                    "active_only": False,
+                    "closed_only": False,
+                    "include_archived": False,
+                    "page_size": 2,
+                    "reuse_recent_cache": True,
+                    "cache_ttl_seconds": 3600,
+                },
+            }
+            first_client = FakeClient()
+            second_client = FakeClient()
+
+            first_events = fetch_weather_events(first_client, config)  # type: ignore[arg-type]
+            second_events = fetch_weather_events(second_client, config)  # type: ignore[arg-type]
+
+        self.assertEqual(first_events, second_events)
+        self.assertEqual(len(first_client.calls), 2)
+        self.assertEqual(len(second_client.calls), 1)
+        self.assertIsNone(second_client.calls[0]["after_cursor"])
+
+    def test_fetch_weather_events_ignores_recent_cache_when_first_page_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = {
+                "api": {"cache_dir": str(Path(temp_dir) / "api-cache"), "cache_ttl_seconds": 3600},
+                "pagination": {"page_size": 2, "max_offset": 10},
+                "weather": {
+                    "tag_id": 84,
+                    "tag_slug": "weather",
+                    "use_keyset": True,
+                    "order": "createdAt",
+                    "ascending": False,
+                    "max_events": 10,
+                    "active_only": False,
+                    "closed_only": False,
+                    "include_archived": False,
+                    "page_size": 2,
+                    "reuse_recent_cache": True,
+                    "cache_ttl_seconds": 3600,
+                },
+            }
+            first_client = FakeClient()
+            changed_client = FakeClient()
+            changed_client.events = [{"id": "9"}, {"id": "2"}, {"id": "3"}, {"id": "4"}]
+
+            fetch_weather_events(first_client, config)  # type: ignore[arg-type]
+            events = fetch_weather_events(changed_client, config)  # type: ignore[arg-type]
+
+        self.assertEqual([event["id"] for event in events], ["9", "2", "3", "4"])
+        self.assertEqual(len(changed_client.calls), 3)
+
     def test_leaderboard_time_period_alias_uses_day_for_1d(self) -> None:
         client = FakeLeaderboardClient()
         client.fetch_leaderboard_page(
@@ -623,6 +730,33 @@ class UpgradeBehaviorTests(unittest.TestCase):
         )
 
         self.assertEqual(records, [{"id": "1"}, {"id": "2"}])
+
+    def test_paginate_with_status_can_continue_from_prefetched_prefix(self) -> None:
+        calls: list[tuple[int, int]] = []
+
+        def fetch_page(limit: int, offset: int) -> list[dict[str, Any]]:
+            calls.append((limit, offset))
+            if offset == 2:
+                return [{"id": "3"}]
+            raise AssertionError(f"unexpected offset {offset}")
+
+        page = paginate_with_status(
+            page_size=2,
+            max_offset=10,
+            fetch_page=fetch_page,
+            initial_records=[{"id": "1"}, {"id": "2"}],
+            initial_page_count=1,
+            initial_next_offset=2,
+        )
+
+        self.assertEqual(calls, [(2, 2)])
+        self.assertEqual(page["records"], [{"id": "1"}, {"id": "2"}, {"id": "3"}])
+        self.assertTrue(page["complete"])
+        self.assertEqual(page["stop_reason"], "last_page_partial")
+        self.assertEqual(page["page_count"], 2)
+        self.assertEqual(page["record_count"], 3)
+        self.assertEqual(page["last_offset"], 2)
+        self.assertEqual(page["next_offset"], 4)
 
     def test_leaderboard_prefilter_skips_rows_failing_pnl_or_volume(self) -> None:
         config = {
@@ -774,7 +908,11 @@ class UpgradeBehaviorTests(unittest.TestCase):
                     "current_datetime": "2026-04-25T00:00:00+00:00",
                     "position_size_threshold": 0.1,
                 },
-                "history_ledger": {"enabled": True, "backend": "local"},
+                "history_ledger": {
+                    "enabled": True,
+                    "backend": "local",
+                    "persist_screening_snapshots": True,
+                },
                 "history_provider": {
                     "enabled": True,
                     "screening_fallback_enabled": True,
@@ -905,6 +1043,420 @@ class UpgradeBehaviorTests(unittest.TestCase):
         self.assertIn("end", window_query["variables"])
         self.assertFalse(any(name == "trades" for name, _kwargs in client.calls))
 
+    def test_day_trade_probe_does_not_seed_full_snapshot_when_screening_snapshot_disabled(self) -> None:
+        current_ts = 1_777_000_000
+        client = WindowActivityClient(
+            [
+                {
+                    "type": "TRADE",
+                    "id": "recent-trade",
+                    "timestamp": current_ts - 60,
+                    "conditionId": "cond-core",
+                    "side": "BUY",
+                    "size": "4",
+                    "price": "0.20",
+                    "usdcSize": "0.80",
+                }
+            ]
+        )
+        config = {
+            "analysis": {
+                "current_datetime": "2026-04-25T00:00:00+00:00",
+                "screening_snapshot_enabled": False,
+                "full_history_core_gate_enabled": False,
+                "position_size_threshold": 0.1,
+                "top_trades_in_report": 3,
+                "top_positions_in_report": 3,
+                "top_closed_positions_in_report": 3,
+            },
+            "chain_validation": {"enabled": False},
+            "leaderboard": {"time_period": "DAY"},
+            "pagination": {"page_size": 10, "max_offset": 100},
+            "wallet_filter": {
+                "min_pnl": 0,
+                "min_volume": 0,
+                "min_traded_count": 1,
+                "max_traded_count": 99,
+                "min_weather_trade_ratio": 0,
+                "include_wallets": [],
+                "exclude_wallets": [],
+            },
+        }
+        captured_prefetched_trades: list[Any] = []
+
+        def fake_fetch_wallet_snapshot(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+            captured_prefetched_trades.append(kwargs.get("prefetched_trades"))
+            return {
+                "wallet": "0xabc",
+                "activity": [],
+                "trades": [],
+                "rewards": [],
+                "positions": [],
+                "closed_positions": [],
+                "equity": [],
+                "accounting_snapshot": None,
+                "history_provider": {},
+                "history_ledger_operations": {},
+                "chain_validation": {},
+                "collection_status": {},
+                "operation_audit": {},
+                "snapshot_scope": str(kwargs.get("snapshot_scope") or "full"),
+            }
+
+        fake_wallet_result = {
+            "wallet": "0xabc",
+            "screening": {"selected": True, "trade_count": 0, "reasons": []},
+            "labels": [],
+            "selection_record": {"wallet": "0xabc", "selected": True},
+        }
+
+        with patch("polymarket_weather_tool.analysis.fetch_wallet_snapshot", side_effect=fake_fetch_wallet_snapshot):
+            with patch("polymarket_weather_tool.analysis.analyze_wallet", return_value=fake_wallet_result):
+                result = analyze_leaderboard_entry(
+                    client=client,  # type: ignore[arg-type]
+                    leaderboard_entry={
+                        "proxyWallet": "0xabc",
+                        "pnl": "20",
+                        "vol": "1000",
+                        "rank": 1,
+                        "userName": "day-full-snapshot",
+                    },
+                    weather_index=WeatherIndex(
+                        set(),
+                        set(),
+                        {"cond-core", "cond-older"},
+                        set(),
+                        {"cond-core": "NYC", "cond-older": "London"},
+                    ),
+                    config=config,
+                )
+
+        self.assertIn("wallet_result", result)
+        self.assertEqual(captured_prefetched_trades, [None])
+        probe_activity_calls = [
+            kwargs
+            for name, kwargs in client.calls
+            if name == "activity" and str(kwargs.get("activity_type") or "").upper() == "TRADE"
+        ]
+        self.assertEqual(len(probe_activity_calls), 1)
+        self.assertIn("start", probe_activity_calls[0])
+        self.assertIn("end", probe_activity_calls[0])
+
+    def test_all_period_trade_probe_seeds_full_snapshot_with_prefetched_trades_page(self) -> None:
+        class AllPeriodProbeClient:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def fetch_trades_page(self, **kwargs: Any) -> list[dict[str, Any]]:
+                self.calls.append(dict(kwargs))
+                limit = int(kwargs["limit"])
+                offset = int(kwargs["offset"])
+                records = [
+                    {
+                        "type": "TRADE",
+                        "id": "trade-1",
+                        "timestamp": 1_777_000_000 - 60,
+                        "conditionId": "cond-core",
+                        "side": "BUY",
+                        "size": "4",
+                        "price": "0.20",
+                        "usdcSize": "0.80",
+                    },
+                    {
+                        "type": "TRADE",
+                        "id": "trade-2",
+                        "timestamp": 1_777_000_000 - 120,
+                        "conditionId": "cond-core",
+                        "side": "SELL",
+                        "size": "3",
+                        "price": "0.25",
+                        "usdcSize": "0.75",
+                    },
+                    {
+                        "type": "TRADE",
+                        "id": "trade-3",
+                        "timestamp": 1_777_000_000 - 180,
+                        "conditionId": "cond-older",
+                        "side": "BUY",
+                        "size": "5",
+                        "price": "0.35",
+                        "usdcSize": "1.75",
+                    },
+                ]
+                return records[offset : offset + limit]
+
+        client = AllPeriodProbeClient()
+        config = {
+            "analysis": {
+                "current_datetime": "2026-04-25T00:00:00+00:00",
+                "screening_snapshot_enabled": False,
+                "full_history_core_gate_enabled": False,
+                "position_size_threshold": 0.1,
+                "top_trades_in_report": 3,
+                "top_positions_in_report": 3,
+                "top_closed_positions_in_report": 3,
+            },
+            "chain_validation": {"enabled": False},
+            "leaderboard": {"time_period": "ALL"},
+            "pagination": {"page_size": 2, "max_offset": 100},
+            "wallet_filter": {
+                "min_pnl": 0,
+                "min_volume": 0,
+                "min_traded_count": 1,
+                "min_weather_trade_ratio": 0,
+                "include_wallets": [],
+                "exclude_wallets": [],
+            },
+        }
+        captured_prefetched_trades: list[Any] = []
+        captured_prefetched_trades_pages: list[Any] = []
+
+        def fake_fetch_wallet_snapshot(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+            captured_prefetched_trades.append(kwargs.get("prefetched_trades"))
+            captured_prefetched_trades_pages.append(kwargs.get("prefetched_trades_page"))
+            return {
+                "wallet": "0xabc",
+                "activity": [],
+                "trades": [],
+                "rewards": [],
+                "positions": [],
+                "closed_positions": [],
+                "equity": [],
+                "accounting_snapshot": None,
+                "history_provider": {},
+                "history_ledger_operations": {},
+                "chain_validation": {},
+                "collection_status": {},
+                "operation_audit": {},
+                "snapshot_scope": str(kwargs.get("snapshot_scope") or "full"),
+            }
+
+        fake_wallet_result = {
+            "wallet": "0xabc",
+            "screening": {"selected": True, "trade_count": 0, "reasons": []},
+            "labels": [],
+            "selection_record": {"wallet": "0xabc", "selected": True},
+        }
+
+        with patch("polymarket_weather_tool.analysis.fetch_wallet_snapshot", side_effect=fake_fetch_wallet_snapshot):
+            with patch("polymarket_weather_tool.analysis.analyze_wallet", return_value=fake_wallet_result):
+                result = analyze_leaderboard_entry(
+                    client=client,  # type: ignore[arg-type]
+                    leaderboard_entry={
+                        "proxyWallet": "0xabc",
+                        "pnl": "20",
+                        "vol": "1000",
+                        "rank": 1,
+                        "userName": "all-period-prefetch",
+                    },
+                    weather_index=WeatherIndex(
+                        set(),
+                        set(),
+                        {"cond-core", "cond-older"},
+                        set(),
+                        {"cond-core": "NYC", "cond-older": "London"},
+                    ),
+                    config=config,
+                )
+
+        self.assertIn("wallet_result", result)
+        self.assertEqual(captured_prefetched_trades, [None])
+        self.assertEqual(len(captured_prefetched_trades_pages), 1)
+        page = captured_prefetched_trades_pages[0]
+        self.assertIsInstance(page, dict)
+        self.assertEqual(page["record_count"], 2)
+        self.assertFalse(page["complete"])
+        self.assertEqual(page["next_offset"], 2)
+        self.assertEqual(page["collection_mode"], "probe_prefetch")
+        self.assertEqual(client.calls[0]["offset"], 0)
+        self.assertEqual(client.calls[0]["limit"], 2)
+
+    def test_screening_window_snapshot_does_not_seed_full_hydration_trade_offset(self) -> None:
+        config = {
+            "analysis": {
+                "current_datetime": "2026-04-25T00:00:00+00:00",
+                "screening_window_first": True,
+                "recent_activity_screening_snapshot_enabled": False,
+                "hydrate_selected_wallet_full_history": True,
+                "position_size_threshold": 0.1,
+            },
+            "chain_validation": {"enabled": False},
+            "leaderboard": {"time_period": "DAY"},
+            "pagination": {"page_size": 10, "max_offset": 100},
+            "wallet_filter": {
+                "min_pnl": 0,
+                "min_volume": 0,
+                "min_traded_count": 1,
+                "min_weather_trade_ratio": 0,
+                "include_wallets": [],
+                "exclude_wallets": [],
+            },
+        }
+        screening_snapshot = {
+            "wallet": "0xabc",
+            "activity": [
+                {"type": "TRADE", "id": "recent-trade", "timestamp": 1_777_000_000 - 60},
+                {"type": "REWARD", "id": "recent-reward", "timestamp": 1_777_000_000 - 30},
+            ],
+            "trades": [
+                {"type": "TRADE", "id": "recent-trade", "timestamp": 1_777_000_000 - 60},
+                {"type": "TRADE", "id": "older-trade", "timestamp": 1_777_000_000 - 120},
+            ],
+            "rewards": [],
+            "positions": [],
+            "closed_positions": [],
+            "equity": [],
+            "accounting_snapshot": None,
+            "history_provider": {},
+            "history_ledger_operations": {},
+            "history_ledger": {},
+            "chain_validation": {},
+            "operation_audit": {},
+            "snapshot_scope": "screening",
+            "collection_status": {
+                "trades": {
+                    "page_count": 2,
+                    "complete": True,
+                    "last_offset": 1,
+                    "next_offset": 2,
+                    "history_scope": "screening_window",
+                    "range_start": 1_776_913_600,
+                    "range_end": 1_777_000_000,
+                }
+            },
+        }
+        full_snapshot = {
+            "wallet": "0xabc",
+            "activity": [],
+            "trades": [],
+            "rewards": [],
+            "positions": [],
+            "closed_positions": [],
+            "equity": [],
+            "accounting_snapshot": None,
+            "history_provider": {},
+            "history_ledger_operations": {},
+            "history_ledger": {},
+            "chain_validation": {},
+            "operation_audit": {},
+            "snapshot_scope": "full",
+            "collection_status": {},
+        }
+        lightweight_wallet_result = {
+            "wallet": "0xabc",
+            "screening": {"selected": True, "trade_count": 2, "reasons": []},
+            "labels": [{"key": "core_test_label", "system_core": True}],
+            "selection_record": {"wallet": "0xabc", "selected": True},
+        }
+        full_wallet_result = {
+            "wallet": "0xabc",
+            "screening": {"selected": True, "trade_count": 2, "reasons": []},
+            "labels": [{"key": "core_test_label", "system_core": True}],
+            "selection_record": {"wallet": "0xabc", "selected": True},
+        }
+        captured_prefetched_activity_pages: list[Any] = []
+        captured_prefetched_trades_pages: list[Any] = []
+
+        def fake_fetch_full_wallet_snapshot_with_retry(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+            captured_prefetched_activity_pages.append(kwargs.get("prefetched_activity_page"))
+            captured_prefetched_trades_pages.append(kwargs.get("prefetched_trades_page"))
+            return dict(full_snapshot)
+
+        with patch(
+            "polymarket_weather_tool.analysis.probe_wallet_trade_window",
+            return_value={"trade_probe_fetched": False},
+        ):
+            with patch(
+                "polymarket_weather_tool.analysis.fetch_wallet_snapshot",
+                return_value=screening_snapshot,
+            ):
+                with patch(
+                    "polymarket_weather_tool.analysis.fetch_full_wallet_snapshot_with_retry",
+                    side_effect=fake_fetch_full_wallet_snapshot_with_retry,
+                ):
+                    with patch(
+                        "polymarket_weather_tool.analysis.analyze_wallet",
+                        side_effect=[lightweight_wallet_result, full_wallet_result],
+                    ):
+                        result = analyze_leaderboard_entry(
+                            client=object(),  # type: ignore[arg-type]
+                            leaderboard_entry={
+                                "proxyWallet": "0xabc",
+                                "pnl": "20",
+                                "vol": "1000",
+                                "rank": 1,
+                                "userName": "screening-hydration-prefetch",
+                            },
+                            weather_index=WeatherIndex(
+                                set(),
+                                set(),
+                                {"cond-core"},
+                                set(),
+                                {"cond-core": "NYC"},
+                            ),
+                            config=config,
+                        )
+
+        self.assertIn("wallet_result", result)
+        self.assertEqual(result["wallet_result"]["deep_hydration"]["status"], "completed")
+        self.assertEqual(captured_prefetched_activity_pages, [None])
+        self.assertEqual(captured_prefetched_trades_pages, [None])
+
+    def test_fetch_wallet_snapshot_ignores_screening_prefetch_page_for_full_history(self) -> None:
+        records = [
+            {
+                "type": "TRADE",
+                "id": "full-trade",
+                "timestamp": 1_777_000_000,
+                "conditionId": "cond-core",
+                "side": "BUY",
+                "size": "4",
+                "price": "0.20",
+                "usdcSize": "0.80",
+            },
+            {
+                "type": "REWARD",
+                "id": "reward",
+                "timestamp": 1_776_999_940,
+                "usdcSize": "1.25",
+            },
+        ]
+        client = WindowActivityClient(records)
+        config = {
+            "analysis": {"position_size_threshold": 0.1},
+            "chain_validation": {"enabled": False},
+            "leaderboard": {"time_period": "ALL"},
+            "pagination": {"page_size": 10, "max_offset": 100},
+        }
+
+        snapshot = fetch_wallet_snapshot(
+            client,  # type: ignore[arg-type]
+            "0xabc",
+            config,
+            prefetched_trades_page={
+                "records": [
+                    {
+                        "type": "TRADE",
+                        "id": "window-trade",
+                        "timestamp": 1_777_000_000,
+                        "conditionId": "cond-core",
+                    }
+                ],
+                "page_count": 1,
+                "next_offset": 1,
+                "collection_mode": "screening_prefetch",
+                "history_scope": "screening_window",
+                "source_section": "trades",
+            },
+        )
+
+        self.assertFalse(any(name == "trades" for name, _kwargs in client.calls))
+        self.assertEqual([record["id"] for record in snapshot["trades"]], ["full-trade"])
+        self.assertEqual(
+            snapshot["collection_status"]["trades"]["collection_mode"],
+            "activity_projection",
+        )
+
     def test_fetch_wallet_snapshot_uses_screening_window_for_weekly_mode(self) -> None:
         current_ts = 1_777_000_000
         old_ts = current_ts - 20 * 24 * 3600
@@ -1015,6 +1567,227 @@ class UpgradeBehaviorTests(unittest.TestCase):
             for row in gap_rows:
                 self.assertNotIn("records", row["payload"])
 
+    def test_fetch_wallet_snapshot_can_skip_screening_history_ledger_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifacts_root = Path(temp_dir)
+            current_ts = 1_777_000_000
+            records = [
+                {"type": "REWARD", "id": "recent-reward", "timestamp": current_ts - 60},
+                {"type": "TRADE", "id": "recent-trade", "timestamp": current_ts - 120},
+            ]
+            client = WindowActivityClient(records)
+            config = {
+                "analysis": {
+                    "current_datetime": "2026-04-25T00:00:00+00:00",
+                    "position_size_threshold": 0.1,
+                },
+                "chain_validation": {"enabled": False},
+                "history_ledger": {
+                    "enabled": True,
+                    "backend": "local",
+                    "persist_screening_snapshots": False,
+                },
+                "leaderboard": {"time_period": "WEEK"},
+                "pagination": {"page_size": 10, "max_offset": 100},
+                "runtime": {
+                    "artifacts_root": str(artifacts_root),
+                    "run_id": "screening-ledger-skip-run",
+                },
+                "wallet_filter": {"include_wallets": [], "exclude_wallets": []},
+            }
+
+            snapshot = fetch_wallet_snapshot(
+                client,  # type: ignore[arg-type]
+                "0xabc",
+                config,
+                snapshot_scope="screening",
+            )
+
+            self.assertEqual(snapshot["history_ledger"]["status"], "skipped")
+            self.assertEqual(
+                snapshot["history_ledger"]["reason"],
+                "screening_snapshot_persistence_disabled",
+            )
+            self.assertEqual(self.read_history_ledger_rows(artifacts_root, "trades"), [])
+            self.assertEqual(self.read_history_ledger_rows(artifacts_root, "operations"), [])
+            self.assertEqual(self.read_history_ledger_rows(artifacts_root, "gaps"), [])
+
+    def test_history_ledger_skips_oversized_local_table_reads_and_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifacts_root = Path(temp_dir)
+            trade_path = history_ledger_table_path(artifacts_root, "trades")
+            trade_path.parent.mkdir(parents=True, exist_ok=True)
+            oversized_payload = "[]          "
+            trade_path.write_text(oversized_payload, encoding="utf-8")
+            store = create_history_ledger_store(
+                artifacts_root,
+                {
+                    "history_ledger": {
+                    "enabled": True,
+                    "backend": "local",
+                    "max_local_table_bytes": 2,
+                    "read_cloud_fallback_enabled": False,
+                    "replicate_to_cloudflare": False,
+                }
+            },
+        )
+            snapshot = {
+                "wallet": "0xabc",
+                "trades": [
+                    {
+                        "id": "trade-1",
+                        "timestamp": 1_777_000_000,
+                        "conditionId": "cond-weather",
+                        "asset": "rain-yes",
+                        "side": "BUY",
+                        "size": "1",
+                        "usdcSize": "0.5",
+                    }
+                ],
+            }
+
+            status = store.persist_wallet_snapshot(
+                snapshot,
+                wallet="0xabc",
+                run_id="oversized-ledger",
+                snapshot_scope="full",
+            )
+            fallback = store.load_complete_trade_fallback(
+                wallet="0xabc",
+                history_scope="aggregate",
+                snapshot_scope="full",
+            )
+            self.assertEqual(store.status()["local_skipped_tables"], ["trades"])
+            self.assertEqual(status["status"], "skipped")
+            self.assertEqual(status["reason"], "local_ledger_table_too_large")
+            self.assertEqual(status["trade_count"], 1)
+            self.assertEqual(status["local_skipped_tables"], ["trades"])
+            self.assertEqual(status["local_skip_reason"], "local_ledger_table_too_large")
+            self.assertEqual(trade_path.read_text(encoding="utf-8"), oversized_payload)
+            self.assertEqual(fallback["status"], "skipped")
+            self.assertEqual(fallback["reason"], "local_ledger_table_too_large")
+            self.assertEqual(fallback["local_skipped_tables"], ["trades"])
+            self.assertEqual(fallback["record_count"], 0)
+
+    def test_history_ledger_skips_oversized_gap_table_before_fallback_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifacts_root = Path(temp_dir)
+            gap_path = history_ledger_table_path(artifacts_root, "gaps")
+            gap_path.parent.mkdir(parents=True, exist_ok=True)
+            gap_path.write_text("[]          ", encoding="utf-8")
+            store = create_history_ledger_store(
+                artifacts_root,
+                {
+                    "history_ledger": {
+                    "enabled": True,
+                    "backend": "local",
+                    "max_local_table_bytes": 2,
+                    "read_cloud_fallback_enabled": False,
+                    "replicate_to_cloudflare": False,
+                }
+            },
+        )
+
+            with patch(
+                "polymarket_weather_tool.history_ledger.read_local_ledger_rows",
+                side_effect=AssertionError("oversized gap table should not be read"),
+            ):
+                trade_fallback = store.load_complete_trade_fallback(
+                    wallet="0xabc",
+                    history_scope="aggregate",
+                    snapshot_scope="full",
+                )
+                operation_fallback = store.load_complete_operation_fallback(
+                    wallet="0xabc",
+                    history_scope="full_history",
+                    snapshot_scope="full",
+                )
+                compaction = store.compact_local_gap_payloads()
+
+            self.assertEqual(trade_fallback["status"], "skipped")
+            self.assertEqual(trade_fallback["reason"], "local_ledger_table_too_large")
+            self.assertEqual(trade_fallback["local_skipped_tables"], ["gaps"])
+            self.assertEqual(operation_fallback["status"], "skipped")
+            self.assertEqual(operation_fallback["reason"], "local_ledger_table_too_large")
+            self.assertEqual(operation_fallback["local_skipped_tables"], ["gaps"])
+            self.assertEqual(compaction["status"], "skipped")
+            self.assertEqual(compaction["reason"], "local_ledger_table_too_large")
+            self.assertEqual(compaction["local_skipped_tables"], ["gaps"])
+
+    def test_history_ledger_reuses_gap_rows_within_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifacts_root = Path(temp_dir)
+            gap_path = history_ledger_table_path(artifacts_root, "gaps")
+            gap_path.parent.mkdir(parents=True, exist_ok=True)
+            gap_rows = [
+                {
+                    "wallet_address": "0xabc",
+                    "section_name": "trades",
+                    "complete": True,
+                },
+                {
+                    "wallet_address": "0xabc",
+                    "section_name": "history_provider",
+                    "complete": True,
+                },
+            ]
+            gap_path.write_text(json.dumps(gap_rows), encoding="utf-8")
+            store = create_history_ledger_store(
+                artifacts_root,
+                {"history_ledger": {"enabled": True, "backend": "local"}},
+            )
+
+            with patch(
+                "polymarket_weather_tool.history_ledger.read_local_ledger_rows",
+                return_value=gap_rows,
+            ) as read_mock:
+                trade_rows = store._load_gap_rows_local(wallet="0xabc", section_name="trades")
+                provider_rows = store._load_gap_rows_local(
+                    wallet="0xabc",
+                    section_name="history_provider",
+                )
+
+            self.assertEqual(read_mock.call_count, 1)
+            self.assertEqual(len(trade_rows), 1)
+            self.assertEqual(len(provider_rows), 1)
+
+    def test_history_ledger_sync_skips_oversized_local_tables_without_reading(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifacts_root = Path(temp_dir)
+            trade_path = history_ledger_table_path(artifacts_root, "trades")
+            trade_path.parent.mkdir(parents=True, exist_ok=True)
+            trade_path.write_text("[]          ", encoding="utf-8")
+            store = create_history_ledger_store(
+                artifacts_root,
+                {
+                    "history_ledger": {
+                        "enabled": True,
+                        "backend": "local",
+                        "cloudflare_account_id": "account-id",
+                        "cloudflare_d1_database_id": "database-id",
+                        "cloudflare_api_token": "api-token",
+                        "max_local_table_bytes": 2,
+                    }
+                },
+            )
+
+            def fake_read_local_ledger_rows(path: Path) -> list[dict[str, Any]]:
+                if path == trade_path:
+                    raise AssertionError("oversized trade table should not be read")
+                return []
+
+            with patch(
+                "polymarket_weather_tool.history_ledger.read_local_ledger_rows",
+                side_effect=fake_read_local_ledger_rows,
+            ), patch("polymarket_weather_tool.history_ledger.cloudflare_d1_upsert_rows") as upsert_mock:
+                result = store.sync_local_to_cloudflare()
+
+            self.assertEqual(result["status"], "synced")
+            self.assertEqual(result["local_skipped_tables"], ["trades"])
+            self.assertEqual(result["skipped_local_tables"], ["trades"])
+            self.assertEqual(result["local_skip_reason"], "local_ledger_table_too_large")
+            self.assertFalse(upsert_mock.called)
+
     def test_history_ledger_batch_compaction_removes_legacy_gap_records_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             artifacts_root = Path(temp_dir)
@@ -1073,6 +1846,49 @@ class UpgradeBehaviorTests(unittest.TestCase):
             trade_rows = self.read_history_ledger_rows(artifacts_root, "trades")
             self.assertEqual(trade_rows[0]["payload"], {"id": "trade-payload"})
 
+    def test_history_ledger_gap_compaction_can_be_deferred_until_run_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifacts_root = Path(temp_dir)
+            gap_path = history_ledger_table_path(artifacts_root, "gaps")
+            gap_path.parent.mkdir(parents=True, exist_ok=True)
+            gap_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "gap_key": "gap-1",
+                            "wallet_address": "0xabc",
+                            "section_name": "trades",
+                            "payload": {
+                                "complete": True,
+                                "records": [{"id": "heavy-trade"}],
+                            },
+                        }
+                    ],
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            store = create_history_ledger_store(
+                artifacts_root,
+                {
+                    "history_ledger": {
+                        "enabled": True,
+                        "backend": "local",
+                        "compact_gap_payloads_after_batch": False,
+                    }
+                },
+            )
+            deferred = store.compact_local_gap_payloads()
+            forced = store.compact_local_gap_payloads(force=True)
+
+            self.assertEqual(deferred["status"], "disabled")
+            self.assertEqual(deferred["reason"], "gap_payload_compaction_disabled")
+            self.assertEqual(forced["status"], "compacted")
+            gap_rows = self.read_history_ledger_rows(artifacts_root, "gaps")
+            self.assertNotIn("records", gap_rows[0]["payload"])
+
     def test_fetch_wallet_snapshot_replicates_history_ledger_rows_to_cloudflare_when_backend_is_local(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             artifacts_root = Path(temp_dir)
@@ -1096,6 +1912,7 @@ class UpgradeBehaviorTests(unittest.TestCase):
                     "cloudflare_d1_database_id": "database-id",
                     "cloudflare_api_token": "api-token",
                     "replicate_to_cloudflare": True,
+                    "persist_screening_snapshots": True,
                 },
                 "leaderboard": {"time_period": "WEEK"},
                 "pagination": {"page_size": 10, "max_offset": 100},
@@ -1497,6 +2314,78 @@ class UpgradeBehaviorTests(unittest.TestCase):
         )
         self.assertEqual(snapshot["collection_status"]["trades"]["history_scope"], "full_history")
 
+    def test_fetch_graph_order_fills_stops_when_each_role_page_is_partial(self) -> None:
+        client = SplitGraphOrderFillsClient()
+
+        page = fetch_graph_order_fills(
+            client=client,  # type: ignore[arg-type]
+            wallet="0xabc",
+            settings={
+                "orderbook_url": "https://example.test/subgraph",
+                "page_size": 5,
+                "max_pages_per_stream": 2,
+                "partition_probe_pages": 2,
+            },
+        )
+
+        self.assertEqual(page["record_count"], 5)
+        self.assertEqual(page["page_count"], 1)
+        self.assertEqual(
+            [call["variables"]["skip"] for call in client.graphql_calls],
+            [0],
+        )
+
+    def test_fetch_graph_token_condition_lookup_reuses_positive_cache(self) -> None:
+        class TokenLookupClient:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def fetch_graphql(
+                self,
+                *,
+                endpoint_url: str,
+                query: str,
+                variables: dict[str, Any] | None = None,
+            ) -> dict[str, Any]:
+                del endpoint_url, query
+                variables = dict(variables or {})
+                self.calls.append(variables)
+                return {
+                    "data": {
+                        "tokenIdConditions": [
+                            {
+                                "id": token_id,
+                                "condition": {"id": f"cond-{token_id}"},
+                                "outcomeIndex": "0",
+                            }
+                            for token_id in variables.get("ids", [])
+                        ]
+                    }
+                }
+
+        client = TokenLookupClient()
+        settings = {
+            "positions_url": "https://example.test/token-cache",
+            "token_lookup_chunk_size": 10,
+            "token_lookup_cache_enabled": True,
+        }
+
+        first = fetch_graph_token_condition_lookup(
+            client=client,  # type: ignore[arg-type]
+            token_ids=["1001"],
+            settings=settings,
+        )
+        second = fetch_graph_token_condition_lookup(
+            client=client,  # type: ignore[arg-type]
+            token_ids=["1001", "1002"],
+            settings=settings,
+        )
+
+        self.assertEqual(first["cache_hit_count"], 0)
+        self.assertEqual(second["cache_hit_count"], 1)
+        self.assertEqual([call["ids"] for call in client.calls], [["1001"], ["1002"]])
+        self.assertEqual({record["id"] for record in second["records"]}, {"1001", "1002"})
+
     def test_history_provider_fetch_plan_only_requests_missing_sections(self) -> None:
         config = {
             "history_provider": {
@@ -1536,6 +2425,54 @@ class UpgradeBehaviorTests(unittest.TestCase):
                 "need_operations": False,
             },
         )
+
+    def test_full_history_bundle_overlaps_trade_and_operation_fetches(self) -> None:
+        barrier = threading.Barrier(2)
+        calls: list[str] = []
+        calls_lock = threading.Lock()
+
+        def record_call(name: str) -> None:
+            with calls_lock:
+                calls.append(name)
+
+        def fetch_order_fills(**_kwargs: Any) -> dict[str, Any]:
+            record_call("order_fills")
+            barrier.wait(timeout=1)
+            return {
+                "records": [{"makerAssetId": "0", "takerAssetId": "1001"}],
+                "complete": True,
+            }
+
+        def fetch_activity_operations(**_kwargs: Any) -> dict[str, Any]:
+            record_call("activity_operations")
+            barrier.wait(timeout=1)
+            return {
+                "records": [{"type": "SPLIT", "id": "split-1"}],
+                "complete": True,
+            }
+
+        bundle = history_provider_module.build_full_history_bundle(
+            settings={
+                "source": "test",
+                "usdc_asset_id": "0",
+            },
+            wallet="0xabc",
+            need_trade_history=True,
+            need_operations=True,
+            fetch_order_fills=fetch_order_fills,
+            fetch_activity_operations=fetch_activity_operations,
+            fetch_token_condition_lookup=lambda **_kwargs: {
+                "records": [{"id": "1001", "condition": {"id": "cond-1"}}],
+                "complete": True,
+            },
+            graph_order_fill_asset_id=lambda record, **_kwargs: str(record.get("takerAssetId") or ""),
+            convert_order_fills_to_trade_records=lambda **_kwargs: [{"conditionId": "cond-1"}],
+        )
+
+        self.assertTrue(bundle["status"]["complete"])
+        self.assertEqual(bundle["status"]["trade_record_count"], 1)
+        self.assertEqual(bundle["status"]["operation_record_count"], 1)
+        self.assertEqual(set(calls), {"order_fills", "activity_operations"})
 
     def test_fetch_wallet_snapshot_marks_full_snapshot_complete_when_provider_restores_history(self) -> None:
         client = IncompleteGraphHistoryProviderClient()
@@ -1668,6 +2605,61 @@ class UpgradeBehaviorTests(unittest.TestCase):
         self.assertEqual(page["stop_reason"], "partitioned_complete")
         self.assertGreaterEqual(int(page.get("partition_count", 0)), 2)
         self.assertTrue(all("start" in call and "end" in call for call in client.calls))
+
+    def test_graph_activity_operations_fetches_streams_concurrently(self) -> None:
+        barrier = threading.Barrier(4)
+
+        class ConcurrentGraphActivityClient:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.lock = threading.Lock()
+
+            def fetch_graphql(
+                self,
+                *,
+                endpoint_url: str,
+                query: str,
+                variables: dict[str, Any] | None = None,
+            ) -> dict[str, Any]:
+                del endpoint_url
+                variables = dict(variables or {})
+                if int(variables.get("skip", 0) or 0) == 0:
+                    barrier.wait(timeout=1)
+                if "WalletSplits" in query:
+                    root_field = "splits"
+                elif "WalletMerges" in query:
+                    root_field = "merges"
+                elif "WalletRedemptions" in query:
+                    root_field = "redemptions"
+                elif "WalletNegRiskConversions" in query:
+                    root_field = "negRiskConversions"
+                else:
+                    raise AssertionError(f"unexpected query: {query}")
+                with self.lock:
+                    self.calls.append(root_field)
+                return {"data": {root_field: []}}
+
+        client = ConcurrentGraphActivityClient()
+
+        page = fetch_graph_activity_operations(
+            client=client,  # type: ignore[arg-type]
+            wallet="0xabc",
+            settings={
+                "activity_url": "https://example.test/graphql",
+                "page_size": 10,
+                "max_pages_per_stream": 1,
+                "operation_stream_concurrency": 4,
+                "asset_decimals": 6,
+            },
+        )
+
+        self.assertTrue(page["complete"])
+        self.assertEqual(page["stop_reason"], "all_streams_loaded")
+        self.assertEqual(page["record_count"], 0)
+        self.assertEqual(
+            set(client.calls),
+            {"splits", "merges", "redemptions", "negRiskConversions"},
+        )
 
     def test_fetch_wallet_snapshot_can_reuse_history_ledger_operations_when_provider_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2380,6 +3372,22 @@ class UpgradeBehaviorTests(unittest.TestCase):
             ["partial_snapshot:screening_window_complete", "passed all numeric filters"],
         )
 
+    def test_freeze_analysis_current_datetime_sets_stable_run_clock(self) -> None:
+        config: dict[str, Any] = {"analysis": {}}
+
+        frozen = freeze_analysis_current_datetime(config)
+
+        self.assertEqual(config["analysis"]["current_datetime"], frozen)
+        self.assertIsNotNone(frozen)
+
+    def test_freeze_analysis_current_datetime_preserves_configured_clock(self) -> None:
+        config = {"analysis": {"current_datetime": "2026-04-25T00:00:00+00:00"}}
+
+        frozen = freeze_analysis_current_datetime(config)
+
+        self.assertEqual(frozen, "2026-04-25T00:00:00+00:00")
+        self.assertEqual(config["analysis"]["current_datetime"], "2026-04-25T00:00:00+00:00")
+
     def test_history_registry_cloudflare_read_fallback_returns_false_on_d1_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             artifacts_root = Path(temp_dir)
@@ -2400,6 +3408,131 @@ class UpgradeBehaviorTests(unittest.TestCase):
             with patch(
                 "polymarket_weather_tool.history_registry.cloudflare_d1_select_rows",
                 side_effect=CloudflareD1RequestError("boom"),
+            ):
+                self.assertFalse(registry.contains("0xabc"))
+
+    def test_history_registry_cloudflare_read_fallback_primes_cache_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifacts_root = Path(temp_dir)
+            registry = create_history_registry(
+                artifacts_root,
+                {
+                    "history_registry": {
+                        "enabled": True,
+                        "backend": "local",
+                        "cloudflare_account_id": "account-id",
+                        "cloudflare_d1_database_id": "database-id",
+                        "cloudflare_api_token": "api-token",
+                        "read_cloud_fallback_enabled": True,
+                    }
+                },
+            )
+            rows = [
+                {
+                    "wallet_address": "0xabc0000000000000000000000000000000000000",
+                    "user_name": "cached",
+                    "x_username": "",
+                    "first_seen_at": "2026-05-01T00:00:00+00:00",
+                    "last_seen_at": "2026-05-02T00:00:00+00:00",
+                    "last_run_id": "run-1",
+                    "last_status": "selected",
+                    "run_count": 1,
+                }
+            ]
+
+            with patch(
+                "polymarket_weather_tool.history_registry.cloudflare_d1_select_rows",
+                return_value=rows,
+            ) as select_mock:
+                self.assertTrue(registry.contains("0xabc0000000000000000000000000000000000000"))
+                self.assertFalse(registry.contains("0xdef0000000000000000000000000000000000000"))
+
+        self.assertEqual(select_mock.call_count, 1)
+
+    def test_history_registry_pending_selected_wallet_does_not_prefilter_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifacts_root = Path(temp_dir)
+            registry = create_history_registry(
+                artifacts_root,
+                {
+                    "history_registry": {
+                        "enabled": True,
+                        "backend": "local",
+                        "read_cloud_fallback_enabled": False,
+                    }
+                },
+            )
+            leaderboard_entry = {
+                "proxyWallet": "0xabc",
+                "userName": "pending",
+                "xUsername": "",
+            }
+
+            write_wallet_history_record(
+                history_registry_dir=registry,  # type: ignore[arg-type]
+                wallet="0xabc",
+                leaderboard_entry=leaderboard_entry,
+                run_id="run-1",
+                status="selected_pending_hydration",
+            )
+            self.assertFalse(wallet_is_in_history_registry(registry, "0xabc"))  # type: ignore[arg-type]
+
+            write_wallet_history_record(
+                history_registry_dir=registry,  # type: ignore[arg-type]
+                wallet="0xabc",
+                leaderboard_entry=leaderboard_entry,
+                run_id="run-1",
+                status="selected",
+            )
+            self.assertTrue(wallet_is_in_history_registry(registry, "0xabc"))  # type: ignore[arg-type]
+
+    def test_local_history_registry_pending_file_does_not_prefilter_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry_dir = Path(temp_dir)
+            leaderboard_entry = {
+                "proxyWallet": "0xabc",
+                "userName": "pending-file",
+                "xUsername": "",
+            }
+
+            write_wallet_history_record(
+                history_registry_dir=registry_dir,
+                wallet="0xabc",
+                leaderboard_entry=leaderboard_entry,
+                run_id="run-1",
+                status="selected_pending",
+            )
+            self.assertFalse(wallet_is_in_history_registry(registry_dir, "0xabc"))
+
+            write_wallet_history_record(
+                history_registry_dir=registry_dir,
+                wallet="0xabc",
+                leaderboard_entry=leaderboard_entry,
+                run_id="run-1",
+                status="screened_out",
+            )
+            self.assertTrue(wallet_is_in_history_registry(registry_dir, "0xabc"))
+
+    def test_history_registry_cloudflare_read_timeout_returns_false(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifacts_root = Path(temp_dir)
+            registry = create_history_registry(
+                artifacts_root,
+                {
+                    "history_registry": {
+                        "enabled": True,
+                        "backend": "local",
+                        "cloudflare_account_id": "account-id",
+                        "cloudflare_d1_database_id": "database-id",
+                        "cloudflare_api_token": "api-token",
+                        "read_cloud_fallback_enabled": True,
+                    }
+                },
+            )
+
+            with patch(
+                "polymarket_weather_tool.cloudflare_backend.urlrequest.urlopen",
+                side_effect=TimeoutError("The read operation timed out"),
             ):
                 self.assertFalse(registry.contains("0xabc"))
 

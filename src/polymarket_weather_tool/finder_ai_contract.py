@@ -161,9 +161,41 @@ def build_finder_ai_labels(labels: Any) -> list[dict[str, Any]]:
     return results
 
 
-def build_finder_ai_key_metrics(selection_record: Mapping[str, Any], evidence_summary: Mapping[str, Any]) -> list[dict[str, Any]]:
+def build_finder_ai_key_metrics(
+    selection_record: Mapping[str, Any],
+    evidence_summary: Mapping[str, Any],
+    metrics: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    metrics = safe_mapping(metrics)
+    pnl_value = (
+        selection_record.get("falcon_total_pnl")
+        if selection_record.get("falcon_total_pnl") not in (None, "")
+        else selection_record.get("display_pnl")
+        if selection_record.get("display_pnl") not in (None, "")
+        else metrics.get("falcon_total_pnl")
+        if metrics.get("falcon_total_pnl") not in (None, "")
+        else metrics.get("display_pnl")
+    )
+    win_rate_value = (
+        selection_record.get("falcon_win_rate")
+        if selection_record.get("falcon_win_rate") not in (None, "")
+        else selection_record.get("display_win_rate")
+        if selection_record.get("display_win_rate") not in (None, "")
+        else metrics.get("falcon_win_rate")
+        if metrics.get("falcon_win_rate") not in (None, "")
+        else metrics.get("display_win_rate")
+        if metrics.get("display_win_rate") not in (None, "")
+        else None
+    )
+    win_rate_label = first_non_empty(
+        selection_record.get("falcon_win_rate_window_label"),
+        selection_record.get("display_win_rate_window_label"),
+        metrics.get("falcon_win_rate_window_label"),
+        metrics.get("display_win_rate_window_label"),
+    )
     metric_specs = [
-        ("pnl", "PnL", selection_record.get("pnl")),
+        ("pnl", "PnL", pnl_value),
+        ("win_rate", win_rate_label or "Win rate", win_rate_value),
         ("volume", "Volume", selection_record.get("volume")),
         ("trade_count", "Trade count", selection_record.get("trade_count")),
         ("weather_notional_ratio", "Weather notional ratio", selection_record.get("weather_notional_ratio")),
@@ -190,6 +222,7 @@ def build_finder_ai_contract(*, run_id: str, wallet_result: Mapping[str, Any]) -
     selection_record = safe_mapping(wallet_result.get("selection_record"))
     leaderboard_entry = safe_mapping(wallet_result.get("leaderboard_entry"))
     profile = safe_mapping(wallet_result.get("profile"))
+    metrics = safe_mapping(wallet_result.get("metrics"))
     evidence_summary = safe_mapping(wallet_result.get("evidence_summary"))
     strategy_notes = compact_text_list(wallet_result.get("strategy_notes"), limit=4, max_length=180)
     primary_signals = build_finder_ai_primary_signals(wallet_result.get("label_evaluations"))
@@ -228,7 +261,7 @@ def build_finder_ai_contract(*, run_id: str, wallet_result: Mapping[str, Any]) -
         "needsReview": False,
         "labels": labels,
         "primarySignals": primary_signals,
-        "keyMetrics": build_finder_ai_key_metrics(selection_record, evidence_summary),
+        "keyMetrics": build_finder_ai_key_metrics(selection_record, evidence_summary, metrics),
         "sourceExcerpt": source_excerpt,
         "weatherSignals": {
             "marketScope": "weather",
